@@ -85,6 +85,9 @@ BIN_DIR="${BIN_DIR:-}"
 # SKIP_MODEL_CHECK=1 skips the preflight test for the GGUF files (for
 # --cluster-selftest runs before the models are synced to every node).
 SKIP_MODEL_CHECK="${SKIP_MODEL_CHECK:-0}"
+# Extra container environment, space-separated KEY=VALUE pairs, e.g.
+# EXTRA_ENV="NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET" for transport debugging.
+EXTRA_ENV="${EXTRA_ENV:-}"
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10)
 
 MODE=up
@@ -203,6 +206,8 @@ podman_cmd() {
         -e "NCCL_SOCKET_IFNAME=${iface}" -e "GLOO_SOCKET_IFNAME=${iface}" -e "NCCL_IB_HCA=${hca}"
         -e NCCL_ASYNC_ERROR_HANDLING=1 -e NCCL_IB_QPS_PER_CONNECTION=2
         -e NCCL_IB_TIMEOUT=22 -e NCCL_IB_RETRY_CNT=7 -e HIP_FORCE_DEV_KERNARG=1)
+    local kv
+    for kv in $EXTRA_ENV; do cmd+=(-e "$kv"); done
     if [ -n "$BIN_DIR" ]; then
         cmd+=(-v "${BIN_DIR}:/opt/lucebox-dist:ro"
               --entrypoint /opt/lucebox-dist/server/build/dflash_server)
