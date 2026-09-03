@@ -117,10 +117,15 @@ static int run_cluster_selftest_main(const BackendArgs & bargs) {
             std::fprintf(stderr, "[cluster] listen failed: %s\n", err.c_str());
             return 1;
         }
-        std::fprintf(stderr, "[cluster] head listening on %s:%d, waiting for %d worker(s)\n",
-                     c.head_host.c_str(), c.head_port, c.size - 1);
+        // Same stdout line the real head backend prints; launch_cluster.sh waits
+        // for it before starting the workers, so the accept deadline below must
+        // cover the worker start-up, not just one collective timeout.
+        std::printf("cluster: listening on %s:%d, waiting for %d worker(s)\n",
+                    c.head_host.c_str(), c.head_port, c.size - 1);
+        std::fflush(stdout);
         std::vector<HelloMsg> hellos;
-        if (!head.accept_workers(c.size - 1, me, c.timeout_ms, hellos, &err)) {
+        const uint32_t accept_deadline_ms = std::max<uint32_t>(c.timeout_ms, 300000u);
+        if (!head.accept_workers(c.size - 1, me, accept_deadline_ms, hellos, &err)) {
             std::fprintf(stderr, "[cluster] worker bootstrap failed: %s\n", err.c_str());
             return 1;
         }
