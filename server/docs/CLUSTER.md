@@ -284,7 +284,7 @@ Exit criteria from the plan (WP0): **64 KiB < 150 us, 16 MiB bf16 < 8 ms at N=4*
 
 | Date (UTC) | N | Hosts | 64 KiB time (us) | 16 MiB time (us) | 16 MiB busbw (GB/s) | Notes |
 |---|---|---|---|---|---|---|
-| TBD | 2 | strix1 strix2 | TBD | TBD | TBD | first measurement pending |
+| 2026-09-03 | 2 | strix1 strix2 | 73 (p50), 818 (p90) | 6070 f32 / 3436 bf16 (p50) | ~2.8 (f32) | `dflash_server --cluster-selftest` (RCCL 2.30.4, 1000+43 collectives, sums exact) while the vLLM/Ray cluster was still running on both hosts, so the p90/p99 tails include co-tenant noise; rccl-tests `all_reduce_perf` still pending |
 | TBD | 4 | strix1 strix2 strix3 strix4 | TBD | TBD | TBD | nobody has measured 4-node RCCL on Strix Halo yet |
 <!-- rccl-baseline-end -->
 
