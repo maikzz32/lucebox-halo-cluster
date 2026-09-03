@@ -285,7 +285,7 @@ Exit criteria from the plan (WP0): **64 KiB < 150 us, 16 MiB bf16 < 8 ms at N=4*
 | Date (UTC) | N | Hosts | 64 KiB time (us) | 16 MiB time (us) | 16 MiB busbw (GB/s) | Notes |
 |---|---|---|---|---|---|---|
 | 2026-09-03 | 2 | strix1 strix2 | 73 (p50), 818 (p90) | 6070 f32 / 3436 bf16 (p50) | ~2.8 (f32) | `dflash_server --cluster-selftest` (RCCL 2.30.4, 1000+43 collectives, sums exact) while the vLLM/Ray cluster was still running on both hosts, so the p90/p99 tails include co-tenant noise; rccl-tests `all_reduce_perf` still pending |
-| TBD | 4 | strix1 strix2 strix3 strix4 | TBD | TBD | TBD | nobody has measured 4-node RCCL on Strix Halo yet |
+| 2026-09-03 | 4 | strix1 strix2 strix3 strix4 | 125 (p50), 136 (p90), 173-187 (p99) | 8511-8617 f32 / 4461-4585 bf16 (p50) | ~2.0 (f32) | `dflash_server --cluster-selftest`, RCCL 2.30.4, all 4 ranks OK, sums exact; first 4-node RCCL measurement on Strix Halo; vLLM/Ray cluster still running on all hosts (GPU busy, CPU idle) |
 <!-- rccl-baseline-end -->
 
 Reference from the vLLM project (different code, same fabric): 4-rank
@@ -337,7 +337,7 @@ Field names are the contract from `cluster_protocol.h::RequestReportMsg`.
 | SIGSEGV at model load, absurd VRAM size reported | ROCm userspace older than the host driver (e.g. upstream `Dockerfile.rocm` with 6.4.1). Use this image (ROCm 10). |
 | `hipErrorOutOfMemory` at load, `rocm-smi` shows ~100 GB used | The vLLM Ray cluster is still running. Stop it yourself (`podman ps` on each node); the scripts never do. |
 | Worker exits with `Hello mismatch: build_sha` / `model_sha` / `placement_hash` | Different image or model files on a node. `sha256sum` the GGUFs, `podman images --digests`. |
-| E830 on strix4: `ibv_devinfo` shows nothing, `rdma link` empty | rdma-core < v64 (host or container). Host: Fedora 45 packages; container: check `rpm -q rdma-core` in the image, rebuild with a newer Fedora base if needed. |
+| E830 on strix4: `ibv_devinfo` inside the container shows nothing although `/sys/class/infiniband/rocep197s0f1` exists; 4-rank `ncclCommInitRankConfig` fails with "internal error" / "remote process exited or there was a network error" | rdma-core in the **container** is too old. Measured 2026-09-03: Fedora 44's v61 hides the E830, and rdma-core built from the upstream `v64.0` tag still does not enumerate it; only the Fedora 45 package `rdma-core-64.0-3.fc45` does. Fix: `dnf upgrade --releasever=45 rdma-core libibverbs librdmacm libibverbs-utils librdmacm-utils` in the image (done in `Dockerfile.rocm-cluster` and `scripts/cluster/Containerfile.devbuild`). A freshly rebuilt `strix-vllm-gfx1151:dev-rocm10` base carries the regression too; only containers started from an older build still work. |
 | Collective timeout (`wait_stream` deadline), request fails with `DecodeFailed` | One rank is slow or dead: check `--status`, heartbeats stop after 10 s. Raise `--cluster-timeout-ms` only for debugging. |
 | `mpirun` in `rccl_baseline.sh` cannot reach peers | The launcher container uses your `~/.ssh` (mounted read-only) to ssh as `maik@192.168.100.N`; make sure the RoCE IPs are in `known_hosts` or accept the `accept-new` prompt once from the head node. |
 

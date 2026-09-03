@@ -1,0 +1,11 @@
+FROM ghcr.io/maikzz32/strix-vllm-gfx1151:dev-rocm10
+# Build/runtime image for the lucebox-halo-cluster dev loop.
+# rdma-core >= 64.0-3 (Fedora 45 build) is required for the Intel E830-L in
+# strix4 (PCI 8086:12de): the Fedora 44 base ships v61 and the upstream v64.0
+# tag still lacks the E830 id, so the fc45 packages are pulled in explicitly.
+RUN dnf install -y --setopt=install_weak_deps=False \
+        cmake ninja-build git rsync procps-ng which gcc gcc-c++ libstdc++-devel glibc-devel make \
+    && dnf upgrade -y --setopt=install_weak_deps=False --releasever=45 \
+        rdma-core libibverbs librdmacm libibverbs-utils librdmacm-utils \
+    && dnf clean all \
+    && rpm -q rdma-core libibverbs && ls -la /usr/lib64/libibverbs.so.1
