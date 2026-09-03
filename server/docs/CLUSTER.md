@@ -16,8 +16,8 @@ not be quoted.
 * **One all-reduce per MoE layer.** Each rank evaluates its local experts as a
   partial sum (the existing masked-route hybrid path with cold owner `None`),
   then a single RCCL `ncclAllReduce` over the `[4096 x n_tokens]` partial
-  (f32 for decode, bf16 for prefill chunks) makes the hidden state identical on
-  all ranks. 43 collectives per forward; at the measured ~77 us per 4-rank
+  (always f32: bf16 partials measurably change greedy outputs, see "Measured
+  results") makes the hidden state identical on all ranks. 43 collectives per forward; at the measured ~77 us per 4-rank
   all-reduce that is ~3 ms against a ~35 ms decode step.
 * **Rank 0 decides, everybody follows.** Rank 0 (head) serves HTTP, broadcasts
   the request descriptor, runs the same generate loop as the workers and
