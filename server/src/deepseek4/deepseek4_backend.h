@@ -110,6 +110,12 @@ public:
     bool set_cluster(const cluster::ClusterConfig * cfg, cluster::IClusterComm * comm);
     const Ds4ClusterRuntime * cluster_runtime() const { return cluster_.get(); }
 
+    // True when a request with a greedy sampler and no budget hook would
+    // decode with DSpark rather than AR. The cluster head asks this before it
+    // broadcasts the request: every rank must enter the same decode loop, so
+    // the head's answer, not each worker's own configuration, decides.
+    bool spec_decode_ready() const { return spec_enabled_ && spec_drafter_ != nullptr; }
+
 private:
     cluster::Ds4ClusterHooks * hooks_ = nullptr;
     // True only when hooks_ belongs to a real cluster (head or worker).

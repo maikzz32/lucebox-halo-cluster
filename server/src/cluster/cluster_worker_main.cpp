@@ -150,6 +150,16 @@ int handle_request(WorkerState & st, const RequestMsg & msg) {
     st.hooks->reset_counters();
     if (st.comm) st.comm->reset_stats();
 
+    // WP4: the head speculates only when it broadcast DecodeMode::Speculative.
+    // A worker without a drafter would silently decode AR instead and then
+    // wait for a Decision frame that never comes, so fail the run loudly.
+    if (msg.decode_mode == DecodeMode::Speculative && !st.ds4->spec_decode_ready()) {
+        send_abort(st, kExitProtocol, msg.request_id,
+                   "head requested speculative decode but this rank has no DSpark drafter "
+                   "(pass the same --draft / DFLASH_DS4_SPEC settings to every rank)");
+        return kExitProtocol;
+    }
+
     GenerateResult result;
     if (msg.kv_offset > 0 && msg.snapshot_slot >= 0) {
         result = st.ds4->restore_and_generate_impl(msg.snapshot_slot, req, io);

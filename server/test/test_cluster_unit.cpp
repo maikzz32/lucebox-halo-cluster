@@ -1144,6 +1144,56 @@ TEST_CASE(ClusterUnitFixture, HeadAndWorkerHooksOverLoopback) {
     lp.head.close();
 }
 
+// WP4: an empty draft block is the head's end marker for a request only it
+// can see ending (client cancel). It must survive the wire as an empty
+// vector, and it must clear whatever the worker had drafted locally.
+TEST_CASE(ClusterUnitFixture, EmptyDraftBlockIsTheEndMarker) {
+    LoopbackPair lp;
+    if (lp.port == 0) SKIP("no loopback port available");
+    REQUIRE(lp.handshake(lp.worker_id));
+
+    HeadHooksConfig hc; hc.timeout_ms = 5000;
+    HeadHooks head(lp.head, hc);
+    WorkerHooksConfig wc; wc.rank = 1; wc.timeout_ms = 5000;
+    WorkerHooks worker(lp.worker, wc);
+
+    const uint64_t req = 9;
+    head.set_current_request(req);
+    worker.set_current_request(req);
+
+    std::string w_err;
+    // The worker drafted its own block; the head's end marker must replace it.
+    std::vector<int32_t> w_draft = {5, 6, 7};
+    bool w_ok = false;
+    std::thread wt([&] { w_ok = worker.decide_draft(req, 3, 128, w_draft, &w_err); });
+
+    std::string h_err;
+    std::vector<int32_t> end_marker;
+    REQUIRE(head.decide_draft(req, 3, 128, end_marker, &h_err));
+    wt.join();
+
+    CHECK(w_ok);
+    CHECK(w_draft.empty());
+    CHECK_EQUAL(head.counters().drafts, 1u);
+    CHECK_EQUAL(worker.counters().drafts, 1u);
+}
+
+// The end marker also has to round-trip through the frame codec on its own:
+// a zero-length token vector is a valid Draft, not a malformed one.
+TEST_CASE(ClusterUnitFixture, EmptyDraftMsgRoundTrip) {
+    DraftMsg msg;
+    msg.request_id = 77;
+    msg.step = 12;
+    msg.pos = 4096;
+    const Frame f = make_frame(msg);
+    DraftMsg got;
+    REQUIRE(parse_frame(f, got));
+    CHECK_EQUAL(got.request_id, 77u);
+    CHECK_EQUAL(got.step, 12u);
+    CHECK_EQUAL(got.pos, 4096);
+    CHECK(got.tokens.empty());
+}
+
 TEST_CASE(ClusterUnitFixture, HeadHooksFailWhenWorkerGone) {
     LoopbackPair lp;
     if (lp.port == 0) SKIP("no loopback port available");

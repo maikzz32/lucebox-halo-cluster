@@ -23,9 +23,22 @@ not be quoted.
   the request descriptor, runs the same generate loop as the workers and
   broadcasts every sampling / acceptance / EOS / cancel decision (a few int32
   per step) over a TCP control channel. Kernel non-determinism therefore
-  cannot make ranks diverge. The DSpark drafter runs on rank 0 only; draft
-  tokens are broadcast, verification runs on every rank through the
-  expert-parallel graph.
+  cannot make ranks diverge.
+* **DSpark on the cluster (WP4).** Every rank loads the drafter and drafts, but
+  only rank 0's block, its adaptive width, its accept count and its bonus token
+  are authoritative; they travel as `Draft` and `Accept` frames inside the
+  decode loop. The redundant draft forwards on the workers run at the same time
+  as the head's, so they cost no wall-clock, and they keep every rank's feature
+  window warm. Verification runs on every rank through the expert-parallel
+  graph, which is the same per-layer forward AR decode uses, so a verify batch
+  of q tokens is q columns in the same all-reduce. The seed token (the first
+  token of a request, an argmax over prefill logits that differ in their last
+  bits between ranks) is decided by rank 0 as well. An EMPTY draft block is the
+  head's end marker: it ends a request only the head can see ending (client
+  cancel, closed connection). Every other stop reason (EOS, token budget) is a
+  function of the accepted tokens and is reached on all ranks in the same step.
+  `--cluster-verify-hash` probes the AR loop only; a speculative request does
+  not hash per step.
 * **Transport.** RCCL over RoCE v2 with `NCCL_NET_GDR_LEVEL=0` (gfx1151 has no
   GPUDirect; the host bounce is a memcpy in the same DRAM on Strix Halo).
   Bootstrap over TCP: workers connect to `--cluster-head`, send `Hello{rank,
@@ -365,7 +378,39 @@ Correctness proof from `DFLASH_CLUSTER_TRACE=1`: for every layer `partial_pre(ra
 
 Quality probe (5 short reasoning/translation questions, 48 tokens): cluster 3/5 = single node 3/5 (both misses are truncations).
 
-Not yet done: DSpark on the cluster (WP4), prefill performance (WP5), `usage.timings.cluster` (WP6), 4-node model run, performance work (M2/M3). The 2-node AR decode is slower than a single node because path 3a waits on the host after every layer's all-reduce.
+## Measured results, DSpark (2026-09-04, same nodes, artifact and binary, `DFLASH_DS4_SPEC=1 DFLASH_DS4_SPEC_Q=4`)
+
+| Configuration | 128-token benchmark prompt, tok/s (median of 3) | Free-form prompt, 200 tokens, tok/s | Output |
+|---|---|---|---|
+| single node, monolithic, DSpark | 27.2 | 12.1 | sha256 `87964cbd…` |
+| 2 nodes, uniform sharding, DSpark | 22.2 | 11.9 | sha256 `87964cbd…` — **byte-identical to every AR and single-node run above** |
+
+`accept_rate` is 1.00 on the benchmark prompt for both configurations and
+0.645 (cluster) against 0.671 (single node) on the free-form prompt, where the
+two produce different token streams and are therefore not directly comparable.
+`spec_decode_ran` is true in every cluster run.
+
+DSpark is worth 1.55x over the cluster's own AR decode (22.2 against 14.3) and
+still 0.82x of a single node with DSpark — the same ratio the AR decode has
+(14.3/16.6 = 0.86), so speculation neither gains nor loses relative ground.
+What holds the cluster back is unchanged: path 3a waits on the host after every
+layer's all-reduce.
+
+The cluster pays one extra price for speculation. Without a fused verify graph,
+a q-token verify batch is cut at the learned compressor's boundaries
+(`deepseek4_safe_compressor_batch_tokens`, ratios 4 and 128), so a batch that
+starts off-boundary runs as two or more forwards — and each forward pays all 43
+all-reduces. Measured cost: 133-140 ms per verify step against ~70 ms for one
+AR step. Removing it needs the in-graph all-reduce (path 3b) so the fused
+verifier can be used, or a batched non-fused verify that crosses a boundary in
+one forward. Both belong to WP5/3b.
+
+Client cancel was tested against a running speculative request (streaming curl
+killed mid-generation): the head stopped at step 38 and rank 1 stopped at the
+same step 38 with the same accept rate, and the next request was served
+normally. That is the empty-draft end marker doing its job.
+
+Not yet done: prefill performance (WP5), `usage.timings.cluster` (WP6), 4-node model run, performance work (M2/M3).
 
 ### M1 artifact and diagnostics
 - Diagnostic placement JSON: `python server/scripts/cluster/build_expert_placement.py --dims 43,256,6 -n 2 --all-on-rank 0 -o all_rank0.json`

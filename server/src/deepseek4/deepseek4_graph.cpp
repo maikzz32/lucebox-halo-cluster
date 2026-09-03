@@ -7380,7 +7380,11 @@ bool deepseek4_step_layer_range(
            wide_verify_candidate) && verify_hooks) ||
          fused_hybrid_decode) &&
         layer_begin == 0 && is_last_shard &&
-        out_logits && ds4_backend_is_gpu(backend) && ds4_fused_verify_enabled()) {
+        out_logits && ds4_backend_is_gpu(backend) && ds4_fused_verify_enabled() &&
+        // A whole-model fused graph has no insertion point for the per-layer
+        // all-reduce. fused_verify_candidate above says the same for the
+        // warning; this is the dispatch that has to honour it.
+        !cluster_mode) {
         const bool q1_feature_capture =
             n_tokens == 1 && verify_hooks && verify_hooks->capture_out;
         // q=1 target-feature capture walks many prompt-position shapes. Keep
@@ -8567,6 +8571,17 @@ bool deepseek4_step_layer_range(
             out_logits->resize((size_t)w.n_vocab);
             ggml_backend_tensor_get(cached_decode_output_graph.sg.logits,
                                     out_logits->data(), 0, sizeof(float) * (size_t)w.n_vocab);
+            if (verify_hooks && verify_hooks->all_logits_out) {
+                // reuse_decode_graphs implies n_tokens == 1, so this single
+                // row IS the whole verify batch of this call. Leaving the
+                // hook empty is invisible until a caller concatenates it:
+                // the compressor-boundary splitter above runs a q-token
+                // verify as q single-token chunks and joins their hook
+                // vectors, so an empty chunk silently drops the logits of
+                // the entire verify batch. A cluster rank reaches exactly
+                // that combination, because it has no fused verify graph.
+                *verify_hooks->all_logits_out = *out_logits;
+            }
         } else {
             const size_t ctx_size = 16 * 1024 * 1024;
             ggml_init_params params{};

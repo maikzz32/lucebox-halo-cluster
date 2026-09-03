@@ -2676,18 +2676,22 @@ GenerateResult DeepSeek4Backend::generate_from_state(
     // The DSpark verifier is greedy-only. Route sampling and penalties through
     // AR so the request's sampler contract is not silently ignored.
     const bool sampling_requires_ar = sampler_.needs_logit_processing();
-    // M1: DSpark in the cluster lands with WP4 (draft on rank 0, Draft /
-    // Accept frames, verify through the EP graph on every rank). Until then a
-    // cluster request always decodes AR so all ranks take the same path.
+    // WP4: DSpark decodes on the cluster. Every rank runs the drafter and the
+    // verify batch, but only rank 0's draft block, accept count and bonus
+    // token count: they travel over the control channel inside the spec loop
+    // (Draft / Accept frames). The verify batch takes the same
+    // expert-parallel per-layer forward as AR decode, so the sharded experts
+    // and their all-reduce need nothing extra here.
     if (cluster && spec_enabled_ && spec_drafter_ && req.n_gen > 0 &&
         !req.force_ar_decode && !budget_requires_ar && !sampling_requires_ar) {
-        static bool cluster_spec_warned = false;
-        if (!cluster_spec_warned) {
-            cluster_spec_warned = true;
-            std::fprintf(stderr, "cluster: DSpark deferred to WP4, decoding AR\n");
+        static bool cluster_spec_logged = false;
+        if (!cluster_spec_logged) {
+            cluster_spec_logged = true;
+            std::fprintf(stderr,
+                         "[deepseek4-cluster] DSpark speculative decode active; rank 0 "
+                         "owns the draft block and the accept decision\n");
         }
     }
-    const bool cluster_requires_ar = cluster;
     // A drafter was loaded and the operator asked for spec decode, but this
     // request routes to AR anyway. Say why, once: the DS4 model card defaults
     // temperature to 1.0, so a request that merely OMITS temperature lands
@@ -2708,8 +2712,7 @@ GenerateResult DeepSeek4Backend::generate_from_state(
         }
     }
     if (spec_enabled_ && spec_drafter_ && req.n_gen > 0 &&
-        !req.force_ar_decode && !budget_requires_ar && !sampling_requires_ar &&
-        !cluster_requires_ar) {
+        !req.force_ar_decode && !budget_requires_ar && !sampling_requires_ar) {
         if (last_logits_.empty()) {
             result.fail(GenerateErrorCode::DecodeFailed, "spec: no prefill logits");
             return result;
@@ -2728,12 +2731,46 @@ GenerateResult DeepSeek4Backend::generate_from_state(
                          seed, last_logits_[(size_t) seed],
                          nonfinite_logits);
         }
+        uint8_t seed_flags = 0;
+        if (cluster) {
+            // The seed is this request's first generated token, and every rank
+            // must emit the same one. It is an argmax over prefill logits,
+            // which differ between ranks in their last bits, so rank 0 decides
+            // and the workers adopt its token. The flags also carry the head's
+            // cancel state, because a worker has no client to ask.
+            const bool seed_eos = deepseek4_is_eos_tok(seed, w_);
+            int32_t seed_tok = seed;
+            if (!cluster_worker()) {
+                seed_flags = cluster::make_decision_flags(
+                    seed_eos, /*stop=*/false, out_io.is_cancelled(), /*budget=*/false,
+                    /*is_final=*/seed_eos || req.n_gen <= 1);
+            }
+            std::string err;
+            if (!hooks_->decide_next_token(hooks_->current_request(), /*step=*/0,
+                                           last_logits_.data(), w_.n_vocab, sampler_,
+                                           seed_eos, seed_tok, seed_flags, &err)) {
+                result.fail(GenerateErrorCode::DecodeFailed,
+                            "cluster: DSpark seed exchange failed: " + err);
+                return result;
+            }
+            if (seed_tok < 0 || seed_tok >= w_.n_vocab) {
+                result.fail(GenerateErrorCode::DecodeFailed,
+                            "cluster: DSpark seed token out of range");
+                return result;
+            }
+            seed = seed_tok;
+        }
         std::vector<int32_t> gen;
         gen.push_back(seed);
         out_io.emit(seed);
         float accept_rate = 0.0f;
         bool spec_ran = false;
-        if (!out_io.is_cancelled() && !deepseek4_is_eos_tok(seed, w_) && req.n_gen > 1) {
+        // Cluster: the head's seed decision says whether the request already
+        // ends here; a worker must not consult its own (never cancelled) IO.
+        const bool seed_ends_request = cluster
+            ? cluster::decision_terminates(seed_flags)
+            : (out_io.is_cancelled() || deepseek4_is_eos_tok(seed, w_));
+        if (!seed_ends_request && req.n_gen > 1) {
             const int feat_row = spec_drafter_->n_target_layers * w_.n_embd;
             const int win_len = feat_row > 0 ? (int) (spec_feat_window_.size() / feat_row) : 0;
             std::vector<int32_t> spec_toks;
@@ -2752,13 +2789,18 @@ GenerateResult DeepSeek4Backend::generate_from_state(
                         out_io.emit(tok);
                         return !out_io.is_cancelled();
                     },
-                    (expert_runtime_.compute || expert_backend_)
+                    // A cluster rank holds only its expert shard, so the
+                    // verify batch MUST go through the hybrid storage; the
+                    // dense full-expert path would reference experts this
+                    // rank never loaded (and would try to allocate all of
+                    // them). Outside the cluster the condition is unchanged.
+                    (cluster || expert_runtime_.compute || expert_backend_)
                         ? moe_hybrid_.get() : nullptr,
                     expert_runtime_.compute ? &expert_runtime_ : nullptr,
                     routing_stats_.get(),
-                    // WP4: Draft/Accept hooks. nullptr today because the
-                    // cluster path above forces AR; passing hooks_ keeps the
-                    // plumbing in place for the single-node LocalHooks case.
+                    // WP4: Draft / Accept lockstep. LocalHooks (no cluster)
+                    // makes every call a no-op, so the single-node algorithm
+                    // is unchanged.
                     hooks_)) {
                 result.fail(GenerateErrorCode::DecodeFailed,
                             "DSpark speculative decode failed");

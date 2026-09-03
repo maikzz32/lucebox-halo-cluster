@@ -66,7 +66,8 @@ uint64_t backend_placement_hash(const common::DeepSeek4Backend & backend) {
 //   SamplerCfg.rep_window, freq_pen, pres_pen  -> affect the AR-vs-spec
 //       routing (needs_logit_processing) on workers; today the worker derives
 //       do_sample from temperature > 0 and never sees the penalties. Harmless
-//       while M1 forces AR in the cluster.
+//       because the head computes decode_mode from its own full sampler and
+//       the worker only ever narrows spec to AR, never the other way round.
 //   GenerateRequest.snap_pos                   -> inline snapshot position;
 //       only snap_slot travels (as snapshot_slot when no restore is active).
 //   BudgetHook.hard_limit_remaining            -> only close_token_ids travel
@@ -286,9 +287,11 @@ void ClusterHeadBackend::fail_cluster(const std::string & reason, int code, uint
 // ─── Generation ─────────────────────────────────────────────────────────
 
 bool ClusterHeadBackend::spec_available() const {
-    // M1 forces AR inside the backend for cluster runs; report what the
-    // request would have routed to so the worker takes the same branch.
-    return false;
+    // WP4: rank 0 decides for the whole cluster whether a request decodes
+    // speculatively. A worker that happens to lack a drafter must not quietly
+    // fall back to AR while the head speculates, so it rejects the request
+    // instead (cluster_worker_main.cpp).
+    return inner_ && inner_->spec_decode_ready();
 }
 
 GenerateResult ClusterHeadBackend::generate_impl(const GenerateRequest & req, const DaemonIO & io) {

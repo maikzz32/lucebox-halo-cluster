@@ -951,11 +951,16 @@ bool run_deepseek4_dspark_spec_decode(
             if ((int) draft_tok.size() > selected_q) draft_tok.resize((size_t) selected_q);
         }
         if ((int) draft_tok.size() > q_step_cap) draft_tok.resize(q_step_cap);
-        // TODO(WP4): cluster draft exchange. The head has the drafter and the
-        // adaptive width; workers must verify the identical block. Workers
-        // will skip the drafter forward above entirely once WP4 lands (no
-        // drafter loaded on ranks > 0); today this only synchronizes the
-        // block so both sides run the same verify_batch shape.
+        // Cluster lockstep (WP4): the head's draft block is authoritative.
+        // Every rank drafts (the drafter forwards run concurrently on all
+        // ranks, so the redundant work costs no wall-clock and keeps every
+        // feature window warm), but only rank 0's block and only rank 0's
+        // adaptive width are verified, so the verify_batch shape and content
+        // are identical everywhere. An EMPTY block is the head's end marker:
+        // it ends a request that only the head can see ending (client cancel
+        // or a closed connection), which no worker could derive from its own
+        // state. Every other stop reason is a function of the accepted tokens
+        // and is therefore reached on all ranks at the same step.
         if (cluster_spec_head) {
             std::string err;
             if (!cluster_hooks->decide_draft(cluster_req, (uint32_t) steps, pos, draft_tok, &err)) {
@@ -970,9 +975,14 @@ bool run_deepseek4_dspark_spec_decode(
                 ok = false;
                 break;
             }
-            if (draft_tok.empty() || draft_tok[0] != lt) {
+            if (draft_tok.empty()) {
+                // End marker: the head left the loop for a head-local reason.
+                stop_requested = true;
+                break;
+            }
+            if (draft_tok[0] != lt) {
                 std::fprintf(stderr, "[ds4-spec] cluster draft seed %d != local seed %d\n",
-                             draft_tok.empty() ? -1 : draft_tok[0], lt);
+                             draft_tok[0], lt);
                 ok = false;
                 break;
             }
@@ -1201,7 +1211,24 @@ bool run_deepseek4_dspark_spec_decode(
                 tm_verify / steps, tm_probe_submit / steps,
                 tm_probe_wait / steps, tm_apply / steps, tm_feat / steps);
         }
-        if (hit_eos || stop_requested) break;
+        if (hit_eos || stop_requested) {
+            // Head-local stop while the workers would keep going: send the
+            // empty end marker for the step they are about to ask for. When
+            // the loop ends on every rank anyway (EOS, or the token budget is
+            // exhausted) no marker is sent: no worker would read it and it
+            // would desynchronize the next request.
+            if (cluster_spec_head && stop_requested && !hit_eos && n_generated < n_gen) {
+                std::vector<int32_t> end_marker;
+                std::string err;
+                if (!cluster_hooks->decide_draft(cluster_req, (uint32_t) steps, pos,
+                                                 end_marker, &err)) {
+                    std::fprintf(stderr, "[ds4-spec] cluster end marker failed: %s\n",
+                                 err.c_str());
+                    ok = false;
+                }
+            }
+            break;
+        }
     }
 
     const double total_ms = spec_ms_since(run_t0);
