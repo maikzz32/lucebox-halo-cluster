@@ -40,6 +40,10 @@ Environment:
   HEAD_WAIT      seconds to wait for the head's "cluster: listening" line (default 20)
   SPEC_Q         DFLASH_DS4_SPEC_Q (default 4); SPEC=0 disables DSpark entirely
   PULL           1 = podman pull IMAGE on every host first (default 0)
+  BIN_DIR        host dir with server/build/dflash_server (+ deps/**/lib*.so*);
+                 mounted at /opt/lucebox-dist and used as entrypoint (dev loop
+                 with IMAGE=localhost/lucebox-build:rocm10; default: unset)
+  SKIP_MODEL_CHECK 1 = do not require the GGUFs on every node (selftest)
   DRY_RUN        1 = print the podman commands instead of running them
   IFACE_<N>/HCA_<N>  override interface/HCA for node N (default: node 4 ->
                  enp197s0f1np1/rocep197s0f1, others enp197s0f3np3/rocep197s0f3)
@@ -72,6 +76,15 @@ SPEC="${SPEC:-1}"
 SPEC_Q="${SPEC_Q:-4}"
 PULL="${PULL:-0}"
 DRY_RUN="${DRY_RUN:-0}"
+# Dev loop without a release image: BIN_DIR is a host directory holding the
+# build tree (e.g. ~/lucebox-cluster-dist with server/build/dflash_server and
+# server/build/deps/**/lib*.so*, rpath is $ORIGIN-relative). It is mounted at
+# /opt/lucebox-dist and the container entrypoint is overridden to that binary,
+# so IMAGE only needs the ROCm runtime (e.g. localhost/lucebox-build:rocm10).
+BIN_DIR="${BIN_DIR:-}"
+# SKIP_MODEL_CHECK=1 skips the preflight test for the GGUF files (for
+# --cluster-selftest runs before the models are synced to every node).
+SKIP_MODEL_CHECK="${SKIP_MODEL_CHECK:-0}"
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10)
 
 MODE=up
@@ -156,8 +169,13 @@ for i in "${!HOSTS[@]}"; do
     if [ "$PULL" = 1 ]; then run_ssh "$h" "podman pull '$IMAGE'"; fi
     run_ssh "$h" "
         set -e
-        test -f '${MODELS_DIR}/${TARGET}' || { echo 'ERROR: ${MODELS_DIR}/${TARGET} missing on $h'; exit 1; }
-        test -f '${MODELS_DIR}/${DSPARK}' || { echo 'ERROR: ${MODELS_DIR}/${DSPARK} missing on $h'; exit 1; }
+        if [ '${SKIP_MODEL_CHECK}' != 1 ]; then
+            test -f '${MODELS_DIR}/${TARGET}' || { echo 'ERROR: ${MODELS_DIR}/${TARGET} missing on $h'; exit 1; }
+            test -f '${MODELS_DIR}/${DSPARK}' || { echo 'ERROR: ${MODELS_DIR}/${DSPARK} missing on $h'; exit 1; }
+        fi
+        if [ -n '${BIN_DIR}' ]; then
+            test -x '${BIN_DIR}/server/build/dflash_server' || { echo 'ERROR: ${BIN_DIR}/server/build/dflash_server missing on $h'; exit 1; }
+        fi
         podman image exists '${IMAGE}' || { echo 'ERROR: image ${IMAGE} not present on $h (PULL=1 or build it)'; exit 1; }
         if podman ps -a --format '{{.Names}}' | grep -q '^lucebox-rank${i}\$'; then
             echo 'ERROR: lucebox-rank${i} already exists on $h; run --down first'; exit 1; fi
@@ -184,8 +202,12 @@ podman_cmd() {
         -e NCCL_NET_GDR_LEVEL=0 -e NCCL_IB_DISABLE=0 -e "NCCL_IB_GID_INDEX=${GID_INDEX}"
         -e "NCCL_SOCKET_IFNAME=${iface}" -e "GLOO_SOCKET_IFNAME=${iface}" -e "NCCL_IB_HCA=${hca}"
         -e NCCL_ASYNC_ERROR_HANDLING=1 -e NCCL_IB_QPS_PER_CONNECTION=2
-        -e NCCL_IB_TIMEOUT=22 -e NCCL_IB_RETRY_CNT=7 -e HIP_FORCE_DEV_KERNARG=1
-        "$IMAGE"
+        -e NCCL_IB_TIMEOUT=22 -e NCCL_IB_RETRY_CNT=7 -e HIP_FORCE_DEV_KERNARG=1)
+    if [ -n "$BIN_DIR" ]; then
+        cmd+=(-v "${BIN_DIR}:/opt/lucebox-dist:ro"
+              --entrypoint /opt/lucebox-dist/server/build/dflash_server)
+    fi
+    cmd+=("$IMAGE"
         "/models/${TARGET}"
         --cluster-rank "$i" --cluster-size "$N" --cluster-head "${HEAD_IP}:${HEAD_PORT}"
         --cluster-ifname "$iface" --cluster-ib-hca "$hca" --cluster-gid-index "$GID_INDEX"
