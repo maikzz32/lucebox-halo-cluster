@@ -352,3 +352,22 @@ Prefill: >= 0.9x single node at N=2, >= 1.5x at N=4 (bf16 16 MiB reduction per
 layer at 2048-token chunks). These are predictions until the table in
 section 9 and the benchmark in `scripts/cluster/bench_ds4_cluster.py` (WP7)
 have real numbers; do not quote them as measurements.
+
+## Measured results (2026-09-03/04, strix1+strix2, `DeepSeek-V4-Flash-ROCMFP2-STRIX.gguf`, path 3a, AR decode)
+
+| Configuration | Decode tok/s (128 tok, temp 0, median of 3) | Output |
+|---|---|---|
+| single node, monolithic (strix1/strix3, same binary, no DSpark) | 16.6 | sha256 `87964cbd…` (3 runs byte-identical) |
+| 2 nodes, uniform expert sharding (50 % experts per rank, 45.7 GiB) | 14.3 | sha256 `87964cbd…` — **byte-identical to the single node** (3 runs byte-identical) |
+| 2 nodes, diagnostic placement all experts on rank 0 | — | per-layer FFN checksums match the monolithic path to 7 digits for layers 0-20, then 1e-6..3e-4 float drift |
+
+Correctness proof from `DFLASH_CLUSTER_TRACE=1`: for every layer `partial_pre(rank0) + partial_pre(rank1) == partial_post == full routed sum` to 7 digits; the shared expert is added once. Free-form prompts can still diverge from the single node at greedy near-ties because the HC / attention path amplifies 1e-7 summation-order noise (measured: `hc_after_ffn(7)` 4e-7 -> `attn_out(8)` 2e-4); the same drift exists between the monolithic fused and per-layer paths. Do not use bf16 for the decode/prefill reduction (`--cluster-allreduce-dtype auto` reduces in f32 since 05466b2); the first runs with bf16 prefill partials produced a wrong early EOS.
+
+Quality probe (5 short reasoning/translation questions, 48 tokens): cluster 3/5 = single node 3/5 (both misses are truncations).
+
+Not yet done: DSpark on the cluster (WP4), prefill performance (WP5), `usage.timings.cluster` (WP6), 4-node model run, performance work (M2/M3). The 2-node AR decode is slower than a single node because path 3a waits on the host after every layer's all-reduce.
+
+### M1 artifact and diagnostics
+- Diagnostic placement JSON: `python server/scripts/cluster/build_expert_placement.py --dims 43,256,6 -n 2 --all-on-rank 0 -o all_rank0.json`
+- Trace run: `EXTRA_ENV="DFLASH_CLUSTER_TRACE=1 DFLASH_CLUSTER_PREFILL_SINGLE_TOKEN=1" scripts/cluster/launch_cluster.sh ... -- --ds4-prefill exact --chunk 1`, then `podman logs lucebox-rank0 | grep cluster-stage`
+- Reference: same binary monolithic with `DFLASH_CLUSTER_TRACE=1 --ds4-prefill exact --chunk 1` prints the same lines as rank -1.
