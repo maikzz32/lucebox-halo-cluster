@@ -128,6 +128,14 @@ void ds4_cluster_mask_routes(const Ds4ClusterRuntime & rt,
                              int route_width,
                              int n_tokens);
 
+// Diagnostics: sum and sum of |x| over n floats (DFLASH_CLUSTER_TRACE lines).
+void ds4_cluster_checksum(const float * data, size_t n, double * sum, double * sum_abs);
+
+// DFLASH_CLUSTER_PREFILL_SINGLE_TOKEN=1: run cluster prefill token by token
+// (n_tokens == 1 chunks through the decode path) to bisect multi-token
+// prefill numerics. Cached after the first call.
+bool ds4_cluster_env_prefill_single_token();
+
 // All-reduce a device-resident F32 partial [n_embd, n_tokens] in place on the
 // backend stream. Stays stream-ordered (no host sync) unless rt.trace is set,
 // in which case it waits with cfg->timeout_ms and logs the layer. Updates

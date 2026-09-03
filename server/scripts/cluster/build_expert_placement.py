@@ -103,7 +103,15 @@ def build_balanced(n_ranks, n_layer, n_expert, rows, replicate_hot):
     return owner
 
 
-def validate(owner, n_ranks, n_expert):
+def build_all_on_rank(rank, n_ranks, n_layer, n_expert):
+    # Diagnostic: one rank owns every expert, the others hold empty shards.
+    # The cluster must then reproduce the single-node output exactly.
+    if rank < 0 or rank >= n_ranks:
+        raise ValueError("--all-on-rank must be in [0, ranks)")
+    return [[rank] * n_expert for _ in range(n_layer)]
+
+
+def validate(owner, n_ranks, n_expert, allow_empty=False):
     for il, row in enumerate(owner):
         replicated = sum(1 for o in row if o == -1)
         owned = [0] * n_ranks
@@ -114,7 +122,11 @@ def validate(owner, n_ranks, n_expert):
                 raise ValueError("layer %d expert %d owner %d out of range" % (il, e, o))
             owned[o] += 1
         if n_expert - replicated >= n_ranks and min(owned) == 0:
-            raise ValueError("layer %d: rank %d owns no expert" % (il, owned.index(0)))
+            if allow_empty:
+                print("warning: layer %d: rank %d owns no expert (diagnostic placement)"
+                      % (il, owned.index(0)), file=sys.stderr)
+            else:
+                raise ValueError("layer %d: rank %d owns no expert" % (il, owned.index(0)))
 
 
 def report(owner, rows, n_ranks, n_layer, n_expert):
@@ -164,7 +176,12 @@ def report(owner, rows, n_ranks, n_layer, n_expert):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("csv", help="routing hotness CSV (MoeHybridRoutingStats::save_csv)")
+    ap.add_argument("csv", nargs="?", help="routing hotness CSV (MoeHybridRoutingStats::save_csv); "
+                    "optional with --dims")
+    ap.add_argument("--dims", help="L,E,K (n_layer,n_expert,n_expert_used) when no CSV is given, "
+                    "e.g. 43,256,6 for DeepSeek V4 Flash")
+    ap.add_argument("--all-on-rank", type=int, default=None,
+                    help="diagnostic: rank R owns every expert, other ranks get empty shards")
     ap.add_argument("--ranks", "-n", type=int, required=True, help="cluster size N (2..8)")
     ap.add_argument("--mode", choices=("uniform", "balanced"), default="balanced")
     ap.add_argument("--replicate-hot", type=int, default=0, help="replicate the k hottest experts per layer")
@@ -177,15 +194,26 @@ def main():
     if args.replicate_hot < 0:
         sys.exit("--replicate-hot must be >= 0")
 
-    n_layer, n_expert, n_expert_used, rows = load_hotness_csv(args.csv)
+    if args.csv:
+        n_layer, n_expert, n_expert_used, rows = load_hotness_csv(args.csv)
+    elif args.dims:
+        n_layer, n_expert, n_expert_used = (int(x) for x in args.dims.split(","))
+        rows = [[0] * n_expert for _ in range(n_layer)]
+    else:
+        sys.exit("give a hotness CSV or --dims L,E,K")
     if args.replicate_hot > n_expert - args.ranks:
         sys.exit("--replicate-hot leaves fewer experts than ranks")
 
-    if args.mode == "uniform":
+    if args.all_on_rank is not None:
+        owner = build_all_on_rank(args.all_on_rank, args.ranks, n_layer, n_expert)
+        args.replicate_hot = 0
+    elif args.mode == "uniform":
         owner = build_uniform(args.ranks, n_layer, n_expert, rows, args.replicate_hot)
     else:
+        if not args.csv:
+            sys.exit("balanced placement needs a hotness CSV")
         owner = build_balanced(args.ranks, n_layer, n_expert, rows, args.replicate_hot)
-    validate(owner, args.ranks, n_expert)
+    validate(owner, args.ranks, n_expert, allow_empty=args.all_on_rank is not None)
 
     doc = {
         "n_ranks": args.ranks,

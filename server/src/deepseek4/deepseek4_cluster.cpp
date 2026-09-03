@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace dflash::common {
@@ -95,9 +96,25 @@ bool allreduce_device(Ds4ClusterRuntime & rt,
 
     const uint64_t bytes_f32 = (uint64_t) n * sizeof(float);
     const cluster::AllreduceDType dtype = rt.cfg->allreduce_dtype;
-    const bool use_bf16 =
-        dtype == cluster::AllreduceDType::BF16 ||
-        (dtype == cluster::AllreduceDType::Auto && bytes_f32 > cluster::kAutoBf16ThresholdBytes);
+    // M1 correctness first: `auto` resolves to F32 for every size. The bf16
+    // compressed collective rounds each per-layer partial to 8 mantissa
+    // bits; over 43 layers of a multi-token prefill (>256 KiB payload, which
+    // `auto` would have sent as bf16) that visibly changes the first
+    // generated token. bf16 stays available as an explicit
+    // --cluster-allreduce-dtype bf16 for the WP5 prefill measurements.
+    // TODO(cluster-verify): re-enable the auto threshold once a bf16 prefill
+    // run is token-identical to f32 on the qualification prompts.
+    const bool use_bf16 = dtype == cluster::AllreduceDType::BF16;
+    if (dtype == cluster::AllreduceDType::Auto && bytes_f32 > cluster::kAutoBf16ThresholdBytes) {
+        static bool logged_auto_f32 = false;
+        if (!logged_auto_f32) {
+            logged_auto_f32 = true;
+            std::fprintf(stderr,
+                         "[deepseek4-cluster] allreduce dtype auto: using f32 for %llu-byte "
+                         "partials (bf16 auto-switch disabled until verified)\n",
+                         (unsigned long long) bytes_f32);
+        }
+    }
 
     bool ok = false;
     uint64_t payload = 0;
@@ -358,6 +375,29 @@ bool ds4_cluster_init_experts(const std::string & model_path,
                  rt.placement.total_owned(rt.rank()),
                  resident - rt.placement.total_owned(rt.rank()));
     return true;
+}
+
+// ─── Diagnostics ────────────────────────────────────────────────────────
+
+void ds4_cluster_checksum(const float * data, size_t n, double * sum, double * sum_abs) {
+    double s = 0.0;
+    double a = 0.0;
+    if (data) {
+        for (size_t i = 0; i < n; ++i) {
+            s += (double) data[i];
+            a += (double) (data[i] < 0.0f ? -data[i] : data[i]);
+        }
+    }
+    if (sum) *sum = s;
+    if (sum_abs) *sum_abs = a;
+}
+
+bool ds4_cluster_env_prefill_single_token() {
+    static const bool enabled = [] {
+        const char * v = std::getenv("DFLASH_CLUSTER_PREFILL_SINGLE_TOKEN");
+        return v && v[0] && std::strcmp(v, "0") != 0;
+    }();
+    return enabled;
 }
 
 // ─── Route masking ──────────────────────────────────────────────────────

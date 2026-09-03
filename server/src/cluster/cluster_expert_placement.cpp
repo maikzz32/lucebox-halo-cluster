@@ -308,7 +308,7 @@ bool ClusterExpertPlacement::valid(std::string * err) const {
         // When there are at least n_ranks non-replicated experts, every rank
         // must own at least one: a rank with no owned experts would evaluate
         // only replicated routes, which is never what the operator wanted.
-        if (n_expert - replicated >= n_ranks) {
+        if (n_expert - replicated >= n_ranks && !allow_empty_shards) {
             for (int r = 0; r < n_ranks; ++r) {
                 if (owned[(size_t) r] == 0) {
                     set_err(err, "rank " + std::to_string(r) + " owns no expert in layer " +
@@ -538,7 +538,21 @@ bool ClusterExpertPlacement::load_json(const std::string & path, ClusterExpertPl
         set_err(err, "placement json: owner table does not match n_layer x n_expert");
         return false;
     }
+    // Files are the diagnostic entry point: tolerate empty shards, but say so.
+    parsed.allow_empty_shards = true;
     if (!parsed.valid(err)) return false;
+    for (int r = 0; r < parsed.n_ranks; ++r) {
+        for (int il = 0; il < parsed.n_layer; ++il) {
+            if (parsed.owned_count(il, r) == 0) {
+                std::fprintf(stderr,
+                             "[cluster-placement] warning: %s leaves rank %d with no owned "
+                             "expert in layer %d (diagnostic placement; every route of that "
+                             "layer is evaluated elsewhere)\n",
+                             path.c_str(), r, il);
+                break;
+            }
+        }
+    }
     out = std::move(parsed);
     return true;
 }

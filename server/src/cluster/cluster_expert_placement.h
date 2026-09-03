@@ -33,6 +33,11 @@ struct ClusterExpertPlacement {
     int n_expert = 0;
     int n_expert_used = 0;
     int replicate_hot = 0;   // replicated experts per layer (informational)
+    // Diagnostics only: set by load_json so a hand-written file may leave a
+    // rank with no owned expert in a layer (e.g. rank 0 owns everything and
+    // rank 1 nothing, which must reproduce the single-node output exactly if
+    // the cluster path is correct). Builders never set it.
+    bool allow_empty_shards = false;
 
     // Flattened [layer * n_expert + expert] -> owner rank, or kReplicated.
     std::vector<int32_t> owner;
