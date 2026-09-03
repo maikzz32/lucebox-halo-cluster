@@ -99,3 +99,46 @@ clean-models:  ## Remove downloaded models from $(MODELS_DIR). Destructive.
 	  read -r -p "Continue? [y/N] " ans; \
 	  [ "$$ans" = "y" ] || { echo "Aborted."; exit 0; }; \
 	  rm -rf -- "$$resolved"/*
+
+# ── Cluster (lucebox-halo-cluster) ───────────────────────────────────────
+# Multi-node expert-parallel DeepSeek V4 across 2-4 Strix Halo nodes.
+# Full guide: server/docs/CLUSTER.md. The scripts talk to the nodes over ssh
+# aliases (strix1..strix4) and never touch containers they did not start.
+DFLASH_HIP_ARCHES ?= gfx1151
+CLUSTER_HOSTS   ?= strix1 strix2
+CLUSTER_IMAGE   ?= ghcr.io/maikzz32/lucebox-halo-cluster:dev
+CLUSTER_MODELS  ?= /home/maik/gguf/ds4
+CLUSTER_TARGET  ?= DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf
+CLUSTER_DRAFT   ?= DeepSeek-V4-Flash-0731-DSpark-draft-Q4RMFP4-denseF16.gguf
+
+.PHONY: build-rocm-cluster
+build-rocm-cluster:  ## Bake the ROCm 10 / RCCL cluster image (Dockerfile.rocm-cluster) locally.
+	DFLASH_HIP_ARCHES="$(DFLASH_HIP_ARCHES)" docker buildx bake rocm-cluster-local --load
+
+.PHONY: cluster-host-check
+cluster-host-check:  ## Check-only host prerequisites on every CLUSTER_HOSTS node (RDMA, MTU, kernel cmdline, ...).
+	@for h in $(CLUSTER_HOSTS); do \
+	  echo "== $$h"; \
+	  ssh "$$h" 'bash -s' < scripts/cluster/host_prep.sh || true; \
+	done
+
+.PHONY: cluster-fetch-models
+cluster-fetch-models:  ## Resumable, sha256-verified download of target + DSpark GGUF into CLUSTER_MODELS on the first host.
+	ssh "$(firstword $(CLUSTER_HOSTS))" 'bash -s -- --dir $(CLUSTER_MODELS)' < scripts/cluster/fetch_models.sh
+
+.PHONY: cluster-baseline
+cluster-baseline:  ## all_reduce_perf 8K..64M over CLUSTER_HOSTS inside the running lucebox-rank* containers.
+	scripts/cluster/rccl_baseline.sh "$(CLUSTER_HOSTS)"
+
+.PHONY: cluster-up
+cluster-up:  ## Start rank 0 + workers (podman on each host) with the DS4 target/DSpark GGUFs.
+	IMAGE="$(CLUSTER_IMAGE)" MODELS_DIR="$(CLUSTER_MODELS)" \
+	  scripts/cluster/launch_cluster.sh "$(CLUSTER_HOSTS)" "$(CLUSTER_TARGET)" "$(CLUSTER_DRAFT)"
+
+.PHONY: cluster-status
+cluster-status:  ## podman ps + log tail of lucebox-rank* on every host.
+	scripts/cluster/launch_cluster.sh --status "$(CLUSTER_HOSTS)"
+
+.PHONY: cluster-down
+cluster-down:  ## Stop and remove only the lucebox-rank* containers on every host.
+	scripts/cluster/launch_cluster.sh --down "$(CLUSTER_HOSTS)"

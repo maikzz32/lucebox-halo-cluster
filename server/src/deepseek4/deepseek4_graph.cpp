@@ -9,6 +9,7 @@
 //   6. MoE FFN (hash routing + top-k + shared expert + clamped SwiGLU)
 
 #include "deepseek4_internal.h"
+#include "deepseek4_cluster.h"
 #include "deepseek4_hc_cuda.h"
 #include "deepseek4_roctx.h"
 #include "internal.h"
@@ -4650,6 +4651,17 @@ bool deepseek4_step(
         MoeHybridRoutingStats * routing_stats,
         Ds4VerifyHooks * verify_hooks,
         MoeExpertComputeRuntime * expert_runtime) {
+    if (cache.cluster_rt && moe_hybrid != nullptr) {
+        // Cluster rank: the legacy CPU-HC hybrid step has no all-reduce
+        // insertion point. Route through the cached per-layer forward, which
+        // reduces the routed partial inside eval_ds4_layer_range_hybrid_ffn.
+        std::vector<float> hc_state;
+        return deepseek4_step_layer_range(
+            backend, device, w, cache, hc_state, embed, n_tokens, kv_start,
+            0, w.n_layer, &out_logits, token_ids, telemetry,
+            /*allow_decode_graph_reuse=*/verify_hooks == nullptr, verify_hooks,
+            moe_hybrid, expert_runtime, routing_stats);
+    }
     if (w.moe_hybrid && moe_hybrid != nullptr) {
         if (!deepseek4_cuda_hc_set_device(device)) {
             std::fprintf(stderr,
@@ -5683,7 +5695,11 @@ static bool eval_ds4_layer_range_hybrid_ffn(
         MoeHybridRoutingStats * routing_stats,
         std::vector<float> & out,
         DeepSeek4StepTelemetry * telemetry,
-        const MoeHybridDeviceOutputs * device_outputs = nullptr) {
+        const MoeHybridDeviceOutputs * device_outputs = nullptr,
+        // Cluster expert-parallel (path 3a): mask routes to experts this rank
+        // does not evaluate, all-reduce the routed partial across ranks, then
+        // add the locally computed shared expert. nullptr = upstream path.
+        Ds4ClusterRuntime * cluster_rt = nullptr) {
     const bool trace_prefill = ds4_env_flag("DFLASH_DS4_PREFILL_TRACE");
     if (trace_prefill) {
         std::fprintf(stderr,
@@ -5915,6 +5931,29 @@ static bool eval_ds4_layer_range_hybrid_ffn(
     MoeHybridConfig cfg = make_ds4_moe_hybrid_config(w);
     cfg.n_expert_used = route_width;
     MoeLayerDesc desc = make_ds4_moe_layer_desc(L);
+    // Cluster: the shared expert is replicated on every rank and must not be
+    // part of the reduced partial. Evaluate the routed experts with the shexp
+    // tensors cleared (per-layer equivalent of include_shared=false) and add
+    // the full-desc shared term after the all-reduce below. Routes to
+    // experts another rank evaluates become id -1 / weight 0, which every
+    // hybrid evaluator treats as "contributes zero" under cold owner None.
+    // Slot = token index inside this batch (identical on all ranks).
+    const MoeLayerDesc shared_desc = desc;
+    if (cluster_rt) {
+        if (cluster_rt->cfg &&
+            cluster_rt->cfg->shared_expert != cluster::SharedExpertMode::Replicate) {
+            std::fprintf(stderr,
+                         "[deepseek4-cluster] layer %d: shared expert mode %s not implemented\n",
+                         layer, cluster::shared_expert_mode_name(cluster_rt->cfg->shared_expert));
+            return false;
+        }
+        ds4_cluster_mask_routes(*cluster_rt, layer, selected.data(), weights.data(),
+                                route_width, n_tokens);
+        desc.ffn_gate_shexp = nullptr;
+        desc.ffn_up_shexp = nullptr;
+        desc.ffn_down_shexp = nullptr;
+        desc.ffn_gate_inp_shexp = nullptr;
+    }
     ggml_gallocr_t * hot_alloc = persistent_owner_alloc
         ? &hybrid.prefill_hot_alloc : nullptr;
     ggml_gallocr_t * cold_alloc = persistent_owner_alloc
@@ -5942,7 +5981,57 @@ static bool eval_ds4_layer_range_hybrid_ffn(
                      layer, ok ? "ok" : "failed",
                      ds4_elapsed_us(owners_t0, Ds4TimingClock::now()) / 1000.0);
     }
-    return ok;
+    if (!ok || !cluster_rt) return ok;
+
+    // ── Cluster (path 3a): reduce the routed partial, then add the shared expert ──
+    // `out` is the host copy of this rank's routed partial [n_embd, n_tokens]
+    // (cluster mode never takes the device_ffn_input / device-join branches:
+    // both require a GPU cold owner). The all-reduce stages it through the
+    // runtime's device scratch on the backend stream and waits, so the sum is
+    // identical on every rank before HC-post consumes it.
+    if (out.size() != (size_t) n_embd * (size_t) n_tokens) {
+        std::fprintf(stderr,
+                     "[deepseek4-cluster] layer %d: routed partial has %zu floats, expected %zu\n",
+                     layer, out.size(), (size_t) n_embd * (size_t) n_tokens);
+        return false;
+    }
+    std::string cluster_err;
+    if (!ds4_cluster_allreduce_layer_host(
+            *cluster_rt, backend, out.data(),
+            n_embd, n_tokens, layer, telemetry, &cluster_err)) {
+        std::fprintf(stderr, "[deepseek4-cluster] layer %d all-reduce failed: %s\n",
+                     layer, cluster_err.c_str());
+        return false;
+    }
+    if (shared_desc.has_shared_expert()) {
+        if (device_ffn_input || normed_host.empty()) {
+            std::fprintf(stderr,
+                         "[deepseek4-cluster] layer %d: shared expert needs the host "
+                         "normalized activation\n", layer);
+            return false;
+        }
+        const auto shared_t0 = Ds4TimingClock::now();
+        std::vector<float> shared_out;
+        if (!eval_moe_shared_expert_batched(
+                backend, cfg, shared_desc, hybrid.layers[(size_t)layer],
+                normed_host.data(), n_tokens, shared_out, &cluster_err)) {
+            std::fprintf(stderr, "[deepseek4-cluster] layer %d shared expert failed: %s\n",
+                         layer, cluster_err.c_str());
+            return false;
+        }
+        for (size_t i = 0; i < out.size(); ++i) out[i] += shared_out[i];
+        if (telemetry) {
+            telemetry->ffn_eval_us += ds4_elapsed_us(shared_t0, Ds4TimingClock::now());
+        }
+    }
+    if (cluster_rt->trace) {
+        std::fprintf(stderr,
+                     "[deepseek4-cluster] rank %d layer %d tokens=%d routed partial reduced, "
+                     "shared=%s\n",
+                     cluster_rt->rank(), layer, n_tokens,
+                     shared_desc.has_shared_expert() ? "added" : "none");
+    }
+    return true;
 }
 
 // Exact-order prefill control: retain the layer-major HC/FFN schedule, but run
@@ -6893,6 +6982,23 @@ bool deepseek4_step_layer_range(
     const int n_hc = w.n_hc;
     const int hc_dim = n_hc * n_embd;
     const bool is_last_shard = (layer_end >= w.n_layer);
+    // Cluster expert-parallel (path 3a): the all-reduce is a host-driven call
+    // between per-layer graph computes, so every whole-model fused graph
+    // (DSpark fused verify, fused hybrid q=1 decode, --ds4-fused-decode,
+    // layer-major prefill) is forced off and the per-layer loop below runs.
+    const bool cluster_mode = cache.cluster_rt != nullptr;
+    if (cluster_mode) {
+        static bool logged_cluster_mode = false;
+        if (!logged_cluster_mode) {
+            logged_cluster_mode = true;
+            std::fprintf(stderr,
+                         "[deepseek4-cluster] fused decode/verify graphs disabled "
+                         "(DFLASH_DS4_FUSED_VERIFY, DFLASH_DS4_FUSED_HYBRID_DECODE, "
+                         "--ds4-fused-decode, DFLASH_DS4_VERIFY_FORCE_GRAPH_REPLAY "
+                         "ignored); per-layer forward with one all-reduce per MoE "
+                         "layer (path 3a)\n");
+        }
+    }
     const bool fused_hybrid_ready =
         moe_hybrid && !expert_runtime &&
         moe_hybrid->materialized_cold_experts &&
@@ -6907,7 +7013,8 @@ bool deepseek4_step_layer_range(
         (n_tokens <= DS4_CONSERVATIVE_VERIFY_MAX_TOKENS ||
          wide_verify_candidate) && verify_hooks &&
         layer_begin == 0 && is_last_shard && out_logits &&
-        ds4_backend_is_gpu(backend) && ds4_fused_verify_enabled();
+        ds4_backend_is_gpu(backend) && ds4_fused_verify_enabled() &&
+        !cluster_mode;
     // Fused verify has many preconditions and declining any of them is
     // invisible: the request still decodes, still reports a healthy acceptance
     // rate, and only the throughput differs. Name the failed condition once so
@@ -6955,7 +7062,8 @@ bool deepseek4_step_layer_range(
         !w.moe_hybrid && cache.prefill_mode != PrefillAttentionMode::Exact &&
         n_tokens > 4 && n_tokens <= DS4_MAX_LAYER_MAJOR_PREFILL_TOKENS &&
         layer_begin == 0 && is_last_shard && out_logits &&
-        ds4_backend_is_gpu(backend) && layer_major_hooks_supported;
+        ds4_backend_is_gpu(backend) && layer_major_hooks_supported &&
+        !cluster_mode;
     // These graphs are rebuilt around an owner join on every layer, so tensor
     // metadata addresses can be recycled for different topologies.  Until
     // the full heterogeneous layer is captured as one stable scheduler graph,
@@ -7207,7 +7315,7 @@ bool deepseek4_step_layer_range(
     // native AR before the drafter has run at all.
     const bool fused_hybrid_decode =
         fused_hybrid_ready && n_tokens == 1 && allow_decode_graph_reuse &&
-        ds4_env_flag("DFLASH_DS4_FUSED_HYBRID_DECODE");
+        !cluster_mode && ds4_env_flag("DFLASH_DS4_FUSED_HYBRID_DECODE");
     std::vector<int> fused_hybrid_decode_capture_ids;
     Ds4VerifyHooks fused_hybrid_decode_hooks;
     if (fused_hybrid_decode && !verify_hooks) {
@@ -7266,7 +7374,7 @@ bool deepseek4_step_layer_range(
         }
     }
     std::vector<float> fused_debug_logits;
-    if (!moe_hybrid && n_tokens == 1 && allow_decode_graph_reuse && layer_begin == 0 && is_last_shard &&
+    if (!cluster_mode && !moe_hybrid && n_tokens == 1 && allow_decode_graph_reuse && layer_begin == 0 && is_last_shard &&
         !(verify_hooks && verify_hooks->capture_layer_ids &&
           verify_hooks->capture_out) &&
         out_logits && ds4_backend_is_gpu(backend) &&
@@ -8159,7 +8267,8 @@ bool deepseek4_step_layer_range(
                         token_ids, hash_routing_tables_range[(size_t)il],
                         *moe_hybrid, expert_runtime, routing_stats,
                         ffn_out_host, telemetry,
-                        ffn_device_join ? &owner_outputs : nullptr)) {
+                        ffn_device_join ? &owner_outputs : nullptr,
+                        cache.cluster_rt)) {
                     std::fprintf(stderr,
                                  "[deepseek4-moe-tp] layer-range FFN failed layer %d\n",
                                  il);

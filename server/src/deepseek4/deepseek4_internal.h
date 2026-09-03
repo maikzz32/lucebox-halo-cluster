@@ -79,6 +79,12 @@ struct DeepSeek4StepTelemetry {
     uint64_t full_graph_set_us = 0;
     uint64_t full_graph_compute_us = 0;
     uint64_t full_graph_read_us = 0;
+    // Cluster expert-parallel (server/src/cluster): host time spent in the
+    // per-layer all-reduce helper, payload bytes handed to the communicator,
+    // and time blocked on the control channel (decisions/drafts from rank 0).
+    uint64_t cluster_allreduce_us = 0;
+    uint64_t cluster_allreduce_bytes = 0;
+    uint64_t cluster_ctrl_wait_us = 0;
     int hot_selected = 0;
     int cold_selected = 0;
 };
@@ -278,6 +284,11 @@ struct DeepSeek4LayerCache {
 // DeepSeek4Cache below and released by free_deepseek4_cache().
 struct DeepSeek4LayerRangeCache;
 
+// Expert-parallel cluster runtime (deepseek4_cluster.h). Non-null only when
+// the backend runs as one rank of a cluster; the per-layer forward then
+// masks routes to non-local experts and all-reduces the routed partial.
+struct Ds4ClusterRuntime;
+
 struct DeepSeek4Cache {
     int cur_pos  = 0;
     int max_ctx  = 0;
@@ -291,6 +302,10 @@ struct DeepSeek4Cache {
 
     // Lazily created on the first deepseek4_step_layer_range call.
     DeepSeek4LayerRangeCache * layer_range_cache = nullptr;
+
+    // Set by DeepSeek4Backend when it runs as a cluster rank; owned by the
+    // backend, never freed here. nullptr keeps every forward path unchanged.
+    Ds4ClusterRuntime * cluster_rt = nullptr;
 
     ggml_context *        ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;

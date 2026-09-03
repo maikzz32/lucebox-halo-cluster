@@ -24,6 +24,7 @@
 #include "deepseek4_dspark.h"
 #include "deepseek4_internal.h"
 #include "deepseek4_roctx.h"
+#include "cluster/cluster_decision_hooks.h"
 #include "internal.h"
 #include "common/dspark_head.h"
 
@@ -654,9 +655,15 @@ bool run_deepseek4_dspark_spec_decode(
         const std::function<bool(int32_t)> & on_token,
         MoeHybridStorage * moe_hybrid,
         MoeExpertComputeRuntime * expert_runtime,
-        MoeHybridRoutingStats * routing_stats) {
+        MoeHybridRoutingStats * routing_stats,
+        dflash::cluster::Ds4ClusterHooks * cluster_hooks) {
     const int n_embd = target_w.n_embd;
     const int n_tgt = drafter.n_target_layers;
+    // Cluster lockstep (WP4 plumbing). Only a real head/worker hook changes
+    // behaviour; nullptr and LocalHooks leave the single-node algorithm as is.
+    const bool cluster_spec = cluster_hooks && cluster_hooks->is_cluster();
+    const bool cluster_spec_head = cluster_spec && cluster_hooks->is_head();
+    const uint64_t cluster_req = cluster_hooks ? cluster_hooks->current_request() : 0;
     const int block = drafter.block_size;
     const int n_swa = target_w.n_swa;
     const int feat_row = n_tgt * n_embd;
@@ -944,6 +951,32 @@ bool run_deepseek4_dspark_spec_decode(
             if ((int) draft_tok.size() > selected_q) draft_tok.resize((size_t) selected_q);
         }
         if ((int) draft_tok.size() > q_step_cap) draft_tok.resize(q_step_cap);
+        // TODO(WP4): cluster draft exchange. The head has the drafter and the
+        // adaptive width; workers must verify the identical block. Workers
+        // will skip the drafter forward above entirely once WP4 lands (no
+        // drafter loaded on ranks > 0); today this only synchronizes the
+        // block so both sides run the same verify_batch shape.
+        if (cluster_spec_head) {
+            std::string err;
+            if (!cluster_hooks->decide_draft(cluster_req, (uint32_t) steps, pos, draft_tok, &err)) {
+                std::fprintf(stderr, "[ds4-spec] cluster draft broadcast failed: %s\n", err.c_str());
+                ok = false;
+                break;
+            }
+        } else if (cluster_spec) {
+            std::string err;
+            if (!cluster_hooks->decide_draft(cluster_req, (uint32_t) steps, pos, draft_tok, &err)) {
+                std::fprintf(stderr, "[ds4-spec] cluster draft missing: %s\n", err.c_str());
+                ok = false;
+                break;
+            }
+            if (draft_tok.empty() || draft_tok[0] != lt) {
+                std::fprintf(stderr, "[ds4-spec] cluster draft seed %d != local seed %d\n",
+                             draft_tok.empty() ? -1 : draft_tok[0], lt);
+                ok = false;
+                break;
+            }
+        }
         const int q = (int) draft_tok.size();   // seed + candidates
         tm_head += spec_ms_since(t0);
         if (debug && wide_verify && steps == 0) {
@@ -1036,8 +1069,35 @@ bool run_deepseek4_dspark_spec_decode(
             if (draft_tok[i + 1] == tgt_am[i]) accept++;
             else break;
         }
+        int bonus = tgt_am[accept - 1];                       // target's token at the accept point
+        // TODO(WP4): the head's accept/bonus are authoritative. Workers
+        // compute their own above (identical when the EP graph is exact) but
+        // overwrite with the head's so a numerically different argmax on one
+        // rank cannot desynchronize the rollback below. EOS/stop flags will
+        // travel here too once the loop's stop handling is cluster-aware.
+        if (cluster_spec) {
+            int32_t accept_msg = accept;
+            int32_t bonus_msg = bonus;
+            uint8_t accept_flags = 0;
+            std::string err;
+            if (!cluster_hooks->decide_accept(cluster_req, (uint32_t) steps,
+                                              accept_msg, bonus_msg, accept_flags, &err)) {
+                std::fprintf(stderr, "[ds4-spec] cluster accept exchange failed: %s\n", err.c_str());
+                ok = false;
+                break;
+            }
+            if (!cluster_spec_head) {
+                if (accept_msg < 1 || accept_msg > q) {
+                    std::fprintf(stderr, "[ds4-spec] cluster accept=%d outside [1,%d]\n",
+                                 accept_msg, q);
+                    ok = false;
+                    break;
+                }
+                accept = accept_msg;
+                bonus = bonus_msg;
+            }
+        }
         const int matched = accept - 1;                       // accepted candidates
-        const int bonus = tgt_am[accept - 1];                 // target's token at the accept point
         const int commit_pos = pos + accept;                  // seed + accepted candidates in KV
 
         if (timing && steps < 8 && q >= 2) {

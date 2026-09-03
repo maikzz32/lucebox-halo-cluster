@@ -5759,6 +5759,22 @@ void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * tot
     CUDA_CHECK(cudaMemGetInfo(free, total));
 }
 
+void * ggml_backend_cuda_get_stream(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return nullptr;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    return (void *) cuda_ctx->stream();
+}
+
+int ggml_backend_cuda_get_device_id(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return -1;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    return cuda_ctx->device;
+}
+
 bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
     if (getenv("GGML_CUDA_REGISTER_HOST") == nullptr) {
         return false;

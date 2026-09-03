@@ -4,6 +4,11 @@ set_property(CACHE DFLASH27B_GPU_BACKEND PROPERTY STRINGS cuda hip)
 option(DFLASH27B_ENABLE_MIXED_CUDA_HIP
     "Primary GPU runtime plus an isolated in-process CUDA/HIP peer (Linux only)"
     OFF)
+# lucebox-halo-cluster: SPMD expert-parallel DeepSeek4 across 2-8 Strix Halo
+# nodes over RCCL/RoCE. OFF keeps the build byte-identical to upstream; the
+# GPU-free cluster sources (config, protocol, control channel, gates) are
+# always compiled so the CLI flags and unit tests exist in every build.
+option(DFLASH27B_CLUSTER "Multi-node RCCL expert-parallel cluster (HIP only)" OFF)
 string(TOLOWER "${DFLASH27B_GPU_BACKEND}" DFLASH27B_GPU_BACKEND)
 if(DFLASH27B_ENABLE_MIXED_CUDA_HIP)
     # Reject unsupported targets before project() tries to discover both GPU
@@ -144,6 +149,11 @@ endif()
 # No BLAS, no Metal, no Vulkan, no examples/tests/tools.
 
 if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+    if(DFLASH27B_CLUSTER)
+        message(FATAL_ERROR
+            "DFLASH27B_CLUSTER requires DFLASH27B_GPU_BACKEND=hip "
+            "(the cluster path is RCCL on gfx1151 only)")
+    endif()
     set(GGML_CUDA ON CACHE BOOL "" FORCE)
     if(DFLASH27B_ENABLE_MIXED_CUDA_HIP)
         set(GGML_HIP ON CACHE BOOL "" FORCE)
@@ -179,7 +189,13 @@ elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
         set(GGML_CUDA_MODULE OFF CACHE BOOL "" FORCE)
     endif()
     set(GGML_HIP  ON  CACHE BOOL "" FORCE)
-    set(GGML_HIP_RCCL OFF CACHE BOOL "" FORCE)
+    if(DFLASH27B_CLUSTER)
+        # ggml-hip then find_package(rccl), defines GGML_USE_NCCL and links
+        # roc::rccl; the cluster communicator links the same target below.
+        set(GGML_HIP_RCCL ON CACHE BOOL "" FORCE)
+    else()
+        set(GGML_HIP_RCCL OFF CACHE BOOL "" FORCE)
+    endif()
     set(GGML_HIP_GRAPHS OFF CACHE BOOL "Enable experimental HIP graph replay")
     set(DFLASH27B_GGML_BACKEND_TARGET ggml-hip)
     set(DFLASH27B_HIP_ARCHITECTURES "" CACHE STRING "HIP GPU targets, e.g. gfx906;gfx1100")
@@ -218,6 +234,33 @@ option(DFLASH27B_ROCMFP2_AFFINE
     OFF)
 if(DFLASH27B_ROCMFP2_AFFINE)
     add_compile_definitions(ROCMFP2_AFFINE=1)
+endif()
+
+# Cluster build: DFLASH27B_CLUSTER gates the runtime branches in the model
+# code, DFLASH27B_CLUSTER_RCCL gates the RCCL communicator implementation.
+# The build identity is exchanged in the control-channel Hello so ranks
+# running different binaries refuse to form a cluster.
+if(DFLASH27B_CLUSTER)
+    add_compile_definitions(DFLASH27B_CLUSTER=1 DFLASH27B_CLUSTER_RCCL=1)
+    find_package(Git QUIET)
+    set(_dflash_build_sha "unknown")
+    if(GIT_FOUND)
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} describe --always --dirty --tags
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+            OUTPUT_VARIABLE _dflash_build_sha_out
+            RESULT_VARIABLE _dflash_build_sha_rc
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET)
+        if(_dflash_build_sha_rc EQUAL 0 AND _dflash_build_sha_out)
+            set(_dflash_build_sha "${_dflash_build_sha_out}")
+        endif()
+        unset(_dflash_build_sha_out)
+        unset(_dflash_build_sha_rc)
+    endif()
+    add_compile_definitions(DFLASH27B_BUILD_SHA="${_dflash_build_sha}")
+    message(STATUS "lucebox-halo-cluster: DFLASH27B_CLUSTER=ON (build sha ${_dflash_build_sha})")
+    unset(_dflash_build_sha)
 endif()
 
 # HIP Phase 2 — opt-in rocWMMA flashprefill kernels (Strix Halo / gfx1151).
@@ -475,6 +518,7 @@ add_library(dflash_common STATIC
     src/deepseek4/deepseek4_target_shard_ipc_daemon.cpp
     src/deepseek4/deepseek4_dspark.cpp
     src/deepseek4/deepseek4_dspark_spec.cpp
+    src/deepseek4/deepseek4_cluster.cpp
     src/flashprefill_q8.cpp
     src/kv_cache.cpp
     src/kv_quant.cpp
@@ -544,6 +588,16 @@ add_library(dflash_common STATIC
     src/common/backend_factory.cpp
     src/common/feature_gate.cpp
     src/placement/placement_config.cpp
+    # ── Multi-node cluster (lucebox-halo-cluster). GPU-free parts are always
+    # compiled; cluster_comm.cpp's RCCL half is under DFLASH27B_CLUSTER_RCCL.
+    src/cluster/cluster_config.cpp
+    src/cluster/cluster_protocol.cpp
+    src/cluster/cluster_control.cpp
+    src/cluster/cluster_comm.cpp
+    src/cluster/cluster_expert_placement.cpp
+    src/cluster/cluster_decision_hooks.cpp
+    src/cluster/cluster_head_backend.cpp
+    src/cluster/cluster_worker_main.cpp
     src/common/layer_split_utils.cpp
     src/common/ddtree.cpp
     src/common/peer_access.cpp
@@ -617,6 +671,14 @@ elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
     # hip_compat shim is needed by ALL dflash_common sources (peer_access.cpp,
     # dflash_feature_ring.cpp, flashprefill.cpp), not just the SM80_EQUIV path.
     target_include_directories(dflash_common PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/hip_compat)
+    if(DFLASH27B_CLUSTER)
+        # RCCL communicator: rccl.h for cluster_comm.cpp plus the f32<->bf16
+        # conversion kernels behind allreduce_sum_bf16_compressed.
+        find_package(rccl REQUIRED)
+        target_sources(dflash_common PRIVATE src/cluster/cluster_comm_kernels.cu)
+        set_source_files_properties(src/cluster/cluster_comm_kernels.cu PROPERTIES LANGUAGE HIP)
+        target_link_libraries(dflash_common PUBLIC roc::rccl)
+    endif()
 endif()
 
 if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
@@ -1827,7 +1889,10 @@ if(DFLASH27B_TESTS)
         add_executable(test_feature_gate test/test_feature_gate.cpp)
         target_sources(test_feature_gate PRIVATE
             src/common/feature_gate.cpp
-            src/placement/placement_config.cpp)
+            src/placement/placement_config.cpp
+            # ClusterConfig::validate() and the --cluster-* parsers are as
+            # GPU-free as the gate itself.
+            src/cluster/cluster_config.cpp)
         target_include_directories(test_feature_gate PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src
             ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
@@ -1840,6 +1905,42 @@ if(DFLASH27B_TESTS)
             target_compile_definitions(test_feature_gate PRIVATE
                 DFLASH27B_BACKEND_CUDA=1)
         endif()
+    endif()
+
+    # Cluster unit tests (lucebox-halo-cluster): protocol round-trips,
+    # placement invariants, decision hooks over socketpair, gate rules. The
+    # placement code reads MoeHybridRoutingStats, which pulls ggml-base for
+    # ggml_backend_tensor_get, so this links dflash_common like the other
+    # host-side unit tests instead of cherry-picking sources. GPU-free at run
+    # time: it never opens a device.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_cluster_unit.cpp")
+        add_executable(test_cluster_unit test/test_cluster_unit.cpp)
+        target_include_directories(test_cluster_unit PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+            target_compile_definitions(test_cluster_unit PRIVATE
+                DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
+        else()
+            target_compile_definitions(test_cluster_unit PRIVATE
+                DFLASH27B_BACKEND_CUDA=1
+                DFLASH27B_CUDA_MIN_SM=${_dflash_cuda_min_sm})
+        endif()
+        target_link_libraries(test_cluster_unit PRIVATE
+            dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} ggml-base)
+        if(NOT WIN32)
+            target_link_libraries(test_cluster_unit PRIVATE pthread)
+        else()
+            target_link_libraries(test_cluster_unit PRIVATE ws2_32)
+        endif()
+        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+            find_package(CUDAToolkit REQUIRED)
+            target_link_libraries(test_cluster_unit PRIVATE CUDA::cudart)
+        else()
+            target_link_libraries(test_cluster_unit PRIVATE hip::host)
+        endif()
+        # Stable CTest name for CI filters (`ctest -R cluster_unit`); the
+        # per-suite entries are discovered below via _new_cppunit_test_targets.
+        add_test(NAME cluster_unit COMMAND test_cluster_unit)
+        set_tests_properties(cluster_unit PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 
     function(dflash_discover_cppunit_tests target)
@@ -1875,6 +1976,7 @@ if(DFLASH27B_TESTS)
         test_platform_compat
         test_draft_swa
         test_feature_gate
+        test_cluster_unit
         test_qwen35_split_tree_guard
         test_recurrent_snapshot
         test_ds4_mix_registry_teardown
@@ -1958,6 +2060,9 @@ if(DFLASH27B_TESTS)
     endif()
     if(TARGET test_feature_gate)
         list(APPEND _check_deps test_feature_gate)
+    endif()
+    if(TARGET test_cluster_unit)
+        list(APPEND _check_deps test_cluster_unit)
     endif()
     if(_check_deps)
         add_custom_target(check

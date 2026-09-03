@@ -90,6 +90,16 @@ GGML_BACKEND_API int  ggml_backend_cuda_get_device_count(void);
 GGML_BACKEND_API void ggml_backend_cuda_get_device_description(int device, char * description, size_t description_size);
 GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * total);
 
+// Current compute stream of a CUDA/HIP backend (cudaStream_t / hipStream_t
+// returned as an opaque pointer), so external collectives (e.g. NCCL/RCCL
+// all-reduce across processes) can be enqueued stream-ordered with the
+// kernels of the same backend instead of synchronizing the host. The stream
+// is created lazily on first use. Returns NULL for non-CUDA/HIP backends.
+GGML_BACKEND_API void * ggml_backend_cuda_get_stream(ggml_backend_t backend);
+
+// Device ordinal the backend was created for, or -1 for non-CUDA/HIP backends.
+GGML_BACKEND_API int ggml_backend_cuda_get_device_id(ggml_backend_t backend);
+
 // Override the plain quantized MUL_MAT MMVQ column ceiling on the calling
 // thread. Pass zero to restore LUCE_MMVQ_MAX_NCOLS. This is intentionally
 // thread-local so one graph builder can select a safe topology without

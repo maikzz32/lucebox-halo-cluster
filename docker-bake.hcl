@@ -157,3 +157,62 @@ target "rocm-local" {
     inherits = ["_rocm-base"]
     tags = image_tags("rocm")
 }
+
+# ── ROCm cluster (lucebox-halo-cluster) ──────────────────────────────────────
+# Multi-node expert-parallel image from Dockerfile.rocm-cluster: ROCm 10
+# (TheRock SDK), RCCL over RoCE v2, rccl-tests, -DDFLASH27B_CLUSTER=ON. See
+# server/docs/CLUSTER.md. Build on a Strix Halo node (no GPU needed to build):
+#   docker buildx bake rocm-cluster-local --load
+#   ROCM_SDK_FROM_PIP=1 docker buildx bake rocm-cluster-local --load   # from fedora:44 + pip SDK
+# Publish under the fork's own name (not lucebox-hub):
+#   REGISTRY=ghcr.io/maikzz32/ CLUSTER_TAG=dev docker buildx bake rocm-cluster-local --push
+
+# Prebuilt image that already carries the TheRock ROCm SDK at /opt/rocm
+# (fast path, ROCM_SDK_FROM_PIP=0).
+variable "CLUSTER_BASE_IMAGE"   { default = "ghcr.io/maikzz32/strix-vllm-gfx1151:dev-rocm10" }
+# "1" = ignore CLUSTER_BASE_IMAGE and pip-install rocm[...]==CLUSTER_ROCM_VERSION
+# into fedora:44 (reproducible path).
+variable "ROCM_SDK_FROM_PIP"    { default = "0" }
+variable "CLUSTER_ROCM_VERSION" { default = "10.0.0" }
+# rccl-tests git ref; pin a sha for reproducible baselines.
+variable "RCCL_TESTS_REF"       { default = "develop" }
+# Moving tag of the cluster image; launch_cluster.sh defaults to
+# ghcr.io/maikzz32/lucebox-halo-cluster:dev.
+variable "CLUSTER_TAG"          { default = "dev" }
+
+function "cluster_image_tags" {
+    params = []
+    result = VERSION != "" ? ["${REGISTRY}lucebox-halo-cluster:${CLUSTER_TAG}", "${REGISTRY}lucebox-halo-cluster:${sanitized_version}"] : ["${REGISTRY}lucebox-halo-cluster:${CLUSTER_TAG}"]
+}
+
+target "_rocm-cluster-base" {
+    context    = "."
+    dockerfile = "Dockerfile.rocm-cluster"
+    args = {
+        BASE_IMAGE        = CLUSTER_BASE_IMAGE
+        ROCM_SDK_FROM_PIP = ROCM_SDK_FROM_PIP
+        ROCM_VERSION      = CLUSTER_ROCM_VERSION
+        RCCL_TESTS_REF    = RCCL_TESTS_REF
+        DFLASH_HIP_ARCHES = DFLASH_HIP_ARCHES
+        GIT_SHA           = GIT_SHA
+        IMAGE_TAG         = IMAGE_TAG
+        BUILD_TIME        = BUILD_TIME
+    }
+}
+
+target "rocm-cluster" {
+    inherits = ["_rocm-cluster-base", "docker-metadata-action"]
+}
+
+target "rocm-cluster-local" {
+    inherits = ["_rocm-cluster-base"]
+    tags = cluster_image_tags()
+}
+
+# Dockerfile validation without the HIP build (what cluster-ci.yml runs on
+# PRs): stops after the `base` stage.
+target "rocm-cluster-base-only" {
+    inherits = ["_rocm-cluster-base"]
+    target   = "base"
+    tags     = ["lucebox-halo-cluster:base"]
+}

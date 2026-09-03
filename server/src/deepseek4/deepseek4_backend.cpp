@@ -3,7 +3,9 @@
 
 #include "deepseek4_backend.h"
 #include "deepseek4_budget_hook.h"
+#include "deepseek4_cluster.h"
 #include "deepseek4_internal.h"
+#include "cluster/cluster_decision_hooks.h"
 #include "common/dynamic_backend.h"
 #include "common/peer_access.h"
 #include "common/platform_env.h"
@@ -362,6 +364,9 @@ static void add_step_tel(DeepSeek4StepTelemetry & dst, const DeepSeek4StepTeleme
     dst.emit_us += src.emit_us;
     dst.hot_selected += src.hot_selected;
     dst.cold_selected += src.cold_selected;
+    dst.cluster_allreduce_us += src.cluster_allreduce_us;
+    dst.cluster_allreduce_bytes += src.cluster_allreduce_bytes;
+    dst.cluster_ctrl_wait_us += src.cluster_ctrl_wait_us;
 }
 
 static double ms(uint64_t us) {
@@ -384,7 +389,8 @@ static void log_step_tel(const char * phase,
         "ffn_hot_graph_build=%llu ffn_hot_graph_hit=%llu ffn_cold_graph_build=%llu ffn_cold_graph_hit=%llu "
         "hc_pre=%.1fms hc_pre_build=%.1fms hc_pre_input=%.1fms hc_pre_compute=%.1fms "
         "hc_post=%.1fms output=%.1fms sample=%.1fms emit=%.1fms "
-        "hot_sel=%d cold_sel=%d\n",
+        "hot_sel=%d cold_sel=%d "
+        "cluster_allreduce=%.1fms cluster_bytes=%llu cluster_ctrl=%.1fms\n",
         phase, tokens, steps, wall_s, tok_s,
         ms(t.total_us), ms(t.embed_us), ms(t.attn_build_us), ms(t.attn_compute_us), ms(t.attn_read_us),
         ms(t.full_graph_build_us), ms(t.full_graph_set_us),
@@ -401,7 +407,9 @@ static void log_step_tel(const char * phase,
         ms(t.hc_pre_compute_us),
         ms(t.hc_post_attn_us + t.hc_post_ffn_us),
         ms(t.output_us), ms(t.sample_us), ms(t.emit_us),
-        t.hot_selected, t.cold_selected);
+        t.hot_selected, t.cold_selected,
+        ms(t.cluster_allreduce_us), (unsigned long long)t.cluster_allreduce_bytes,
+        ms(t.cluster_ctrl_wait_us));
 }
 
 static uint64_t layer_expert_bytes(const DeepSeek4Layer & layer, int n_expert) {
@@ -789,7 +797,22 @@ bool DeepSeek4Backend::load_model() {
     const bool heterogeneous_tp = env_flag_enabled("DFLASH_DS4_MOE_TP");
     const bool need_monolithic =
         requires_monolithic_model() && !heterogeneous_tp;
-    if (target_backend == PlacementBackend::Hip &&
+    if (cluster_) {
+        // Cluster rank: dense weights in full, routed experts sharded by
+        // rank (deepseek4_cluster.h). Takes precedence over every local
+        // placement policy; the feature gate already rejects layer split,
+        // remote shards and heterogeneous TP together with --cluster-*.
+        if (force_full || heterogeneous_tp) {
+            std::fprintf(stderr,
+                         "[deepseek4-cluster] DFLASH_DS4_FORCE_FULL_LOAD / DFLASH_DS4_MOE_TP "
+                         "are ignored on a cluster rank\n");
+        }
+        if (!init_cluster_model()) {
+            std::fprintf(stderr, "[deepseek4-cluster] expert-parallel load failed: %s\n",
+                         cfg_.model_path);
+            return false;
+        }
+    } else if (target_backend == PlacementBackend::Hip &&
         (force_full || need_monolithic)) {
         std::fprintf(stderr,
                      "[deepseek4] monolithic execution requested "
@@ -835,6 +858,17 @@ bool DeepSeek4Backend::load_model() {
     w_.routed_expert_top_k = cfg_.expert_top_k;
     w_.fused_decode = cfg_.fused_decode && !moe_hybrid_;
     w_.fused_verify_f16_kv = cfg_.fused_verify_f16_kv && !moe_hybrid_;
+    if (cluster_) {
+        // Path 3a: the per-layer all-reduce cannot live inside a whole-model
+        // graph. deepseek4_step_layer_range enforces the same via
+        // cache_.cluster_rt; this is the startup-visible statement of it.
+        std::fprintf(stderr,
+                     "[deepseek4-cluster] rank %d/%d: fused decode/verify graphs disabled, "
+                     "per-layer forward with one all-reduce per MoE layer (path 3a)%s%s\n",
+                     cluster_->rank(), cluster_->size(),
+                     cfg_.fused_decode ? " (--ds4-fused-decode ignored)" : "",
+                     cfg_.fused_verify_f16_kv ? " (fused verifier F16 K/V ignored)" : "");
+    }
     if (cfg_.fused_decode && moe_hybrid_) {
         std::fprintf(stderr,
                      "[deepseek4] fused decode unavailable with hybrid expert placement; "
@@ -1064,6 +1098,9 @@ bool DeepSeek4Backend::init() {
         return false;
     }
     cache_.prefill_mode = cfg_.prefill_mode;
+    // The per-layer forward reads the cluster runtime through the cache it
+    // already receives; nullptr keeps every upstream path byte-identical.
+    cache_.cluster_rt = cluster_.get();
 
     if (env_flag_enabled("DFLASH_DS4_MOE_TP") && !init_moe_tensor_parallel()) {
         return false;
@@ -1668,6 +1705,150 @@ bool DeepSeek4Backend::init_hybrid_model() {
     return true;
 }
 
+bool DeepSeek4Backend::set_cluster(const cluster::ClusterConfig * cfg,
+                                   cluster::IClusterComm * comm) {
+    if (!cfg || !cfg->enabled()) {
+        if (cluster_ && !w_.layers.empty()) {
+            std::fprintf(stderr,
+                         "[deepseek4-cluster] set_cluster(nullptr) after the sharded model "
+                         "was loaded; keeping the runtime (reload is not supported)\n");
+            return false;
+        }
+        cluster_.reset();
+        cache_.cluster_rt = nullptr;
+        return true;
+    }
+    if (comm && (comm->size() != cfg->size || comm->rank() != cfg->rank)) {
+        std::fprintf(stderr,
+                     "[deepseek4-cluster] communicator %d/%d does not match config %d/%d\n",
+                     comm->rank(), comm->size(), cfg->rank, cfg->size);
+        return false;
+    }
+
+    if (cluster_) {
+        // Second call (factory pre-init, then head/worker after RCCL is up):
+        // the placement-defining fields must not change, everything else is
+        // refreshed and the communicator attached.
+        const cluster::ClusterConfig & have = cluster_->cfg_storage;
+        if (have.rank != cfg->rank || have.size != cfg->size ||
+            have.placement_source != cfg->placement_source ||
+            have.placement_file != cfg->placement_file ||
+            have.replicate_hot != cfg->replicate_hot ||
+            have.shared_expert != cfg->shared_expert) {
+            std::fprintf(stderr,
+                         "[deepseek4-cluster] set_cluster(): placement-defining config "
+                         "changed after the expert shard was built; refusing\n");
+            return false;
+        }
+        cluster_->cfg_storage = *cfg;
+        cluster_->cfg = &cluster_->cfg_storage;
+        if (comm) cluster_->comm = comm;
+        cluster_->trace = cluster::cluster_env_trace();
+        cache_.cluster_rt = cluster_.get();
+        return true;
+    }
+
+    cluster_ = std::make_unique<Ds4ClusterRuntime>();
+    cluster_->cfg_storage = *cfg;
+    cluster_->cfg = &cluster_->cfg_storage;
+    cluster_->comm = comm;
+    cluster_->trace = cluster::cluster_env_trace();
+
+    const bool model_loaded = backend_ && !w_.layers.empty();
+    if (!model_loaded) {
+        // Preferred path: init() will take the cluster branch in load_model().
+        return true;
+    }
+    // Late attach (the backend factory ran init() first): the full expert set
+    // is resident. Release and reload through the cluster branch so this rank
+    // holds only its shard. park()/unpark() already own that sequence.
+    std::fprintf(stderr,
+                 "[deepseek4-cluster] rank %d/%d: set_cluster() after init(); reloading the "
+                 "model with expert sharding (call set_cluster before init() to avoid the "
+                 "double load)\n", cfg->rank, cfg->size);
+    if (parked_) {
+        // Nothing resident; unpark() will load the sharded model later.
+        return true;
+    }
+    if (!park(ParkTarget::TargetModel)) {
+        std::fprintf(stderr, "[deepseek4-cluster] failed to release the monolithic model\n");
+        cluster_.reset();
+        return false;
+    }
+    if (!unpark(ParkTarget::TargetModel)) {
+        std::fprintf(stderr, "[deepseek4-cluster] failed to reload the sharded model\n");
+        return false;
+    }
+    cache_.cluster_rt = cluster_.get();
+    return true;
+}
+
+bool DeepSeek4Backend::init_cluster_model() {
+    if (!cluster_ || !cluster_->cfg) {
+        std::fprintf(stderr, "[deepseek4-cluster] runtime is not configured\n");
+        return false;
+    }
+    if (cluster_->comm &&
+        (cluster_->comm->size() != cluster_->cfg->size ||
+         cluster_->comm->rank() != cluster_->cfg->rank)) {
+        std::fprintf(stderr,
+                     "[deepseek4-cluster] communicator %d/%d does not match config %d/%d\n",
+                     cluster_->comm->rank(), cluster_->comm->size(),
+                     cluster_->cfg->rank, cluster_->cfg->size);
+        return false;
+    }
+
+    // Dense weights (attention/MLA/HC/indexer/embeddings/lm_head) in full;
+    // expert tensors as metadata only so the storage builder can size the
+    // per-rank hot stacks (same first step as init_hybrid_model()).
+    TargetLoadPlan plan;
+    plan.skip_expert_tensors = true;
+    if (!load_deepseek4_gguf_partial(cfg_.model_path, backend_, plan, w_)) {
+        std::fprintf(stderr,
+                     "[deepseek4-cluster] failed to load dense weights: %s\n",
+                     cfg_.model_path);
+        return false;
+    }
+
+    std::string err;
+    const char * hotness_env = std::getenv("DFLASH_DS4_HOTNESS_CSV");
+    const std::string hotness_csv = hotness_env ? hotness_env : "";
+    if (!ds4_cluster_build_placement(*cluster_->cfg, w_,
+                                     hotness_csv.empty() ? nullptr : &hotness_csv,
+                                     *cluster_, &err)) {
+        std::fprintf(stderr, "[deepseek4-cluster] placement failed: %s\n", err.c_str());
+        return false;
+    }
+
+    auto hybrid = std::make_shared<MoeHybridStorage>();
+    if (!ds4_cluster_init_experts(cfg_.model_path, backend_, w_, *cluster_, *hybrid, &err)) {
+        std::fprintf(stderr, "[deepseek4-cluster] expert storage failed: %s\n", err.c_str());
+        return false;
+    }
+
+    // No second in-process expert device, no cold-expert stream engine, no
+    // decode-only ownership split: every non-resident route is reduced in.
+    expert_runtime_.reset();
+    stream_engine_.destroy();
+    if (expert_backend_) {
+        ggml_backend_free(expert_backend_);
+        expert_backend_ = nullptr;
+    }
+    moe_hybrid_ = std::move(hybrid);
+    moe_placement_ = cluster_->rank_placement;
+    moe_decode_placement_ = {};
+    w_.moe_hybrid = true;
+    std::fprintf(stderr,
+                 "[deepseek4-cluster] rank %d/%d expert shard ready: resident=%d of %d "
+                 "(%.2f GiB), cold_owner=none, shared_expert=%s, allreduce=%s\n",
+                 cluster_->rank(), cluster_->size(),
+                 moe_placement_.total_hot, w_.n_layer * w_.n_expert,
+                 (double) cluster_->resident_expert_bytes / (1024.0 * 1024.0 * 1024.0),
+                 cluster::shared_expert_mode_name(cluster_->cfg->shared_expert),
+                 cluster::allreduce_dtype_name(cluster_->cfg->allreduce_dtype));
+    return true;
+}
+
 void DeepSeek4Backend::print_ready_banner() const {
     std::printf("[deepseek4-daemon] ready layers=%d ctx=%d experts=%d/%d\n",
                 w_.n_layer, cache_.max_ctx, w_.n_expert_used, w_.n_expert);
@@ -1791,6 +1972,7 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
         }
     }
     cache_.prefill_mode = cfg_.prefill_mode;
+    cache_.cluster_rt = cluster_.get();
     return true;
 }
 
@@ -2224,11 +2406,28 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
     bool budget_close_started = false;
     size_t close_inject_pos = 0;
 
+    // Cluster lockstep (WP2). In a cluster every rank runs this loop with the
+    // same n_gen; rank 0 samples and broadcasts DecisionMsg{token, flags},
+    // workers take the token from the frame and never sample or test EOS /
+    // cancel themselves. Cancellation is therefore evaluated on the head
+    // AFTER the step's token is emitted and travels in the flags, so no rank
+    // can leave the loop before the forward of the current step ran on all
+    // of them (the top-of-loop cancel break below is single-node only).
+    const bool cluster = cluster_active();
+    const bool worker = cluster_worker();
+    const uint64_t cluster_req = hooks_ ? hooks_->current_request() : 0;
+    const int hash_every = hooks_ ? hooks_->verify_hash_every() : 0;
+    const uint64_t ctrl_wait_at_start = hooks_ ? hooks_->counters().ctrl_wait_us : 0;
+
     for (int generated = 0; generated < n_gen; generated++) {
-        if (io.is_cancelled()) break;
+        if (!cluster && io.is_cancelled()) break;
 
         // Get last logits and sample
         std::vector<float> logits;
+        // Final-layer HC residual as materialized on the host by the layer-
+        // range step (only the hybrid / non-hybrid layer-range paths fill it).
+        // Used as the primary --cluster-verify-hash source; empty otherwise.
+        std::vector<float> hc_state;
         if (generated == 0 && !last_logits_.empty()) {
             logits = last_logits_;
         } else {
@@ -2242,7 +2441,6 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
             const int pos = std::max(0, committed + generated - 1);
             bool ok = false;
             if (moe_hybrid_ && (expert_runtime_.compute || expert_backend_)) {
-                std::vector<float> hc_state;
                 ok = deepseek4_step_layer_range(
                     backend_, cfg_.device.gpu, w_, cache_, hc_state,
                     embed.data(), 1, pos,
@@ -2263,7 +2461,6 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
                                     nullptr,
                                     expert_runtime_.compute ? &expert_runtime_ : nullptr);
             } else {
-                std::vector<float> hc_state;
                 ok = deepseek4_step_layer_range(backend_, cfg_.device.gpu, w_, cache_, hc_state,
                                                 embed.data(), 1, pos,
                                                 0, w_.n_layer, &logits,
@@ -2280,9 +2477,44 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
             }
         }
 
+        // --cluster-verify-hash n: every n steps each rank hashes the host
+        // copy of the final HC residual (hc_state) when the step produced
+        // one, otherwise the logits vector, plus the tokens accepted so far.
+        // Workers send, the head gathers and compares. Runs before the
+        // decision so a divergence is attributed to the step that caused it.
+        if (cluster && hash_every > 0 && (generated % hash_every) == 0) {
+            const uint64_t hc_hash = hc_state.empty()
+                ? cluster::hash_floats(logits.data(), logits.size())
+                : cluster::hash_floats(hc_state.data(), hc_state.size());
+            const uint64_t tok_hash = cluster::hash_tokens(out_tokens);
+            std::string err;
+            if (!hooks_->hash_probe(cluster_req, (uint32_t) generated, hc_hash, tok_hash, &err)) {
+                std::fprintf(stderr, "[deepseek4] cluster hash probe failed at step %d: %s\n",
+                             generated, err.c_str());
+                return false;
+            }
+        }
+
         int32_t next_token = 0;
+        uint8_t decision_flags = 0;
         const auto sample_t0 = Clock::now();
-        if (process_logits) {
+        if (worker) {
+            // Workers never sample: the head's token arrives in DecisionMsg.
+            std::string err;
+            if (!hooks_->decide_next_token(cluster_req, (uint32_t) generated,
+                                           logits.data(), w_.n_vocab, sampler_,
+                                           /*is_eos_candidate_unused=*/false,
+                                           next_token, decision_flags, &err)) {
+                std::fprintf(stderr, "[deepseek4] cluster decision missing at step %d: %s\n",
+                             generated, err.c_str());
+                return false;
+            }
+            if (next_token < 0 || next_token >= w_.n_vocab) {
+                std::fprintf(stderr, "[deepseek4] cluster decision token %d out of range at step %d\n",
+                             next_token, generated);
+                return false;
+            }
+        } else if (process_logits) {
             next_token = sample_logits(logits.data(), w_.n_vocab, sampler_,
                                        history, sampler_rng_);
         } else {
@@ -2300,13 +2532,16 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
         // keep going. Runs before history.push_back so penalty history records what was
         // actually emitted. The rule lives in a header-only helper so it is testable without a
         // model; see deepseek4_budget_hook.h for why this overrides rather than appends.
-        {
-            bool hook_forced = false;
+        // Head/local only: the worker's token already carries the override.
+        bool hook_forced = false;
+        if (!worker) {
             next_token = dflash::deepseek4::budget_hook_apply(
                 budget_hook.close_token_ids, n_gen - generated,
                 budget_hook.hard_limit_remaining, next_token,
                 budget_close_started, close_inject_pos, hook_forced);
             if (hook_forced && forced_close_out) *forced_close_out = true;
+        } else if ((decision_flags & cluster::kDecisionBudget) && forced_close_out) {
+            *forced_close_out = true;
         }
 
         if (process_logits) {
@@ -2324,14 +2559,58 @@ bool DeepSeek4Backend::do_decode(int committed, int n_gen,
         io.emit(next_token);
         if (timing) tel_acc.emit_us += elapsed_us(emit_t0, Clock::now());
 
-        if (deepseek4_is_eos_tok(next_token, w_)) {
+        const bool eos = deepseek4_is_eos_tok(next_token, w_);
+        if (cluster && !worker) {
+            // Head: publish the decision. Cancel is only ever evaluated here
+            // (workers have no client) and travels in the flags.
+            const bool cancel = io.is_cancelled();
+            const bool is_final = eos || cancel || generated + 1 >= n_gen;
+            decision_flags = cluster::make_decision_flags(
+                eos, /*stop=*/false, cancel, hook_forced, is_final);
+            std::string err;
+            if (!hooks_->decide_next_token(cluster_req, (uint32_t) generated,
+                                           logits.data(), w_.n_vocab, sampler_,
+                                           /*is_eos_candidate_unused=*/eos,
+                                           next_token, decision_flags, &err)) {
+                std::fprintf(stderr, "[deepseek4] cluster decision broadcast failed at step %d: %s\n",
+                             generated, err.c_str());
+                return false;
+            }
+        }
+
+        if (cluster) {
+            // Every rank leaves the loop on the same step for the same reason.
+            if (decision_flags & (cluster::kDecisionEos | cluster::kDecisionStop |
+                                  cluster::kDecisionCancel)) {
+                break;
+            }
+            continue;
+        }
+        if (eos) {
             break;
         }
+    }
+    if (cluster) {
+        // Host time this decode spent blocked on the control channel
+        // (decision recv on workers, broadcast/gather on the head). Folded
+        // into the step telemetry and into the cluster runtime's counters
+        // that the worker's RequestReport / the head's report read.
+        const uint64_t ctrl_us = hooks_->counters().ctrl_wait_us - ctrl_wait_at_start;
+        tel_acc.cluster_ctrl_wait_us += ctrl_us;
+        if (cluster_) cluster_->telemetry.ctrl_wait_us += ctrl_us;
     }
     if (timing) {
         log_step_tel("decode", (int)out_tokens.size(), steps, elapsed_s(phase_t0), tel_acc);
     }
     return true;
+}
+
+bool DeepSeek4Backend::cluster_active() const {
+    return hooks_ != nullptr && hooks_->is_cluster();
+}
+
+bool DeepSeek4Backend::cluster_worker() const {
+    return cluster_active() && !hooks_->is_head();
 }
 
 GenerateResult DeepSeek4Backend::generate_impl(const GenerateRequest & req,
@@ -2374,7 +2653,12 @@ GenerateResult DeepSeek4Backend::generate_from_state(
     }
     result.prefill_s = elapsed_s(t0);
 
-    if (out_io.is_cancelled()) {
+    // Cluster: a post-prefill cancel is not visible to the workers (they have
+    // no client), so the head must not return here or the workers would wait
+    // for a first decision that never comes. The cancel is picked up by the
+    // first decode decision instead (one token later than single-node).
+    const bool cluster = cluster_active();
+    if (!cluster && out_io.is_cancelled()) {
         result.succeed();
         maybe_save_routing_stats();
         return result;
@@ -2392,6 +2676,18 @@ GenerateResult DeepSeek4Backend::generate_from_state(
     // The DSpark verifier is greedy-only. Route sampling and penalties through
     // AR so the request's sampler contract is not silently ignored.
     const bool sampling_requires_ar = sampler_.needs_logit_processing();
+    // M1: DSpark in the cluster lands with WP4 (draft on rank 0, Draft /
+    // Accept frames, verify through the EP graph on every rank). Until then a
+    // cluster request always decodes AR so all ranks take the same path.
+    if (cluster && spec_enabled_ && spec_drafter_ && req.n_gen > 0 &&
+        !req.force_ar_decode && !budget_requires_ar && !sampling_requires_ar) {
+        static bool cluster_spec_warned = false;
+        if (!cluster_spec_warned) {
+            cluster_spec_warned = true;
+            std::fprintf(stderr, "cluster: DSpark deferred to WP4, decoding AR\n");
+        }
+    }
+    const bool cluster_requires_ar = cluster;
     // A drafter was loaded and the operator asked for spec decode, but this
     // request routes to AR anyway. Say why, once: the DS4 model card defaults
     // temperature to 1.0, so a request that merely OMITS temperature lands
@@ -2412,7 +2708,8 @@ GenerateResult DeepSeek4Backend::generate_from_state(
         }
     }
     if (spec_enabled_ && spec_drafter_ && req.n_gen > 0 &&
-        !req.force_ar_decode && !budget_requires_ar && !sampling_requires_ar) {
+        !req.force_ar_decode && !budget_requires_ar && !sampling_requires_ar &&
+        !cluster_requires_ar) {
         if (last_logits_.empty()) {
             result.fail(GenerateErrorCode::DecodeFailed, "spec: no prefill logits");
             return result;
@@ -2458,7 +2755,11 @@ GenerateResult DeepSeek4Backend::generate_from_state(
                     (expert_runtime_.compute || expert_backend_)
                         ? moe_hybrid_.get() : nullptr,
                     expert_runtime_.compute ? &expert_runtime_ : nullptr,
-                    routing_stats_.get())) {
+                    routing_stats_.get(),
+                    // WP4: Draft/Accept hooks. nullptr today because the
+                    // cluster path above forces AR; passing hooks_ keeps the
+                    // plumbing in place for the single-node LocalHooks case.
+                    hooks_)) {
                 result.fail(GenerateErrorCode::DecodeFailed,
                             "DSpark speculative decode failed");
                 return result;
@@ -2637,6 +2938,10 @@ void DeepSeek4Backend::shutdown() {
     }
     routing_stats_.reset();
     routing_stats_out_path_.clear();
+    cache_.cluster_rt = nullptr;
+    if (cluster_) {
+        cluster_->free_scratch();  // device scratch belongs to backend_, freed below
+    }
     moe_placement_ = {};
     moe_decode_placement_ = {};
     free_deepseek4_weights(w_);

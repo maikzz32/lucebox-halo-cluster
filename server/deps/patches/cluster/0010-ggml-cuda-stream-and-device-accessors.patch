@@ -1,0 +1,48 @@
+diff --git a/server/deps/llama.cpp/ggml/include/ggml-cuda.h b/server/deps/llama.cpp/ggml/include/ggml-cuda.h
+index ec5643f..aabd170 100644
+--- a/server/deps/llama.cpp/ggml/include/ggml-cuda.h
++++ b/server/deps/llama.cpp/ggml/include/ggml-cuda.h
+@@ -90,6 +90,16 @@ GGML_BACKEND_API int  ggml_backend_cuda_get_device_count(void);
+ GGML_BACKEND_API void ggml_backend_cuda_get_device_description(int device, char * description, size_t description_size);
+ GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * total);
+ 
++// Current compute stream of a CUDA/HIP backend (cudaStream_t / hipStream_t
++// returned as an opaque pointer), so external collectives (e.g. NCCL/RCCL
++// all-reduce across processes) can be enqueued stream-ordered with the
++// kernels of the same backend instead of synchronizing the host. The stream
++// is created lazily on first use. Returns NULL for non-CUDA/HIP backends.
++GGML_BACKEND_API void * ggml_backend_cuda_get_stream(ggml_backend_t backend);
++
++// Device ordinal the backend was created for, or -1 for non-CUDA/HIP backends.
++GGML_BACKEND_API int ggml_backend_cuda_get_device_id(ggml_backend_t backend);
++
+ // Override the plain quantized MUL_MAT MMVQ column ceiling on the calling
+ // thread. Pass zero to restore LUCE_MMVQ_MAX_NCOLS. This is intentionally
+ // thread-local so one graph builder can select a safe topology without
+diff --git a/server/deps/llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu b/server/deps/llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu
+index a1c178f..b0a9e5a 100644
+--- a/server/deps/llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/server/deps/llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5759,6 +5759,22 @@ void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * tot
+     CUDA_CHECK(cudaMemGetInfo(free, total));
+ }
+ 
++void * ggml_backend_cuda_get_stream(ggml_backend_t backend) {
++    if (!ggml_backend_is_cuda(backend)) {
++        return nullptr;
++    }
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    return (void *) cuda_ctx->stream();
++}
++
++int ggml_backend_cuda_get_device_id(ggml_backend_t backend) {
++    if (!ggml_backend_is_cuda(backend)) {
++        return -1;
++    }
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    return cuda_ctx->device;
++}
++
+ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
+     if (getenv("GGML_CUDA_REGISTER_HOST") == nullptr) {
+         return false;

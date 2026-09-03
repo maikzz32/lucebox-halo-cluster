@@ -11,6 +11,7 @@
 // Run:   ./test_feature_gate
 
 #include "CppUnitTestFramework.hpp"
+#include "cluster/cluster_config.h"
 #include "common/draft_block_size.h"
 #include "common/feature_gate.h"
 #include "common/model_capabilities.h"
@@ -19,6 +20,7 @@
 
 #include <climits>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -718,6 +720,282 @@ void test_model_capability_tables() {
     CHECK(arch_supports_draft_block_size("qwen35", false));
     CHECK(!arch_supports_draft_block_size("qwen35", true));
     CHECK(!arch_supports_draft_block_size("qwen35moe", false));
+
+    // Multi-node expert parallelism is a DeepSeek4-only path.
+    CHECK(arch_supports_cluster_ep("deepseek4"));
+    for (const char * arch : {"qwen35", "qwen35moe", "bailingmoe3", "laguna",
+                              "qwen3", "gemma4", "qwen36", ""}) {
+        CHECK(!arch_supports_cluster_ep(arch));
+    }
+}
+
+// ── Cluster gate (--cluster-*) ──────────────────────────────────────────
+// The cluster block in check_feature_compatibility() and the GPU-free
+// helpers in cluster_config.cpp. None of this touches a socket or RCCL.
+
+static BackendArgs cluster_args(int rank = 0, int size = 2) {
+    BackendArgs args = gate_args_hip_deepseek4();
+    args.cluster.rank = rank;
+    args.cluster.size = size;
+    args.cluster.head_host = "10.0.0.1";
+    args.cluster.head_port = 9400;
+    return args;
+}
+
+void test_feature_gate_cluster_accepts_deepseek4_hip() {
+    CHECK(gate_result(cluster_args(), "deepseek4", PlacementBackend::Hip).empty());
+    CHECK(gate_result(cluster_args(1, 2), "deepseek4", PlacementBackend::Hip).empty());
+    CHECK(gate_result(cluster_args(3, 4), "deepseek4", PlacementBackend::Hip).empty());
+    CHECK(gate_result(cluster_args(7, dflash::cluster::kClusterMaxSize),
+                      "deepseek4", PlacementBackend::Hip).empty());
+
+    // The model-default top-k (0 or 6) stays admissible; sparse prefill
+    // and the other monolithic-HIP DS4 options are unaffected.
+    BackendArgs topk6 = cluster_args();
+    topk6.ds4_expert_top_k = 6;
+    topk6.ds4_prefill_mode_set = true;
+    topk6.ds4_prefill_mode = PrefillAttentionMode::Sparse;
+    CHECK(gate_result(topk6, "deepseek4", PlacementBackend::Hip).empty());
+
+    // A cluster config that is not enabled is invisible to the gate.
+    BackendArgs off = gate_args_hip_deepseek4();
+    off.cluster.rank = 3;  // stale rank without a size must not matter here
+    CHECK(gate_result(off, "deepseek4", PlacementBackend::Hip).empty());
+    CHECK(gate_result(off, "qwen35", PlacementBackend::Hip).empty());
+}
+
+void test_feature_gate_cluster_requires_deepseek4_and_hip() {
+    // Wrong architecture.
+    for (const char * arch : {"qwen35", "qwen35moe", "laguna", "qwen3", "gemma4"}) {
+        const std::string e = gate_result(cluster_args(), arch, PlacementBackend::Hip);
+        CHECK(!e.empty());
+        CHECK(e.find("cluster") != std::string::npos);
+    }
+
+    // CUDA binary / CUDA target.
+    BackendArgs cuda = cluster_args();
+    cuda.device.backend = PlacementBackend::Cuda;
+    CHECK(!gate_result_for_binary(cuda, "deepseek4", PlacementBackend::Cuda,
+                                  PlacementBackend::Cuda).empty());
+}
+
+void test_feature_gate_cluster_rejects_split_paged_and_concurrency() {
+    BackendArgs split = cluster_args();
+    split.device.layer_split_gpus = {0, 1};
+    CHECK(!gate_result(split, "deepseek4", PlacementBackend::Hip).empty());
+
+    BackendArgs tensor = cluster_args();
+    tensor.device.layer_split_gpus = {0, 1};
+    tensor.device.split_mode = TargetSplitMode::Tensor;
+    CHECK(!gate_result(tensor, "deepseek4", PlacementBackend::Hip).empty());
+
+    BackendArgs remote = cluster_args();
+    remote.remote_target_shard.ipc_bin = "/usr/bin/shard-ipc";
+    CHECK(!gate_result(remote, "deepseek4", PlacementBackend::Hip).empty());
+
+    BackendArgs paged = cluster_args();
+    paged.paged_attention = true;
+    CHECK(!gate_result(paged, "deepseek4", PlacementBackend::Hip).empty());
+
+    BackendArgs concurrent = cluster_args();
+    concurrent.max_concurrency = 2;
+    CHECK(!gate_result(concurrent, "deepseek4", PlacementBackend::Hip).empty());
+
+    BackendFeatureConfig pflash;
+    pflash.pflash_enabled = true;
+    pflash.pflash_drafter_configured = true;
+    CHECK(!gate_result(cluster_args(), "deepseek4", PlacementBackend::Hip, pflash).empty());
+
+    BackendFeatureConfig kvflash;
+    kvflash.kvflash_enabled = true;
+    CHECK(!gate_result(cluster_args(), "deepseek4", PlacementBackend::Hip, kvflash).empty());
+}
+
+void test_feature_gate_cluster_rank_size_and_head_rules() {
+    // Rank outside [0, size).
+    CHECK(!gate_result(cluster_args(2, 2), "deepseek4", PlacementBackend::Hip).empty());
+    CHECK(!gate_result(cluster_args(-1, 2), "deepseek4", PlacementBackend::Hip).empty());
+
+    // Size 1 is not a cluster; size above the maximum is refused.
+    CHECK(!gate_result(cluster_args(0, 1), "deepseek4", PlacementBackend::Hip).empty());
+    CHECK(!gate_result(cluster_args(0, dflash::cluster::kClusterMaxSize + 1),
+                       "deepseek4", PlacementBackend::Hip).empty());
+
+    // Missing head endpoint.
+    BackendArgs no_head = cluster_args();
+    no_head.cluster.head_host.clear();
+    CHECK(!gate_result(no_head, "deepseek4", PlacementBackend::Hip).empty());
+
+    // Structural validate() failures surface through the gate too.
+    BackendArgs bad_file = cluster_args();
+    bad_file.cluster.placement_source = dflash::cluster::PlacementSource::File;
+    CHECK(!gate_result(bad_file, "deepseek4", PlacementBackend::Hip).empty());
+}
+
+void test_feature_gate_cluster_rejects_unsupported_ds4_options() {
+    BackendArgs fused = cluster_args();
+    fused.ds4_fused_decode = true;
+    const std::string fused_err = gate_result(fused, "deepseek4", PlacementBackend::Hip);
+    CHECK(!fused_err.empty());
+    CHECK(fused_err.find("not yet supported on the cluster path") != std::string::npos);
+
+    BackendArgs f16_kv = cluster_args();
+    f16_kv.ds4_fused_verify_f16_kv = true;
+    CHECK(!gate_result(f16_kv, "deepseek4", PlacementBackend::Hip).empty());
+
+    BackendArgs topk4 = cluster_args();
+    topk4.ds4_expert_top_k = 4;
+    CHECK(!gate_result(topk4, "deepseek4", PlacementBackend::Hip).empty());
+    // ... while the same flag stays legal outside cluster mode.
+    BackendArgs topk4_single = gate_args_hip_deepseek4();
+    topk4_single.ds4_expert_top_k = 4;
+    CHECK(gate_result(topk4_single, "deepseek4", PlacementBackend::Hip).empty());
+}
+
+void test_feature_warnings_cluster_replicate_hot_without_hotness() {
+    // collect_feature_warnings() is called directly (not via warn_result):
+    // the cluster gate only admits HIP binaries, and the warning logic must
+    // be checkable on the CUDA CI leg as well.
+    BackendArgs args = cluster_args();
+    args.cluster.replicate_hot = 2;
+    const std::vector<std::string> w = collect_feature_warnings(args, {}, "deepseek4");
+    // Whether the warning fires depends on DFLASH_DS4_HOTNESS_CSV in the test
+    // environment; with the variable unset it must fire, and it must never
+    // fire for a placement file (which carries its own replication).
+    if (std::getenv("DFLASH_DS4_HOTNESS_CSV") == nullptr) {
+        CHECK(warns_about(w, "--cluster-replicate-hot"));
+    }
+    BackendArgs from_file = args;
+    from_file.cluster.placement_source = dflash::cluster::PlacementSource::File;
+    from_file.cluster.placement_file = "/nonexistent/placement.json";
+    CHECK(!warns_about(collect_feature_warnings(from_file, {}, "deepseek4"),
+                       "--cluster-replicate-hot"));
+    // No warning without the flag.
+    CHECK(!warns_about(collect_feature_warnings(cluster_args(), {}, "deepseek4"),
+                       "--cluster-replicate-hot"));
+}
+
+void test_cluster_config_validate() {
+    using namespace dflash::cluster;
+    ClusterConfig off;
+    CHECK(!off.enabled());
+    CHECK(!off.is_head());
+    CHECK(!off.is_worker());
+    CHECK(off.validate().empty());  // disabled configs are always valid
+
+    ClusterConfig ok;
+    ok.rank = 0;
+    ok.size = 2;
+    ok.head_host = "10.0.0.1";
+    CHECK(ok.enabled());
+    CHECK(ok.is_head());
+    CHECK(!ok.is_worker());
+    CHECK(ok.validate().empty());
+
+    ClusterConfig worker = ok;
+    worker.rank = 1;
+    CHECK(worker.is_worker());
+    CHECK(worker.validate().empty());
+
+    ClusterConfig bad = ok;
+    bad.size = 1;
+    CHECK(!bad.validate().empty());
+    bad = ok;
+    bad.size = kClusterMaxSize + 1;
+    CHECK(!bad.validate().empty());
+    bad = ok;
+    bad.rank = 2;
+    CHECK(!bad.validate().empty());
+    bad = ok;
+    bad.rank = -1;
+    CHECK(!bad.validate().empty());
+    bad = ok;
+    bad.head_host.clear();
+    CHECK(!bad.validate().empty());
+    bad = ok;
+    bad.head_port = 0;
+    CHECK(!bad.validate().empty());
+    bad = ok;
+    bad.head_port = 70000;
+    CHECK(!bad.validate().empty());
+    bad = ok;
+    bad.replicate_hot = -1;
+    CHECK(!bad.validate().empty());
+    bad = ok;
+    bad.placement_source = PlacementSource::File;
+    CHECK(!bad.validate().empty());
+    bad.placement_file = "/tmp/placement.json";
+    CHECK(bad.validate().empty());
+    bad = ok;
+    bad.timeout_ms = 0;
+    CHECK(!bad.validate().empty());
+    bad = ok;
+    bad.verify_hash_every = -3;
+    CHECK(!bad.validate().empty());
+}
+
+void test_cluster_config_parsers() {
+    using namespace dflash::cluster;
+    std::string host;
+    int port = 0;
+    std::string err;
+
+    CHECK(parse_host_port("10.0.0.1:9400", host, port, &err));
+    CHECK(host == "10.0.0.1");
+    CHECK(port == 9400);
+    CHECK(parse_host_port("halo1", host, port, &err));
+    CHECK(host == "halo1");
+    CHECK(port == kClusterDefaultPort);
+    CHECK(parse_host_port("[fe80::1]:7000", host, port, &err));
+    CHECK(host == "fe80::1");
+    CHECK(port == 7000);
+    CHECK(parse_host_port("[fe80::1]", host, port, &err));
+    CHECK(host == "fe80::1");
+    CHECK(port == kClusterDefaultPort);
+    CHECK(!parse_host_port("", host, port, &err));
+    CHECK(!err.empty());
+    CHECK(!parse_host_port(":9400", host, port, &err));
+    CHECK(!parse_host_port("halo1:", host, port, &err));
+    CHECK(!parse_host_port("halo1:abc", host, port, &err));
+    CHECK(!parse_host_port("halo1:0", host, port, &err));
+    CHECK(!parse_host_port("halo1:65536", host, port, &err));
+    CHECK(!parse_host_port("[fe80::1", host, port, &err));
+
+    SharedExpertMode se = SharedExpertMode::Shard;
+    CHECK(parse_shared_expert_mode("replicate", se, &err));
+    CHECK(se == SharedExpertMode::Replicate);
+    CHECK(parse_shared_expert_mode("shard", se, &err));
+    CHECK(se == SharedExpertMode::Shard);
+    CHECK(parse_shared_expert_mode("rank0", se, &err));
+    CHECK(se == SharedExpertMode::Rank0);
+    CHECK(!parse_shared_expert_mode("Replicate", se, &err));
+    CHECK(!parse_shared_expert_mode("", se, &err));
+    CHECK(std::string(shared_expert_mode_name(SharedExpertMode::Rank0)) == "rank0");
+
+    AllreduceDType dt = AllreduceDType::F32;
+    CHECK(parse_allreduce_dtype("f32", dt, &err));
+    CHECK(dt == AllreduceDType::F32);
+    CHECK(parse_allreduce_dtype("bf16", dt, &err));
+    CHECK(dt == AllreduceDType::BF16);
+    CHECK(parse_allreduce_dtype("auto", dt, &err));
+    CHECK(dt == AllreduceDType::Auto);
+    CHECK(!parse_allreduce_dtype("fp16", dt, &err));
+    CHECK(std::string(allreduce_dtype_name(AllreduceDType::BF16)) == "bf16");
+
+    PlacementSource ps = PlacementSource::Balanced;
+    std::string file = "stale";
+    CHECK(parse_placement_source("uniform", ps, file, &err));
+    CHECK(ps == PlacementSource::Uniform);
+    CHECK(file.empty());
+    CHECK(parse_placement_source("balanced", ps, file, &err));
+    CHECK(ps == PlacementSource::Balanced);
+    CHECK(parse_placement_source("/etc/lucebox/placement.json", ps, file, &err));
+    CHECK(ps == PlacementSource::File);
+    CHECK(file == "/etc/lucebox/placement.json");
+    CHECK(!parse_placement_source("random", ps, file, &err));
+    CHECK(!parse_placement_source("placement.yaml", ps, file, &err));
+    CHECK(!parse_placement_source(".json", ps, file, &err));
+    CHECK(std::string(placement_source_name(PlacementSource::File)) == "file");
 }
 
 };
@@ -747,4 +1025,12 @@ TEST_CASE(FeatureGateFixture, feature_gate_suite) {
     test_feature_warnings_report_inert_decode_tunables();
     test_feature_warnings_report_inert_moe_options();
     test_model_capability_tables();
+    test_feature_gate_cluster_accepts_deepseek4_hip();
+    test_feature_gate_cluster_requires_deepseek4_and_hip();
+    test_feature_gate_cluster_rejects_split_paged_and_concurrency();
+    test_feature_gate_cluster_rank_size_and_head_rules();
+    test_feature_gate_cluster_rejects_unsupported_ds4_options();
+    test_feature_warnings_cluster_replicate_hot_without_hotness();
+    test_cluster_config_validate();
+    test_cluster_config_parsers();
 }

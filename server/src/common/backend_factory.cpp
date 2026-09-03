@@ -16,6 +16,7 @@
 #include "deepseek4_layer_split_adapter.h"
 #include "layer_split_backend.h"
 #include "qwen35_layer_split_adapter.h"
+#include "cluster/cluster_head_backend.h"
 
 #include <cstdio>
 #include <algorithm>
@@ -447,9 +448,32 @@ std::unique_ptr<ModelBackend> create_backend(
             cfg.prefill_mode = args.ds4_prefill_mode;
 
             auto backend = std::make_unique<DeepSeek4Backend>(cfg);
+            // lucebox-halo-cluster: a cluster rank loads only its expert
+            // shard, so the backend must know the cluster config BEFORE
+            // init() (WP3 contract; the communicator is attached later with a
+            // second set_cluster call once RCCL is up). Not a cluster run
+            // (the default): nothing here executes.
+            if (args.cluster.enabled() &&
+                !backend->set_cluster(&args.cluster, /*comm=*/nullptr)) {
+                std::fprintf(stderr, "[backend_factory] DeepSeek4Backend::set_cluster refused\n");
+                return nullptr;
+            }
             if (!backend->init()) {
                 std::fprintf(stderr, "[backend_factory] DeepSeek4Backend init failed\n");
                 return nullptr;
+            }
+            // Rank 0 serves HTTP through the lockstep decorator, which
+            // bootstraps the control channel and RCCL here. Workers
+            // (rank > 0) get the raw backend; run_cluster_worker owns their
+            // control loop.
+            if (args.cluster.is_head()) {
+                auto head = std::make_unique<dflash::cluster::ClusterHeadBackend>(
+                    std::move(backend), args.cluster, args.model_path, args.device.gpu);
+                if (!head->init()) {
+                    std::fprintf(stderr, "[backend_factory] ClusterHeadBackend init failed\n");
+                    return nullptr;
+                }
+                return head;
             }
             return backend;
         }

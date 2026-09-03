@@ -330,3 +330,23 @@ grep -rE 'getenv\("DFLASH[A-Z0-9_]*"\)' server/src
 
 See `server/docs/ENVIRONMENT.md` for the canonical generated inventory and the
 policy on promoting env vars to CLI flags.
+
+## Cluster (lucebox-halo-cluster)
+
+Multi-node expert-parallel DeepSeek V4 (fork-only, `-DDFLASH27B_CLUSTER=ON`, see
+`server/docs/CLUSTER.md`). Following the policy above, **every cluster setting
+is a CLI flag** (`--cluster-rank`, `--cluster-size`, `--cluster-head`,
+`--cluster-ifname`, `--cluster-ib-hca`, `--cluster-gid-index`,
+`--cluster-expert-placement`, `--cluster-replicate-hot`, `--cluster-shared-expert`,
+`--cluster-allreduce-dtype`, `--cluster-timeout-ms`, `--cluster-verify-hash`,
+`--cluster-selftest`; reference in `server/src/cluster/cluster_config.h`). The
+RCCL transport variables (`NCCL_SOCKET_IFNAME`, `NCCL_IB_HCA`, `NCCL_IB_GID_INDEX`,
+`NCCL_NET_GDR_LEVEL=0`) are *exported by the server* from those flags; values
+already present in the environment win. Only the burn-in kill switches and the
+trace toggle below are environment variables.
+
+| Variable | Purpose |
+|---|---|
+| `DFLASH_CLUSTER_NO_INGRAPH_ALLREDUCE` | 🔀 **kill-switch** Disable the in-graph `GGML_MOE_FUSED_CLUSTER_ALLREDUCE` node (path 3b) and fall back to the host-enqueued `ClusterComm::allreduce_*` after the FFN graph (path 3a). Slower (breaks the fused verify graph) but isolates graph-integration bugs. |
+| `DFLASH_CLUSTER_NO_GRAPH_CAPTURE` | 🔀 **kill-switch** Never capture HIP graphs for graphs that contain a cluster collective (RCCL under HIP graph capture on gfx1151 is unverified). Default in M1; intended to become opt-in once measured. |
+| `DFLASH_CLUSTER_TRACE` | 🐛 **debug** Per-step trace of control-channel messages, collective sizes/latencies and, together with `--cluster-verify-hash n`, the first divergent layer between ranks. Very verbose; never required for serving. |

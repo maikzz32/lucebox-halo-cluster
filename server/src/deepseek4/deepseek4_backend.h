@@ -24,7 +24,15 @@
 #include <string>
 #include <vector>
 
+namespace dflash::cluster {
+struct Ds4ClusterHooks;  // cluster/cluster_decision_hooks.h
+struct ClusterConfig;    // cluster/cluster_config.h
+class IClusterComm;      // cluster/cluster_comm.h
+}
+
 namespace dflash::common {
+
+struct Ds4ClusterRuntime;  // deepseek4_cluster.h
 
 // Bounds the sparse heterogeneous prefill arena once accumulated attention
 // context dominates its memory footprint. Decode batching is unaffected.
@@ -80,7 +88,34 @@ public:
         return routing_stats_.get();
     }
 
+    // Cluster lockstep decisions (lucebox-halo-cluster, WP2). nullptr (the
+    // default) keeps upstream single-node behaviour byte-identical. The
+    // pointer is borrowed: the head decorator / worker main loop owns the
+    // hooks and must outlive every generate() call.
+    void set_cluster_hooks(cluster::Ds4ClusterHooks * hooks) { hooks_ = hooks; }
+    cluster::Ds4ClusterHooks * cluster_hooks() const { return hooks_; }
+
+    // Cluster expert-parallel (WP3). The backend loads only this rank's expert
+    // shard (deepseek4_cluster.h) and runs the per-layer forward with one
+    // all-reduce per MoE layer; fused whole-model graphs are disabled.
+    //
+    // Preferred order: set_cluster(&cfg, nullptr) BEFORE init() (the
+    // communicator does not exist yet at factory time), then
+    // set_cluster(&cfg, comm) once RCCL is up: the second call only attaches
+    // the communicator. Calling it for the first time AFTER init() still
+    // works but reloads the model (park + unpark) with sharding, i.e. the
+    // full expert set is loaded once for nothing. cfg is copied; comm is
+    // borrowed and must outlive every forward. Returns false on a config
+    // mismatch or a failed reload.
+    bool set_cluster(const cluster::ClusterConfig * cfg, cluster::IClusterComm * comm);
+    const Ds4ClusterRuntime * cluster_runtime() const { return cluster_.get(); }
+
 private:
+    cluster::Ds4ClusterHooks * hooks_ = nullptr;
+    // True only when hooks_ belongs to a real cluster (head or worker).
+    bool cluster_active() const;
+    bool cluster_worker() const;
+
     DeepSeek4BackendConfig cfg_;
     ggml_backend_t         backend_      = nullptr;
     ggml_backend_t         snap_backend_ = nullptr;
@@ -161,6 +196,8 @@ private:
 
     bool load_model();
     bool init_hybrid_model();
+    // Cluster rank: dense weights + this rank's expert shard (cold owner None).
+    bool init_cluster_model();
     bool requires_monolithic_model() const;
     bool validate_prefill_mode() const;
     bool init_moe_tensor_parallel();
@@ -178,6 +215,9 @@ private:
     MoeExpertComputeRuntime            expert_runtime_;
     std::shared_ptr<MoeHybridRoutingStats> routing_stats_;
     std::string                       routing_stats_out_path_;
+
+    // Non-null only when set_cluster() was called (one rank of a cluster).
+    std::unique_ptr<Ds4ClusterRuntime> cluster_;
 };
 
 }  // namespace dflash::common

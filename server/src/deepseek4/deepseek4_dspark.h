@@ -29,6 +29,10 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+namespace dflash::cluster {
+struct Ds4ClusterHooks;  // cluster/cluster_decision_hooks.h
+}
+
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -239,6 +243,10 @@ bool run_deepseek4_dspark_spec_decode(
         const std::function<bool(int32_t)> & on_token = {},
         MoeHybridStorage * moe_hybrid = nullptr,
         MoeExpertComputeRuntime * expert_runtime = nullptr,
-        MoeHybridRoutingStats * routing_stats = nullptr);
+        MoeHybridRoutingStats * routing_stats = nullptr,
+        // Cluster lockstep hooks (lucebox-halo-cluster WP4). nullptr or a
+        // LocalHooks instance leaves the single-node algorithm untouched;
+        // head/worker hooks broadcast/receive DraftMsg and AcceptMsg.
+        dflash::cluster::Ds4ClusterHooks * cluster_hooks = nullptr);
 
 }  // namespace dflash::common

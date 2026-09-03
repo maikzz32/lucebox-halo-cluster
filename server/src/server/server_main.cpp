@@ -26,6 +26,12 @@
 #include "placement/pflash_placement.h"
 #include "placement/draft_residency.h"
 #include "kvflash_pager.h"
+#include "cluster/cluster_comm.h"
+#include "cluster/cluster_config.h"
+#include "cluster/cluster_control.h"
+#include "cluster/cluster_identity.h"
+#include "cluster/cluster_protocol.h"
+#include "cluster/cluster_worker_main.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -67,6 +73,121 @@ static bool parse_double_list(const char * value, std::vector<double> & out) {
         if (!*p) return false;
     }
     return !out.empty();
+}
+
+// ── Cluster helpers (--cluster-*) ──────────────────────────────────────────
+
+// Identity every rank presents in Hello; the one definition shared with
+// ClusterHeadBackend and run_cluster_worker lives in cluster_identity.h.
+static dflash::cluster::HelloMsg cluster_identity(const BackendArgs & bargs, uint64_t placement_hash) {
+    return dflash::cluster::cluster_identity(
+        bargs.cluster.rank, bargs.cluster.size,
+        bargs.model_path ? bargs.model_path : "", placement_hash);
+}
+
+static bool parse_int_arg(const char * flag, const char * value, int & out) {
+    const char * end = value + std::strlen(value);
+    const auto parsed = std::from_chars(value, end, out);
+    if (parsed.ec != std::errc{} || parsed.ptr != end) {
+        std::fprintf(stderr, "[server] %s expects an integer, got '%s'\n", flag, value);
+        return false;
+    }
+    return true;
+}
+
+// --cluster-selftest: bootstrap the control channel and the RCCL
+// communicator on every rank exactly as a real run would, run the
+// collective self-test (1000 x 64 KiB + 43 x 16 MiB all-reduces with a
+// host-side sum check and latency percentiles), then exit. No model is
+// loaded: the test is about the fabric, not the weights.
+static int run_cluster_selftest_main(const BackendArgs & bargs) {
+    using namespace dflash::cluster;
+    const ClusterConfig & c = bargs.cluster;
+    ControlTimeouts timeouts;
+    timeouts.recv_ms = c.timeout_ms;
+    const HelloMsg me = cluster_identity(bargs, /*placement_hash=*/0);
+    std::string err;
+    RcclUniqueId unique_id{};
+
+    ClusterHeadControl head;
+    ClusterWorkerControl worker;
+    if (c.is_head()) {
+        head.set_timeouts(timeouts);
+        if (!head.listen(c.head_host, c.head_port, &err)) {
+            std::fprintf(stderr, "[cluster] listen failed: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "[cluster] head listening on %s:%d, waiting for %d worker(s)\n",
+                     c.head_host.c_str(), c.head_port, c.size - 1);
+        std::vector<HelloMsg> hellos;
+        if (!head.accept_workers(c.size - 1, me, c.timeout_ms, hellos, &err)) {
+            std::fprintf(stderr, "[cluster] worker bootstrap failed: %s\n", err.c_str());
+            return 1;
+        }
+        if (!rccl_get_unique_id(unique_id, &err)) {
+            std::fprintf(stderr, "[cluster] %s\n", err.c_str());
+            return 1;
+        }
+        WelcomeMsg welcome;
+        welcome.size = c.size;
+        welcome.rccl_unique_id = unique_id;
+        welcome.placement_hash = 0;
+        welcome.timeout_ms = c.timeout_ms;
+        welcome.allreduce_dtype = (uint8_t)c.allreduce_dtype;
+        welcome.shared_expert = (uint8_t)c.shared_expert;
+        welcome.verify_hash_every = c.verify_hash_every;
+        welcome.rank_hostnames.push_back(me.hostname);
+        for (const HelloMsg & h : hellos) welcome.rank_hostnames.push_back(h.hostname);
+        if (!head.broadcast(make_frame(welcome), &err)) {
+            std::fprintf(stderr, "[cluster] Welcome broadcast failed: %s\n", err.c_str());
+            return 1;
+        }
+    } else {
+        worker.set_timeouts(timeouts);
+        WelcomeMsg welcome;
+        if (!worker.connect_and_handshake(c.head_host, c.head_port, me, welcome, &err)) {
+            std::fprintf(stderr, "[cluster] handshake with head failed: %s\n", err.c_str());
+            return 1;
+        }
+        unique_id = welcome.rccl_unique_id;
+    }
+
+    RcclCommInit init;
+    init.rank = c.rank;
+    init.size = c.size;
+    init.unique_id = unique_id;
+    init.device = bargs.device.gpu;
+    init.timeout_ms = c.timeout_ms;
+    init.blocking = false;
+    std::unique_ptr<IClusterComm> comm = create_rccl_cluster_comm(init, &err);
+    if (!comm) {
+        std::fprintf(stderr, "[cluster] communicator init failed: %s\n", err.c_str());
+        return 1;
+    }
+    std::fprintf(stderr, "[cluster] rank %d/%d communicator ready (rccl %s)\n",
+                 c.rank, c.size, rccl_version_string().c_str());
+
+    const bool ok = run_cluster_selftest(*comm, bargs.device.gpu, /*iters=*/1000,
+                                         /*small_n=*/16384, /*large_n=*/4u * 1024u * 1024u, &err);
+    if (!ok) {
+        std::fprintf(stderr, "[cluster] self-test FAILED on rank %d: %s\n", c.rank, err.c_str());
+        comm->abort();
+    }
+
+    // Orderly teardown: head tells workers to exit, workers wait for it so
+    // no rank tears the communicator down while a peer is still inside it.
+    if (c.is_head()) {
+        ShutdownMsg sd;
+        sd.reason = ok ? 0 : 1;
+        (void)head.broadcast(make_frame(sd), &err);
+        head.close();
+    } else {
+        Frame f;
+        (void)worker.recv(f, c.timeout_ms, &err);
+        worker.close();
+    }
+    comm.reset();
+    return ok ? 0 : 1;
 }
 
 static void print_usage(const char * prog) {
@@ -227,6 +348,25 @@ static void print_usage(const char * prog) {
         "  --freq                       Enable expert frequency tracking + print analysis at shutdown\n"
         "  --collect-routing <path>     Log binary routing data (hidden states + expert IDs)\n"
         "                               for MLP predictor training (see scripts/train_predictor.py)\n"
+        "\n"
+        "Cluster (multi-node RCCL expert-parallel DeepSeek4, HIP only, build with\n"
+        "-DDFLASH27B_CLUSTER=ON; rank 0 serves HTTP, ranks 1..N-1 are workers):\n"
+        "  --cluster-rank <r>           This node's rank in [0, N)\n"
+        "  --cluster-size <N>           Number of ranks (2..8)\n"
+        "  --cluster-head <host:port>   Control endpoint; rank 0 binds, workers connect\n"
+        "                               (default port 9400)\n"
+        "  --cluster-ifname <if>        RoCE interface -> NCCL_SOCKET_IFNAME\n"
+        "  --cluster-ib-hca <hca[:port]>  RDMA device -> NCCL_IB_HCA\n"
+        "  --cluster-gid-index <n>      RoCE v2 GID index -> NCCL_IB_GID_INDEX\n"
+        "  --cluster-expert-placement uniform|balanced|<file.json>\n"
+        "                               Expert-to-rank ownership (default: uniform;\n"
+        "                               balanced needs DFLASH_DS4_HOTNESS_CSV)\n"
+        "  --cluster-replicate-hot <k>  Replicate the k hottest experts per layer\n"
+        "  --cluster-shared-expert replicate|shard|rank0  (default: replicate)\n"
+        "  --cluster-allreduce-dtype f32|bf16|auto  (default: auto)\n"
+        "  --cluster-timeout-ms <ms>    Collective/control watchdog (default: 30000)\n"
+        "  --cluster-verify-hash <n>    Debug: cross-rank hidden-state hash every n steps\n"
+        "  --cluster-selftest           Bootstrap, run the all-reduce self-test, exit\n"
         "\n", prog);
 }
 
@@ -671,11 +811,121 @@ int main(int argc, char ** argv) {
             sconfig.freq_tracking = true;
         } else if (std::strcmp(argv[i], "--collect-routing") == 0 && i + 1 < argc) {
             sconfig.collect_routing_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--cluster-rank") == 0 && i + 1 < argc) {
+            if (!parse_int_arg("--cluster-rank", argv[++i], bargs.cluster.rank)) return 2;
+        } else if (std::strcmp(argv[i], "--cluster-size") == 0 && i + 1 < argc) {
+            if (!parse_int_arg("--cluster-size", argv[++i], bargs.cluster.size)) return 2;
+        } else if (std::strcmp(argv[i], "--cluster-head") == 0 && i + 1 < argc) {
+            std::string err;
+            if (!dflash::cluster::parse_host_port(argv[++i], bargs.cluster.head_host,
+                                                  bargs.cluster.head_port, &err)) {
+                std::fprintf(stderr, "[server] bad --cluster-head value: %s\n", err.c_str());
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--cluster-ifname") == 0 && i + 1 < argc) {
+            bargs.cluster.ifname = argv[++i];
+        } else if (std::strcmp(argv[i], "--cluster-ib-hca") == 0 && i + 1 < argc) {
+            bargs.cluster.ib_hca = argv[++i];
+        } else if (std::strcmp(argv[i], "--cluster-gid-index") == 0 && i + 1 < argc) {
+            if (!parse_int_arg("--cluster-gid-index", argv[++i], bargs.cluster.gid_index)) return 2;
+            if (bargs.cluster.gid_index < 0) {
+                std::fprintf(stderr, "[server] --cluster-gid-index must be non-negative\n");
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--cluster-expert-placement") == 0 && i + 1 < argc) {
+            std::string err;
+            if (!dflash::cluster::parse_placement_source(argv[++i], bargs.cluster.placement_source,
+                                                         bargs.cluster.placement_file, &err)) {
+                std::fprintf(stderr, "[server] %s\n", err.c_str());
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--cluster-replicate-hot") == 0 && i + 1 < argc) {
+            if (!parse_int_arg("--cluster-replicate-hot", argv[++i], bargs.cluster.replicate_hot)) return 2;
+            if (bargs.cluster.replicate_hot < 0) {
+                std::fprintf(stderr, "[server] --cluster-replicate-hot must be non-negative\n");
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--cluster-shared-expert") == 0 && i + 1 < argc) {
+            std::string err;
+            if (!dflash::cluster::parse_shared_expert_mode(argv[++i], bargs.cluster.shared_expert, &err)) {
+                std::fprintf(stderr, "[server] %s\n", err.c_str());
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--cluster-allreduce-dtype") == 0 && i + 1 < argc) {
+            std::string err;
+            if (!dflash::cluster::parse_allreduce_dtype(argv[++i], bargs.cluster.allreduce_dtype, &err)) {
+                std::fprintf(stderr, "[server] %s\n", err.c_str());
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--cluster-timeout-ms") == 0 && i + 1 < argc) {
+            int v = 0;
+            if (!parse_int_arg("--cluster-timeout-ms", argv[++i], v)) return 2;
+            if (v <= 0) {
+                std::fprintf(stderr, "[server] --cluster-timeout-ms must be positive\n");
+                return 2;
+            }
+            bargs.cluster.timeout_ms = (uint32_t)v;
+        } else if (std::strcmp(argv[i], "--cluster-verify-hash") == 0 && i + 1 < argc) {
+            if (!parse_int_arg("--cluster-verify-hash", argv[++i], bargs.cluster.verify_hash_every)) return 2;
+            if (bargs.cluster.verify_hash_every < 0) {
+                std::fprintf(stderr, "[server] --cluster-verify-hash must be non-negative\n");
+                return 2;
+            }
+        } else if (std::strcmp(argv[i], "--cluster-selftest") == 0) {
+            bargs.cluster.selftest = true;
         } else {
             std::fprintf(stderr, "[server] unknown option: %s\n", argv[i]);
             print_usage(argv[0]);
             return 2;
         }
+    }
+
+    // ── Cluster mode: structural validation, RCCL environment, startup line.
+    // Model/backend-dependent rules live in check_feature_compatibility();
+    // this is only what can be decided from the flags alone.
+    if (bargs.cluster.enabled() || bargs.cluster.rank >= 0 || bargs.cluster.selftest) {
+        if (!bargs.cluster.enabled()) {
+            std::fprintf(stderr,
+                "[server] --cluster-rank / --cluster-selftest require --cluster-size\n");
+            return 2;
+        }
+        const std::string cluster_error = bargs.cluster.validate();
+        if (!cluster_error.empty()) {
+            std::fprintf(stderr, "[server] %s\n", cluster_error.c_str());
+            return 2;
+        }
+        // The snapshot-backed caches are not mirrored across ranks yet (M4:
+        // snapshot broadcast). The gate cannot see ServerConfig, so the rule
+        // lives here, next to the setting it constrains.
+        if (sconfig.prefix_cache_cap != 0) {
+            std::fprintf(stderr,
+                "[server] cluster mode requires --prefix-cache-slots 0 "
+                "(prefix snapshots are not yet replicated across ranks)\n");
+            return 2;
+        }
+        if (sconfig.prefill_cache_cap != 0 || !sconfig.disk_cache_dir.empty()) {
+            std::fprintf(stderr,
+                "[server] cluster mode disables prefill/disk snapshot caches "
+                "until they are replicated across ranks\n");
+            sconfig.prefill_cache_cap = 0;
+            sconfig.disk_cache_dir.clear();
+            sconfig.disk_cache_policy.mode = DiskPrefixCacheMode::Off;
+        }
+        const int n_env = dflash::cluster::export_rccl_environment(bargs.cluster);
+        std::fprintf(stderr,
+            "cluster: rank %d/%d head=%s:%d iface=%s hca=%s placement=%s "
+            "(gid=%d shared_expert=%s allreduce=%s timeout=%u ms; %d NCCL vars exported)\n",
+            bargs.cluster.rank, bargs.cluster.size,
+            bargs.cluster.head_host.c_str(), bargs.cluster.head_port,
+            bargs.cluster.ifname.empty() ? "(env)" : bargs.cluster.ifname.c_str(),
+            bargs.cluster.ib_hca.empty() ? "(env)" : bargs.cluster.ib_hca.c_str(),
+            bargs.cluster.placement_source == dflash::cluster::PlacementSource::File
+                ? bargs.cluster.placement_file.c_str()
+                : dflash::cluster::placement_source_name(bargs.cluster.placement_source),
+            bargs.cluster.gid_index,
+            dflash::cluster::shared_expert_mode_name(bargs.cluster.shared_expert),
+            dflash::cluster::allreduce_dtype_name(bargs.cluster.allreduce_dtype),
+            bargs.cluster.timeout_ms, n_env);
     }
     if (specla_top_k_set && !bargs.specla_mode) {
         std::fprintf(stderr, "[server] --specla-top-k requires --specla\n");
@@ -760,6 +1010,17 @@ int main(int argc, char ** argv) {
     // front so they are visible before the backend's own startup chatter.
     for (const std::string & warning : backend_preparation.warnings) {
         std::fprintf(stderr, "[server] warning: %s\n", warning.c_str());
+    }
+
+    // Cluster short-circuits: both run after the gate admitted the launch so
+    // a misconfigured rank fails the same way on every node.
+    if (bargs.cluster.enabled() && bargs.cluster.selftest) {
+        return run_cluster_selftest_main(bargs);
+    }
+    if (bargs.cluster.is_worker()) {
+        // Workers never bind HTTP: they join the head's control channel,
+        // build the same backend and follow rank 0's decisions.
+        return dflash::cluster::run_cluster_worker(bargs, backend_features, argc, argv);
     }
     const ResolvedBackendPlan & backend_plan = backend_preparation.plan;
     const std::string & arch = backend_plan.arch();

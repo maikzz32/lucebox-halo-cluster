@@ -7,6 +7,7 @@
 
 #include <limits>
 
+#include "cluster/cluster_config.h"
 #include "placement/draft_residency.h"
 #include "placement/placement_config.h"
 #include "placement/remote_draft_config.h"
@@ -89,6 +90,10 @@ struct BackendArgs {
     float           ddtree_tau       = std::numeric_limits<float>::infinity();
     int             verify_width     = 0;  // chain spec verify width; 0 = adaptive
     bool            use_feature_mirror = false;
+
+    // Multi-node expert-parallel cluster (--cluster-*). cluster.enabled() is
+    // false for every upstream launch; only deepseek4 on HIP honors it.
+    dflash::cluster::ClusterConfig cluster;
 };
 
 }  // namespace dflash::common

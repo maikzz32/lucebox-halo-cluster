@@ -6,6 +6,7 @@
 #include "paged_attention_config.h"
 
 #include <climits>
+#include <cstdlib>
 
 namespace dflash::common {
 
@@ -325,6 +326,75 @@ std::string check_feature_compatibility(
                "DeepSeek4 backend";
     }
 
+    // ── --cluster-* × architecture, backend, placement, decode features
+    // Multi-node expert parallelism replicates one DeepSeek4 decode stream
+    // on every rank and joins the ranks per MoE layer with an RCCL
+    // all-reduce. Everything below is about reaching that one code path:
+    // the monolithic HIP DeepSeek4 backend, single stream, no snapshot or
+    // paged state that would have to be mirrored across ranks.
+    if (args.cluster.enabled()) {
+        const dflash::cluster::ClusterConfig & c = args.cluster;
+        if (c.size < dflash::cluster::kClusterMinSize ||
+            c.size > dflash::cluster::kClusterMaxSize) {
+            return "--cluster-size must be in [" +
+                   std::to_string(dflash::cluster::kClusterMinSize) + ", " +
+                   std::to_string(dflash::cluster::kClusterMaxSize) + "], got " +
+                   std::to_string(c.size);
+        }
+        if (c.rank < 0 || c.rank >= c.size) {
+            return "--cluster-rank must be in [0, " + std::to_string(c.size) +
+                   "), got " + std::to_string(c.rank);
+        }
+        if (c.head_host.empty()) {
+            return "cluster mode requires --cluster-head <host:port>";
+        }
+        const std::string structural = c.validate();
+        if (!structural.empty()) {
+            return "cluster mode: " + structural;
+        }
+        if (!arch_supports_cluster_ep(arch)) {
+            return "--cluster-size requires a deepseek4 target (architecture '" +
+                   arch + "' has no cluster expert-parallel path)";
+        }
+        if (compiled_backend != PlacementBackend::Hip ||
+            target_backend != PlacementBackend::Hip) {
+            return "cluster mode requires a HIP build and a HIP target device "
+                   "(compiled backend: " +
+                   std::string(placement_backend_name(compiled_backend)) + ")";
+        }
+        if (args.device.is_multi_device() ||
+            args.remote_target_shard.enabled()) {
+            return "cluster mode requires a single local HIP target device";
+        }
+        if (args.paged_attention || args.max_concurrency > 1) {
+            return "cluster mode is incompatible with --paged-attention / "
+                   "--max-concurrency > 1";
+        }
+        if (features.pflash_enabled) {
+            return "cluster mode does not support PFlash prefill compression";
+        }
+        if (features.kvflash_enabled) {
+            return "cluster mode does not support KVFlash";
+        }
+        if (args.ds4_fused_decode) {
+            return "--ds4-fused-decode is not yet supported on the cluster path";
+        }
+        if (args.ds4_fused_verify_f16_kv) {
+            return "--ds4-fused-verify-f16-kv is not yet supported on the "
+                   "cluster path";
+        }
+        // The expert placement is built for the model's routed top-k; a
+        // narrower top-k would change which ranks see traffic and is not
+        // reflected in the shared placement hash.
+        if (args.ds4_expert_top_k != 0 && args.ds4_expert_top_k != 6) {
+            return "--ds4-expert-top-k must stay at the model default (0 or 6) "
+                   "in cluster mode, got " + std::to_string(args.ds4_expert_top_k);
+        }
+        // --prefix-cache-slots is server-owned (ServerConfig) and does not
+        // reach BackendArgs; server_main.cpp enforces "--prefix-cache-slots 0"
+        // for cluster runs until the snapshot broadcast lands.
+    }
+
     return {};
 }
 
@@ -404,6 +474,19 @@ std::vector<std::string> collect_feature_warnings(
     if (features.adaptive_experts_requested && !arch_has_expert_offload(arch)) {
         out.push_back("--adaptive-experts ignored: architecture '" + arch +
                       "' has no expert-count gating");
+    }
+
+    // Cluster placement tunables that need routing hotness. Without a
+    // hotness CSV the uniform placement has no notion of "hottest", so the
+    // replication request is dropped rather than guessed.
+    if (args.cluster.enabled() && args.cluster.replicate_hot > 0 &&
+        args.cluster.placement_source != dflash::cluster::PlacementSource::File) {
+        const char * hotness = std::getenv("DFLASH_DS4_HOTNESS_CSV");
+        if (hotness == nullptr || hotness[0] == '\0') {
+            out.push_back("--cluster-replicate-hot ignored: no routing hotness "
+                          "available (set DFLASH_DS4_HOTNESS_CSV or use a "
+                          "placement JSON with replicated experts)");
+        }
     }
 
     return out;

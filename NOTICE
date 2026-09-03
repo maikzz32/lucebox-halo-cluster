@@ -1,0 +1,79 @@
+lucebox-halo-cluster
+Copyright 2026 the lucebox-halo-cluster contributors
+
+This product is a modified fork of Lucebox (https://github.com/Luce-Org/lucebox),
+licensed under the Apache License, Version 2.0 (see LICENSE). Earlier Lucebox
+releases were distributed under the MIT License; the Apache-2.0 relicensing by
+the Lucebox authors applies to the code this fork is based on (upstream main
+298031aa, 2026-09-01).
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at http://www.apache.org/licenses/LICENSE-2.0. Unless required by
+applicable law or agreed to in writing, software distributed under the License
+is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.
+
+--------------------------------------------------------------------------
+Modifications in this fork
+--------------------------------------------------------------------------
+
+This is NOT the upstream Lucebox. It adds multi-node expert-parallel execution
+of DeepSeek V4 across several AMD Strix Halo machines connected by RoCE v2
+RDMA, using RCCL. Changes relative to upstream are kept additive and live in:
+
+  server/src/cluster/                 cluster runtime (control channel, RCCL
+                                      communicator, expert placement, hooks)
+  server/deps/patches/cluster/        patch series with every modification to
+                                      the vendored ggml (see README.md there)
+  scripts/cluster/                    host preparation, launch, baseline and
+                                      build helpers
+  Dockerfile.rocm-cluster, docker-bake.hcl (rocm-cluster targets), Makefile
+  server/docs/CLUSTER.md              operator guide
+  .github/workflows/cluster-ci.yml    fork-only CI
+
+Build option: -DDFLASH27B_CLUSTER=ON. With the option OFF the sources are
+intended to be functionally identical to upstream Lucebox.
+
+--------------------------------------------------------------------------
+Third-party components
+--------------------------------------------------------------------------
+
+ggml / llama.cpp (vendored at server/deps/llama.cpp)
+  Copyright (c) 2023-2026 The ggml authors / Georgi Gerganov
+  MIT License. https://github.com/ggml-org/llama.cpp
+  This fork modifies ggml's CUDA/HIP backend; the modifications are
+  documented in server/deps/patches/cluster/.
+
+RCCL (ROCm Communication Collectives Library, used at build and run time,
+not vendored)
+  Copyright (c) 2015-2026 NVIDIA CORPORATION (NCCL origin) and
+  Advanced Micro Devices, Inc.
+  BSD-3-Clause style license (the ROCm/RCCL LICENSE.txt).
+  https://github.com/ROCm/rccl
+
+rccl-tests (built into the container image only)
+  Copyright (c) 2016-2026 NVIDIA CORPORATION and Advanced Micro Devices, Inc.
+  BSD-3-Clause style license. https://github.com/ROCm/rccl-tests
+
+rdma-core (libibverbs, librdmacm, providers; used at run time inside the
+container image, not vendored)
+  Dual licensed: GNU General Public License v2.0 only OR BSD 2-Clause
+  (Linux-OpenIB). https://github.com/linux-rdma/rdma-core
+
+TheRock / ROCm SDK (AMD's pip-distributed ROCm 10 toolchain and libraries
+that the container image is built on)
+  Copyright Advanced Micro Devices, Inc.
+  Component licenses are shipped with the SDK (MIT for most ROCm libraries,
+  Apache-2.0 with LLVM exceptions for the compiler, NCSA for parts of the
+  HIP runtime). https://github.com/ROCm/TheRock
+
+OpenMPI (container image only, for multi-node rccl-tests)
+  BSD-3-Clause. https://www.open-mpi.org
+
+perftest (container image only)
+  Dual GPLv2 / BSD. https://github.com/linux-rdma/perftest
+
+Model weights (DeepSeek V4 Flash GGUF and its DSpark drafter) are NOT part of
+this distribution; they are downloaded by the operator and are subject to
+DeepSeek's model license.
