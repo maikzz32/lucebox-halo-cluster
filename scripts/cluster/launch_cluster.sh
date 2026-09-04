@@ -42,6 +42,8 @@ Environment:
   MMVF_F16       LUCE_MMVF_MAX_NCOLS_F16 (default 4; 0 = upstream per-arch value)
   PINNED_ROLLBACK DFLASH_DS4_PINNED_ROLLBACK (default 1; 0 = pageable staging)
   FUSED_CACHE_SLOTS DFLASH_DS4_TP_FUSED_CACHE_SLOTS (default 12 = the hard cap; upstream is 2 at q<=4)
+  SHARD_DRAFTER  DFLASH_CLUSTER_SHARD_DRAFTER (default 1; 0 = drafter replicated)
+  SPLIT_LM_HEAD  DFLASH_CLUSTER_SPLIT_LM_HEAD (default 1; 0 = head replicated)
   RESTART        podman --restart policy (default no). "on-failure:3" makes the
                  ranks reform the cluster after a peer failure by themselves.
   PREFIX_SLOTS   --prefix-cache-slots on every rank (default 32; 0 disables)
@@ -99,6 +101,16 @@ PINNED_ROLLBACK="${PINNED_ROLLBACK:-1}"
 # are nearly free: the cache measured 303 MiB at 2 slots and 351 MiB at the
 # cap, about 0.8 MiB each. Proposed upstream as #704.
 FUSED_CACHE_SLOTS="${FUSED_CACHE_SLOTS:-12}"
+# Split the DSpark drafter's routed experts across the ranks. Every rank
+# already loads the drafter and runs the draft forward in lockstep, so this
+# needs no protocol change. Two nodes 42.1 -> 43.1 tok/s, four 48.3 -> 49.4,
+# byte-identical and with the acceptance rate unchanged.
+SHARD_DRAFTER="${SHARD_DRAFTER:-1}"
+# Project only this rank's slice of the DSpark head's vocabulary and sum the
+# padded logits back to full width before the argmax. Requires the vocabulary
+# to divide evenly by the rank count; the runtime refuses and stays replicated
+# when it does not. Two nodes 48.2 -> 49.4 tok/s, four 55.0 -> 56.3.
+SPLIT_LM_HEAD="${SPLIT_LM_HEAD:-1}"
 # Container restart policy. Every rank exits non-zero on a cluster fault (the
 # head with code 3), so "on-failure:N" lets the ranks reform the cluster by
 # themselves: the workers retry the handshake and the head waits for them.
@@ -246,7 +258,9 @@ podman_cmd() {
         -e NCCL_IB_TIMEOUT=22 -e NCCL_IB_RETRY_CNT=7 -e HIP_FORCE_DEV_KERNARG=1
         -e "LUCE_MMVF_MAX_NCOLS_F16=${MMVF_F16}"
         -e "DFLASH_DS4_PINNED_ROLLBACK=${PINNED_ROLLBACK}"
-        -e "DFLASH_DS4_TP_FUSED_CACHE_SLOTS=${FUSED_CACHE_SLOTS}")
+        -e "DFLASH_DS4_TP_FUSED_CACHE_SLOTS=${FUSED_CACHE_SLOTS}"
+        -e "DFLASH_CLUSTER_SHARD_DRAFTER=${SHARD_DRAFTER}"
+        -e "DFLASH_CLUSTER_SPLIT_LM_HEAD=${SPLIT_LM_HEAD}")
     local kv
     for kv in $EXTRA_ENV; do cmd+=(-e "$kv"); done
     if [ -n "$BIN_DIR" ]; then
