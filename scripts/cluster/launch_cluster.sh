@@ -39,6 +39,7 @@ Environment:
   PLACEMENT      --cluster-expert-placement (default uniform)
   HEAD_WAIT      seconds to wait for the head's "cluster: listening" line (default 20)
   SPEC_Q         DFLASH_DS4_SPEC_Q (default 4); SPEC=0 disables DSpark entirely
+  MMVF_F16       LUCE_MMVF_MAX_NCOLS_F16 (default 4; 0 = upstream per-arch value)
   RESTART        podman --restart policy (default no). "on-failure:3" makes the
                  ranks reform the cluster after a peer failure by themselves.
   PREFIX_SLOTS   --prefix-cache-slots on every rank (default 32; 0 disables)
@@ -76,6 +77,12 @@ GID_INDEX="${GID_INDEX:-1}"
 PLACEMENT="${PLACEMENT:-uniform}"
 HEAD_WAIT="${HEAD_WAIT:-20}"
 SPEC="${SPEC:-1}"
+# F16 mul_mat_vec ceiling. Upstream gives gfx1151 the RDNA3 value of 3, measured
+# on discrete RX 7000 cards; at a verify width of 4 that sends DeepSeek V4's
+# per-layer F16 router gate to rocBLAS, which runs it in a single workgroup.
+# Two nodes, q=4: 30.5 -> 38.6 tok/s, byte-identical. 0 restores the upstream
+# per-architecture value.
+MMVF_F16="${MMVF_F16:-4}"
 # Container restart policy. Every rank exits non-zero on a cluster fault (the
 # head with code 3), so "on-failure:N" lets the ranks reform the cluster by
 # themselves: the workers retry the handshake and the head waits for them.
@@ -220,7 +227,8 @@ podman_cmd() {
         -e NCCL_NET_GDR_LEVEL=0 -e NCCL_IB_DISABLE=0 -e "NCCL_IB_GID_INDEX=${GID_INDEX}"
         -e "NCCL_SOCKET_IFNAME=${iface}" -e "GLOO_SOCKET_IFNAME=${iface}" -e "NCCL_IB_HCA=${hca}"
         -e NCCL_ASYNC_ERROR_HANDLING=1 -e NCCL_IB_QPS_PER_CONNECTION=2
-        -e NCCL_IB_TIMEOUT=22 -e NCCL_IB_RETRY_CNT=7 -e HIP_FORCE_DEV_KERNARG=1)
+        -e NCCL_IB_TIMEOUT=22 -e NCCL_IB_RETRY_CNT=7 -e HIP_FORCE_DEV_KERNARG=1
+        -e "LUCE_MMVF_MAX_NCOLS_F16=${MMVF_F16}")
     local kv
     for kv in $EXTRA_ENV; do cmd+=(-e "$kv"); done
     if [ -n "$BIN_DIR" ]; then
