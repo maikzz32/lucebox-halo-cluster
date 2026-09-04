@@ -551,6 +551,8 @@ fork:
 | [#699](https://github.com/Luce-Org/lucebox/pull/699) | `ggml_backend_cuda_get_stream` / `_get_device_id`, so work submitted outside ggml can be stream-ordered with a backend | `upstream-pr/ggml-backend-stream-accessors` |
 | [#700](https://github.com/Luce-Org/lucebox/pull/700) | `ggml_cluster_allreduce`: an in-graph collective node that calls a caller-registered callback, so ggml gains no collective-library dependency | `upstream-pr/ggml-ingraph-collective` |
 | [#701](https://github.com/Luce-Org/lucebox/pull/701) | `MoeHybridColdBackend::None` plus the expert-major prefill it unlocks (34.1 s -> 11.45 s on a 1517-token prompt) | `upstream-pr/moe-cold-owner-none` |
+| [#702](https://github.com/Luce-Org/lucebox/pull/702) | `LUCE_MMVF_MAX_NCOLS_F16`: gfx1151 inherits the discrete-RDNA3 F16 `mul_mat_vec` ceiling of 3, and a verify width of 4 lands one column past it, where rocBLAS runs a tall-skinny F16 weight in a single workgroup (27.9 -> 34.5 tok/s) | `upstream-pr/mmvf-f16-ceiling` |
+| [#703](https://github.com/Luce-Org/lucebox/pull/703) | Register mixed-qtype decode tables for hot-only storage, so an owner with cold owner `None` can run an adaptive artifact. **Stacked on #701** | `upstream-pr/mix-tables-hot-only` |
 
 Deliberately **not** offered: the N-rank expert placement, the control channel,
 the decision hooks and the feature-gate rows. They only mean something with a
