@@ -41,6 +41,7 @@ Environment:
   SPEC_Q         DFLASH_DS4_SPEC_Q (default 4); SPEC=0 disables DSpark entirely
   RESTART        podman --restart policy (default no). "on-failure:3" makes the
                  ranks reform the cluster after a peer failure by themselves.
+  PREFIX_SLOTS   --prefix-cache-slots on every rank (default 32; 0 disables)
   PULL           1 = podman pull IMAGE on every host first (default 0)
   BIN_DIR        host dir with server/build/dflash_server (+ deps/**/lib*.so*);
                  mounted at /opt/lucebox-dist and used as entrypoint (dev loop
@@ -55,7 +56,7 @@ Per-rank flags passed to dflash_server (from server/src/cluster/cluster_config.h
   --cluster-ifname <iface> --cluster-ib-hca <hca> --cluster-gid-index GID_INDEX
   --cluster-expert-placement PLACEMENT --target-device hip:0
   --ds4-expert-top-k 6 --ds4-prefill sparse --chunk 2048 --max-ctx 32768
-  --prefix-cache-slots 0 --prefill-cache-slots 0
+  --prefix-cache-slots PREFIX_SLOTS --prefill-cache-slots 0
   plus --host 0.0.0.0 --port HTTP_PORT on rank 0 only.
 Extra arguments after the three positionals are appended on EVERY rank.
 
@@ -81,6 +82,11 @@ SPEC="${SPEC:-1}"
 # Default "no" because during development a crash should stay a crash - a
 # restart loop reloading 50 GB per rank hides the reason it happened.
 RESTART="${RESTART:-no}"
+# Prefix-cache slots. Replicated across ranks since protocol 2 (snapshot save
+# and free are broadcast, the request carries the restore and the inline slot).
+# 0 disables it, which is what a byte-identity comparison against a single node
+# should use so no run silently resumes another run's KV.
+PREFIX_SLOTS="${PREFIX_SLOTS:-32}"
 SPEC_Q="${SPEC_Q:-4}"
 PULL="${PULL:-0}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -227,7 +233,8 @@ podman_cmd() {
         --cluster-ifname "$iface" --cluster-ib-hca "$hca" --cluster-gid-index "$GID_INDEX"
         --cluster-expert-placement "$PLACEMENT"
         --target-device hip:0 --ds4-expert-top-k 6 --ds4-prefill sparse
-        --chunk 2048 --max-ctx 32768 --prefix-cache-slots 0 --prefill-cache-slots 0)
+        --chunk 2048 --max-ctx 32768
+        --prefix-cache-slots "$PREFIX_SLOTS" --prefill-cache-slots 0)
     if [ "$i" = 0 ]; then cmd+=(--host 0.0.0.0 --port "$HTTP_PORT"); fi
     cmd+=("${EXTRA_ARGS[@]}")
     printf '%q ' "${cmd[@]}"

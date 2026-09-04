@@ -29,7 +29,11 @@
 namespace dflash::cluster {
 
 inline constexpr uint32_t kFrameMagic      = 0x4C43424Cu;  // "LBCL"
-inline constexpr uint16_t kProtocolVersion = 1;
+// 2: RequestMsg carries the inline snapshot position and separates the
+//    restore slot from the inline save slot, so the prefix cache can be
+//    replicated (a request may restore from one slot and check-point into
+//    another; before this the workers never took the inline snapshot at all).
+inline constexpr uint16_t kProtocolVersion = 2;
 inline constexpr size_t   kFrameHeaderBytes = 12;
 inline constexpr size_t   kMaxPayloadBytes  = 64ull * 1024ull * 1024ull;
 inline constexpr size_t   kRcclUniqueIdBytes = 128;  // == NCCL_UNIQUE_ID_BYTES
@@ -200,9 +204,14 @@ struct RequestMsg {
     uint64_t seed = 0;
     DecodeMode decode_mode = DecodeMode::Autoregressive;
     bool     force_ar = false;
-    // Prefix-cache / snapshot resume state (0/-1 = none).
-    int32_t  snapshot_slot = -1;
+    // Prefix-cache state. The two halves are independent: a request may
+    // resume from `restore_slot` (its KV holds `kv_offset` tokens) and still
+    // be asked to write an inline snapshot into `snapshot_slot` once prefill
+    // reaches `snapshot_pos`. -1 means "none" for both slots.
+    int32_t  restore_slot = -1;
     int32_t  kv_offset = 0;
+    int32_t  snapshot_slot = -1;
+    int32_t  snapshot_pos = -1;
     std::vector<int32_t> stop_token_ids;     // budget-hook close tokens etc.
 
     static MsgType type() { return MsgType::Request; }

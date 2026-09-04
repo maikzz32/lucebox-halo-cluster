@@ -74,8 +74,7 @@ uint64_t backend_placement_hash(const common::DeepSeek4Backend & backend) {
 //       do_sample from temperature > 0 and never sees the penalties. Harmless
 //       because the head computes decode_mode from its own full sampler and
 //       the worker only ever narrows spec to AR, never the other way round.
-//   GenerateRequest.snap_pos                   -> inline snapshot position;
-//       only snap_slot travels (as snapshot_slot when no restore is active).
+//   (snap_slot / snap_pos and the restore slot travel since protocol 2.)
 //   BudgetHook.hard_limit_remaining            -> only close_token_ids travel
 //       (stop_token_ids); the worker gets hard_limit_remaining = 0, which is
 //       fine because the head's override arrives inside the token itself.
@@ -100,13 +99,14 @@ RequestMsg ClusterHeadBackend::build_request_msg(uint64_t request_id, const Gene
                      !sampling_requires_ar)
         ? DecodeMode::Speculative : DecodeMode::Autoregressive;
     m.force_ar = req.force_ar_decode;
-    if (restore_slot >= 0) {
-        m.snapshot_slot = restore_slot;
-        m.kv_offset = restore_kv_offset;
-    } else {
-        m.snapshot_slot = req.snap_slot;
-        m.kv_offset = 0;
-    }
+    // Restore and inline save are independent: the HTTP layer may resume
+    // from one slot and check-point this request's longer prefix into
+    // another. Both have to travel, or the workers' slots drift away from the
+    // head's and a later restore silently resumes different KV.
+    m.restore_slot   = restore_slot;
+    m.kv_offset      = restore_slot >= 0 ? restore_kv_offset : 0;
+    m.snapshot_slot  = req.snap_slot;
+    m.snapshot_pos   = req.snap_pos;
     m.stop_token_ids = req.budget_hook.close_token_ids;
     return m;
 }
@@ -610,12 +610,16 @@ bool ClusterHeadBackend::unpark(ParkTarget target) {
 bool ClusterHeadBackend::is_target_parked() const { return inner_->is_target_parked(); }
 
 bool ClusterHeadBackend::snapshot_save(int slot) {
-    // TODO(cluster-verify): the M1 gate requires --prefix-cache-slots 0, so
-    // this path is unreachable until snapshot broadcast (M4). If the inner
-    // save fails on the head but succeeds on a worker the slots diverge;
-    // M4 adds a SnapshotFree follow-up on failure.
     if (!broadcast_op(BackendOpKind::SnapshotSave, {slot})) return false;
-    return inner_->snapshot_save(slot);
+    if (inner_->snapshot_save(slot)) return true;
+    // The workers have taken the snapshot and this rank has not. Leaving it
+    // there would make a later restore resume from a slot only some ranks
+    // hold, which diverges silently. Drop it everywhere instead.
+    std::fprintf(stderr,
+                 "[cluster] head: snapshot_save(%d) failed here; freeing the slot on "
+                 "every rank so no rank restores from it\n", slot);
+    broadcast_op(BackendOpKind::SnapshotFree, {slot});
+    return false;
 }
 
 void ClusterHeadBackend::snapshot_free(int slot) {

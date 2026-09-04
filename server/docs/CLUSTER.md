@@ -239,7 +239,7 @@ dflash_server /models/<target>.gguf \
   --cluster-ifname <iface> --cluster-ib-hca <hca> --cluster-gid-index 1 \
   --cluster-expert-placement uniform --target-device hip:0 \
   --ds4-expert-top-k 6 --ds4-prefill sparse --chunk 2048 --max-ctx 32768 \
-  --prefix-cache-slots 0 --prefill-cache-slots 0
+  --prefix-cache-slots 32 --prefill-cache-slots 0
 ```
 
 Environment in every container: `DFLASH_DS4_SPEC=1 DFLASH_DS4_DRAFT=/models/<dspark>
@@ -269,7 +269,8 @@ Manual equivalent for one rank: see the comment block at the end of
 
 Gate rules (feature gate): cluster requires `deepseek4`, HIP, no layer split, no
 remote target shard, no paged attention, `max_concurrency == 1`, no PFlash /
-KVFlash, `--prefix-cache-slots 0` (until snapshot broadcast lands in M4).
+KVFlash. `--prefix-cache-slots` is allowed since protocol 2; the disk and
+prefill caches stay off.
 Ranks must run identical binaries, identical model files and the same
 placement (checked via `build_sha`, `model_sha`, `placement_hash` in `Hello`).
 
@@ -502,6 +503,55 @@ The all-reduce is not the prefill bottleneck: 535 ms of 7.6 s at 1517 tokens,
 3.5 s of 68.6 s at 12017. At 12k tokens attention (24.7 s) and the expert FFN
 (29.2 s) dominate, and attention is replicated on every rank, so long-context
 prefill cannot gain much from more ranks.
+
+## Prefix cache across ranks (M4)
+
+Until protocol 2 a cluster run had to pass `--prefix-cache-slots 0`, so every
+request paid a full prefill. With `DeepSeek-V4-Flash` that is 8 s for a
+1500-token prompt and over a minute for 12k — by far the largest cost in a
+chat or agent workload, much larger than anything left in the decode loop.
+
+Two halves had to travel for the snapshots to be replicated, and only one of
+them did:
+
+* `snapshot_save` / `snapshot_free` were already broadcast backend ops.
+* The **inline snapshot position** was not on the wire (`snap_pos = -1` on the
+  worker), so the workers never took the checkpoint the head took. A later
+  restore would have resumed from a slot only the head held — silent
+  divergence, not an error.
+* The restore slot and the inline save slot were the *same* wire field, but
+  the HTTP layer can resume from one slot and check-point into another in the
+  same request.
+
+Protocol 2 therefore carries `restore_slot`, `kv_offset`, `snapshot_slot` and
+`snapshot_pos` as four independent fields, and `--prefix-cache-slots` is
+allowed again (`PREFIX_SLOTS` in `launch_cluster.sh`, default 32). Two ranks
+that disagree about a save now fail loudly: if the head's own save fails after
+the broadcast it frees the slot everywhere, and a worker whose save fails
+aborts the run instead of continuing with a slot the head has.
+
+The disk and prefill caches stay off: they adopt deserialized snapshots
+through `snapshot_adopt`, which only the head could do.
+
+Measured, three-turn conversation over a 1000-token document, two nodes:
+
+| Turn | prefilled | cache | wall |
+|---|---|---|---|
+| 1 | 1023 | miss | 10.6 s |
+| 2 | 1047 | miss | 12.6 s |
+| 3 | **31** | **hit, 1037 restored** | **1.65 s** |
+
+The same conversation with `PREFIX_SLOTS=0` takes 9.42 s for turn 3, so the
+cache is worth **5.7x** on a continued conversation — and turn 3's completion
+is **identical with and without the cache**, which is the proof that the
+restored snapshot is the same KV a cold prefill would have produced. A single
+node run of the same conversation hits the cache at the same turn with the
+same 1037 restored tokens and returns the same answer.
+
+Note for benchmarking: the 128-token reference benchmark does not restore
+(single short prompt, no shared history), so it stays byte-identical either
+way. Use `PREFIX_SLOTS=0` when comparing outputs against a single node so no
+run can silently resume another run's KV.
 
 ## Faults: what happens when a rank dies (M4)
 

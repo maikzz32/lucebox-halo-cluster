@@ -391,8 +391,9 @@ std::string check_feature_compatibility(
                    "in cluster mode, got " + std::to_string(args.ds4_expert_top_k);
         }
         // --prefix-cache-slots is server-owned (ServerConfig) and does not
-        // reach BackendArgs; server_main.cpp enforces "--prefix-cache-slots 0"
-        // for cluster runs until the snapshot broadcast lands.
+        // reach BackendArgs. The prefix cache is replicated since protocol 2;
+        // server_main.cpp still turns the disk/prefill caches off, because
+        // those adopt deserialized snapshots on the head alone.
     }
 
     return {};

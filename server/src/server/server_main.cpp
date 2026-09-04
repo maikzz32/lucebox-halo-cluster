@@ -899,19 +899,16 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "[server] %s\n", cluster_error.c_str());
             return 2;
         }
-        // The snapshot-backed caches are not mirrored across ranks yet (M4:
-        // snapshot broadcast). The gate cannot see ServerConfig, so the rule
-        // lives here, next to the setting it constrains.
-        if (sconfig.prefix_cache_cap != 0) {
-            std::fprintf(stderr,
-                "[server] cluster mode requires --prefix-cache-slots 0 "
-                "(prefix snapshots are not yet replicated across ranks)\n");
-            return 2;
-        }
+        // The prefix cache is replicated since protocol 2: snapshot save and
+        // free are broadcast backend ops, and the request descriptor carries
+        // both the restore slot and the inline snapshot slot/position, so
+        // every rank holds the same KV in the same slot. The disk and prefill
+        // caches are not: they deserialize snapshots through snapshot_adopt,
+        // which only the head could do, so they stay off.
         if (sconfig.prefill_cache_cap != 0 || !sconfig.disk_cache_dir.empty()) {
             std::fprintf(stderr,
                 "[server] cluster mode disables prefill/disk snapshot caches "
-                "until they are replicated across ranks\n");
+                "(they adopt deserialized snapshots, which is head-local)\n");
             sconfig.prefill_cache_cap = 0;
             sconfig.disk_cache_dir.clear();
             sconfig.disk_cache_policy.mode = DiskPrefixCacheMode::Off;

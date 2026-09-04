@@ -323,8 +323,10 @@ void RequestMsg::encode(ByteWriter & w) const {
     w.u64(seed);
     w.u8((uint8_t)decode_mode);
     w.u8(force_ar ? 1 : 0);
-    w.i32(snapshot_slot);
+    w.i32(restore_slot);
     w.i32(kv_offset);
+    w.i32(snapshot_slot);
+    w.i32(snapshot_pos);
     w.vec_i32(stop_token_ids);
 }
 
@@ -334,8 +336,9 @@ bool RequestMsg::decode(ByteReader & r, RequestMsg & out) {
     if (!r.u64(out.request_id) || !r.vec_i32(out.prompt_tokens) || !r.i32(out.n_gen) ||
         !r.i32(out.max_ctx) || !r.f32(out.temperature) || !r.f32(out.top_p) ||
         !r.i32(out.top_k) || !r.f32(out.min_p) || !r.f32(out.repeat_penalty) ||
-        !r.u64(out.seed) || !r.u8(mode) || !r.u8(force) || !r.i32(out.snapshot_slot) ||
-        !r.i32(out.kv_offset) || !r.vec_i32(out.stop_token_ids, 1 << 16)) {
+        !r.u64(out.seed) || !r.u8(mode) || !r.u8(force) || !r.i32(out.restore_slot) ||
+        !r.i32(out.kv_offset) || !r.i32(out.snapshot_slot) || !r.i32(out.snapshot_pos) ||
+        !r.vec_i32(out.stop_token_ids, 1 << 16)) {
         return false;
     }
     if (mode > (uint8_t)DecodeMode::Speculative) return false;

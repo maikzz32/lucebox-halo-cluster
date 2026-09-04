@@ -361,8 +361,10 @@ TEST_CASE(ClusterUnitFixture, RequestRoundTripEmptyAndLarge) {
     in.seed = 0xDEADBEEFCAFEBABEull;
     in.decode_mode = DecodeMode::Speculative;
     in.force_ar = true;
-    in.snapshot_slot = 3;
+    in.restore_slot = 5;
     in.kv_offset = 1024;
+    in.snapshot_slot = 3;
+    in.snapshot_pos = 2048;
     RequestMsg out;
 
     SECTION("empty prompt and stop tokens") {
@@ -380,7 +382,12 @@ TEST_CASE(ClusterUnitFixture, RequestRoundTripEmptyAndLarge) {
         CHECK_EQUAL(out.seed, in.seed);
         CHECK(out.decode_mode == DecodeMode::Speculative);
         CHECK(out.force_ar);
+        // Restore and inline save are independent halves; a request that
+        // resumes from one slot and check-points into another must survive
+        // the wire with both, or the workers' slots drift from the head's.
+        CHECK_EQUAL(out.restore_slot, 5);
         CHECK_EQUAL(out.snapshot_slot, 3);
+        CHECK_EQUAL(out.snapshot_pos, 2048);
         CHECK_EQUAL(out.kv_offset, 1024);
     }
     SECTION("128k prompt") {

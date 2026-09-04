@@ -61,10 +61,10 @@ GenerateRequest request_from_msg(const RequestMsg & m) {
     req.do_sample = m.temperature > 0.0f;
     req.stream = false;
     req.force_ar_decode = m.force_ar || m.decode_mode == DecodeMode::Autoregressive;
-    if (m.kv_offset <= 0) {
-        req.snap_slot = m.snapshot_slot;
-        req.snap_pos = -1;  // TODO(cluster-verify): snap_pos not on the wire
-    }
+    // Since protocol 2 both halves travel, so this rank writes the same
+    // inline snapshot at the same position as the head.
+    req.snap_slot = m.snapshot_slot;
+    req.snap_pos = m.snapshot_pos;
     req.budget_hook.close_token_ids = m.stop_token_ids;
     req.budget_hook.hard_limit_remaining = 0;  // the head's override arrives inside the token
     return req;
@@ -118,8 +118,13 @@ bool apply_backend_op(WorkerState & st, const BackendOpMsg & op) {
     switch (op.kind) {
     case BackendOpKind::SnapshotSave:
         if (!st.ds4->snapshot_save((int) arg(0, -1))) {
-            std::fprintf(stderr, "[cluster] worker %d: snapshot_save(%lld) failed (head may have succeeded)\n",
+            // A rank without the snapshot would silently resume different KV
+            // on the next restore. Fail the run instead.
+            std::fprintf(stderr,
+                         "[cluster] worker %d: snapshot_save(%lld) failed; the slot would "
+                         "differ from the head's\n",
                          st.cfg.rank, (long long) arg(0, -1));
+            return false;
         }
         return true;
     case BackendOpKind::SnapshotFree:
@@ -202,8 +207,8 @@ int handle_request(WorkerState & st, const RequestMsg & msg) {
     }
 
     GenerateResult result;
-    if (msg.kv_offset > 0 && msg.snapshot_slot >= 0) {
-        result = st.ds4->restore_and_generate_impl(msg.snapshot_slot, req, io);
+    if (msg.restore_slot >= 0) {
+        result = st.ds4->restore_and_generate_impl(msg.restore_slot, req, io);
     } else {
         result = st.ds4->generate_impl(req, io);
     }
