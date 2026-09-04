@@ -183,10 +183,14 @@ quantisation for Strix Halo):
 | Target | `Lucebox/DeepSeek-V4-Flash-0731-ROCmFP3` (the repo upstream's README links; the identical file is also in `Lucebox/DeepSeek-V4-Flash-0731-ROCMFPX`) | `DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf` | 98,294,917,184 | `7c0789d190fdd2acad93255825822ca276f29d13f9410f2ac65f5f7a542b0a38` |
 | DSpark drafter | `Lucebox/DeepSeek-V4-Flash-0731-DSpark-GGUF` | `DeepSeek-V4-Flash-0731-DSpark-draft-Q4RMFP4-denseF16.gguf` | 10,648,656,160 | `58e7337597a917fdd033aca30a38263740dc53999dac187a676a36b8daf9e63d` |
 
-Not used (for the record): `DeepSeek-V4-Flash-ROCMFP2-STRIX.gguf`
-(102,320,631,200 bytes, sha256 `8fa6c30d…9208`) and the drafter variant without
-`0731`, `DeepSeek-V4-Flash-DSpark-draft-Q4RMFP4-denseF16.gguf`
-(11,304,737,056 bytes, sha256 `48883d35…f746`).
+The uniform `DeepSeek-V4-Flash-ROCMFP2-STRIX.gguf` (102,320,631,200 bytes,
+sha256 `8fa6c30d…9208`) also loads and was the only shardable artifact until
+2026-09-04. It is slower and markedly less accurate than the adaptive one and
+should not be used: two nodes measure 38.4 against 42.3 tok/s on the benchmark
+prompt, 17.2 against 20.6 on a free prompt, and 12/60 against 60/60 on
+exact-copy fidelity. Also unused: the drafter variant without `0731`,
+`DeepSeek-V4-Flash-DSpark-draft-Q4RMFP4-denseF16.gguf` (11,304,737,056 bytes,
+sha256 `48883d35…f746`).
 
 Models dir on every node: `/home/maik/gguf/ds4/` (identical files, identical
 paths; the head refuses workers whose `model_sha` differs).
@@ -393,6 +397,36 @@ have real numbers; do not quote them as measurements.
 Correctness proof from `DFLASH_CLUSTER_TRACE=1`: for every layer `partial_pre(rank0) + partial_pre(rank1) == partial_post == full routed sum` to 7 digits; the shared expert is added once. Free-form prompts can still diverge from the single node at greedy near-ties because the HC / attention path amplifies 1e-7 summation-order noise (measured: `hc_after_ffn(7)` 4e-7 -> `attn_out(8)` 2e-4); the same drift exists between the monolithic fused and per-layer paths. Do not use bf16 for the decode/prefill reduction (`--cluster-allreduce-dtype auto` reduces in f32 since 05466b2); the first runs with bf16 prefill partials produced a wrong early EOS.
 
 Quality probe (5 short reasoning/translation questions, 48 tokens): cluster 3/5 = single node 3/5 (both misses are truncations).
+
+## Measured results, adaptive artifact (2026-09-04)
+
+`DeepSeek-V4-Flash-0731-ROCMFPX-MIX-STRIX.gguf`, DSpark q=4, uniform placement,
+`LUCE_MMVF_MAX_NCOLS_F16=4`. Benchmark prompt: 128 tokens at temperature 0,
+median of 5, every run byte-identical to the single-node reference `87964cbd…`.
+Free prompt: a 60-token technical question, 128 tokens generated. Fidelity is
+the exact-copy protocol from `DS4.md` (20 identifiers x 3 repeats).
+
+| Configuration | benchmark tok/s | free prompt tok/s | fidelity | step ms | verify ms |
+|---|---|---|---|---|---|
+| single node | 34.5 | — | — | 115.4 | — |
+| **2 nodes** | **42.3** | **20.6** | 60/60 | 95.0 | 76.2 |
+| 4 nodes | 48.2 | 19.7 | 60/60 | 83.8 | 67.0 |
+
+Two things follow. The benchmark prompt keeps a 100 % acceptance rate (32 steps
+for 127 tokens at every rank count), so it measures verify cost and scales with
+rank count; a free prompt accepts about 2.3 of 4 and is acceptance-bound, where
+**two nodes beat four**. And `F + V/N` over the two cluster points gives
+F ≈ 58 ms fixed, V ≈ 37 ms shardable, so the asymptote of expert parallelism on
+this model is about **53 tok/s** no matter how many nodes are added.
+
+Remaining unsharded work, measured at two nodes: the DSpark drafter (9.3 ms of
+the 95.0 ms step). Every rank already loads it and runs the draft forward in
+lockstep, discarding its own tokens in favour of rank 0's broadcast, so
+splitting its routed experts needs no protocol change -- `ggml_mul_mat_id`
+already treats negative ids as masked owner routes. Worth about +1.6 tok/s at
+two nodes and +2.4 at four; not implemented, because it changes the drafter's
+numerics and the acceptance rate is the more valuable quantity (a 4-rank
+reduction on the uniform artifact cost 28 % that way).
 
 ## Measured results, path 3b (2026-09-04, same nodes and artifact)
 
