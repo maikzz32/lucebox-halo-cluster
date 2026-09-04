@@ -7405,7 +7405,15 @@ bool deepseek4_step_layer_range(
         Ds4FusedVerifyCache & graph_cache = q1_feature_capture
             ? layer_range_cache.fused_capture_graph_cache
             : layer_range_cache.fused_verify_graph_cache;
-        if (cluster_fused_ready) cache.cluster_rt->node_error.clear();
+        // Path 3b puts the collectives inside the graph, so their host time is
+        // not separable and `cluster_allreduce_us` stays 0 for such a step
+        // (the time is part of full_compute). The payload is still worth
+        // reporting, so take it as a delta over the graph compute.
+        uint64_t cluster_bytes_before = 0;
+        if (cluster_fused_ready) {
+            cache.cluster_rt->node_error.clear();
+            cluster_bytes_before = cache.cluster_rt->telemetry.allreduce_bytes;
+        }
         const int vrc = ds4_try_fused_verify_step(
             graph_cache, q1_feature_capture, fused_decode_graph_cache,
             backend, w, cache,
@@ -7417,6 +7425,10 @@ bool deepseek4_step_layer_range(
         // An in-graph all-reduce cannot report a failure through its return
         // value; it records the first one and the forward fails here, before
         // the logits of an incomplete sum reach the sampler.
+        if (cluster_fused_ready && telemetry) {
+            telemetry->cluster_allreduce_bytes +=
+                cache.cluster_rt->telemetry.allreduce_bytes - cluster_bytes_before;
+        }
         if (cluster_fused_ready && !cache.cluster_rt->node_error.empty()) {
             std::fprintf(stderr, "[deepseek4-cluster] in-graph all-reduce failed: %s\n",
                          cache.cluster_rt->node_error.c_str());

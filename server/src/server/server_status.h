@@ -28,6 +28,8 @@ struct PerfRecord {
     bool   cache_hit        = false;
     bool   pflash           = false;
     bool   spec_decode      = false;
+    // Ranks that served this request; 0 on a single node (WP6).
+    int    cluster_size     = 0;
     std::chrono::steady_clock::time_point timestamp;
 };
 
@@ -91,6 +93,18 @@ public:
     void set_decode() {
         std::lock_guard<std::mutex> lk(mu_);
         phase_ = InferencePhase::DECODE;
+    }
+
+    // WP6: set once at startup from the backend's cluster snapshot, so the
+    // status page can say which cluster it is looking at. Empty on a single
+    // node, in which case to_json() omits the section entirely.
+    void set_cluster(int size, int rank, const std::string & placement,
+                     bool ingraph_allreduce) {
+        std::lock_guard<std::mutex> lk(mu_);
+        cluster_size_ = size;
+        cluster_rank_ = rank;
+        cluster_placement_ = placement;
+        cluster_ingraph_allreduce_ = ingraph_allreduce;
     }
 
     void set_flags(bool cache_hit, bool pflash, bool spec_decode) {
@@ -162,9 +176,16 @@ public:
         bool cache_hit = false, pflash = false, spec_decode = false;
         std::string messages_json;
         int active_requests = 0;
+        int cluster_size = 0, cluster_rank = 0;
+        std::string cluster_placement;
+        bool cluster_ingraph = false;
 
         {
             std::lock_guard<std::mutex> lk(mu_);
+            cluster_size = cluster_size_;
+            cluster_rank = cluster_rank_;
+            cluster_placement = cluster_placement_;
+            cluster_ingraph = cluster_ingraph_allreduce_;
             phase = phase_;
             prompt_excerpt = prompt_excerpt_;
             prompt_tokens = prompt_tokens_;
@@ -189,6 +210,14 @@ public:
         j["phase"] = phase_name(phase);
         j["total_requests"] = total_requests;
         j["active_requests"] = active_requests;
+        if (cluster_size > 1) {
+            j["cluster"] = {
+                {"size",              cluster_size},
+                {"rank",              cluster_rank},
+                {"placement",         cluster_placement},
+                {"ingraph_allreduce", cluster_ingraph},
+            };
+        }
 
         if (phase != InferencePhase::IDLE && active_requests == 0) {
             j["current"] = {
@@ -226,6 +255,7 @@ public:
                 {"cache_hit", r.cache_hit},
                 {"pflash", r.pflash},
                 {"spec_decode", r.spec_decode},
+                {"cluster_size", r.cluster_size},
             });
         }
         j["perf_history"] = perf;
@@ -239,6 +269,11 @@ public:
     }
 
 private:
+    int cluster_size_ = 0;
+    int cluster_rank_ = 0;
+    std::string cluster_placement_;
+    bool cluster_ingraph_allreduce_ = false;
+
     mutable std::mutex mu_;
 
     // Live state.

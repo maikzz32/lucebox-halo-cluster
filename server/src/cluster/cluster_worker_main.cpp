@@ -76,6 +76,9 @@ struct WorkerState {
     std::unique_ptr<IClusterComm>              comm;
     std::unique_ptr<WorkerHooks>               hooks;
     uint64_t                                   requests_served = 0;
+    int                                        device = -1;   // local HIP ordinal
+    // High-water mark of device memory in use, sampled at request ends.
+    uint64_t                                   peak_device_bytes = 0;
 };
 
 void send_abort(WorkerState & st, int code, uint64_t request_id, const std::string & reason) {
@@ -230,7 +233,9 @@ int handle_request(WorkerState & st, const RequestMsg & msg) {
         report.allreduce_wait_us = s.allreduce_wait_us;
     }
     report.ctrl_wait_us = st.hooks->counters().ctrl_wait_us;
-    report.peak_device_bytes = 0;  // TODO(cluster-verify): hipMemGetInfo high-water mark (WP6)
+    const uint64_t device_bytes = cluster_device_bytes_in_use(st.device);
+    if (device_bytes > st.peak_device_bytes) st.peak_device_bytes = device_bytes;
+    report.peak_device_bytes = st.peak_device_bytes;
     if (!st.control.send(make_frame(report), &err)) {
         std::fprintf(stderr, "[cluster] worker %d: RequestReport send failed: %s\n", st.cfg.rank,
                      err.c_str());
@@ -336,6 +341,7 @@ int run_cluster_worker(BackendArgs & args, const BackendFeatureConfig & features
     init.size = st.cfg.size;
     init.unique_id = welcome.rccl_unique_id;
     init.device = args.device.gpu;  // local HIP ordinal (DevicePlacement::gpu)
+    st.device = init.device;
     init.timeout_ms = st.cfg.timeout_ms;
     init.blocking = false;
     st.comm = create_rccl_cluster_comm(init, &err);

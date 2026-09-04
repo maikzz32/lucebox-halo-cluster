@@ -30,6 +30,12 @@ namespace dflash::cluster {
 inline constexpr size_t kRcclUniqueIdSize = 128;  // == NCCL_UNIQUE_ID_BYTES
 using RcclUniqueId = std::array<uint8_t, kRcclUniqueIdSize>;
 
+// Device memory in use on `device` right now (total - free), in bytes, or 0
+// when the backend cannot report it. Sampled at request boundaries to fill
+// RequestReportMsg::peak_device_bytes, which is therefore a high-water mark
+// over sampled request ends, not a continuous peak.
+uint64_t cluster_device_bytes_in_use(int device);
+
 struct ClusterCommStats {
     uint64_t allreduce_calls    = 0;
     uint64_t allreduce_bytes    = 0;   // payload bytes handed to RCCL (f32 or bf16)

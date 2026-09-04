@@ -510,6 +510,19 @@ struct ModelBackend {
     // backend does not support routing stats or they are not enabled.
     virtual const struct MoeHybridRoutingStats * get_routing_stats() const { return nullptr; }
 
+    // ── Cluster (WP6) ────────────────────────────────────────────────
+    // A multi-node backend copies what the API should expose into these
+    // plain snapshots (common/cluster_view.h). Both return false when the
+    // backend is not a cluster head, which is what the HTTP layer checks;
+    // that keeps server/ free of any cluster include and identical with
+    // -DDFLASH27B_CLUSTER=OFF.
+    //
+    // cluster_request_telemetry() describes the request that just finished
+    // and must be read on the thread that ran it. cluster_props() is constant
+    // after bootstrap and is safe to read from any thread.
+    virtual bool cluster_request_telemetry(struct ClusterTelemetryView &) const { return false; }
+    virtual bool cluster_props(struct ClusterPropsView &) const { return false; }
+
     // ── Cleanup ──────────────────────────────────────────────────────
     // Release all resources (weights, cache, snapshots, drafter).
     // Called by run_daemon() before returning.

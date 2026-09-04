@@ -21,6 +21,7 @@
 #include "cluster/cluster_control.h"
 #include "cluster/cluster_decision_hooks.h"
 #include "cluster/cluster_protocol.h"
+#include "common/cluster_view.h"
 #include "common/model_backend.h"
 #include "deepseek4/deepseek4_backend.h"
 
@@ -111,6 +112,12 @@ public:
     void shutdown() override;
 
     // ── Cluster introspection (WP6) ──────────────────────────────────
+    // WP6: plain snapshots for the HTTP layer (common/cluster_view.h).
+    // telemetry describes the request that just finished and is read on the
+    // request thread; props is constant after init().
+    bool cluster_request_telemetry(common::ClusterTelemetryView & out) const override;
+    bool cluster_props(common::ClusterPropsView & out) const override;
+
     const ClusterRequestReport & last_report() const { return last_report_; }
     const ClusterConfig & config() const { return cfg_; }
     const std::vector<HelloMsg> & worker_identities() const { return hellos_; }
@@ -139,6 +146,10 @@ private:
     ClusterConfig                     cfg_;
     std::string                       model_path_;
     int                               device_ = 0;
+    // High-water mark of device memory in use on rank 0, sampled at request
+    // ends; the workers keep the same mark and ship it in RequestReport.
+    uint64_t                          peak_device_bytes_ = 0;
+    uint64_t                          head_compute_us_ = 0;
     ClusterHeadControl                control_;
     std::unique_ptr<IClusterComm>     comm_;
     std::unique_ptr<HeadHooks>        hooks_;

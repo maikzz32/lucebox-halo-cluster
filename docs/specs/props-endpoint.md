@@ -359,6 +359,45 @@ enabled, fields carry the runtime configuration:
 - `bsa_enabled` / `bsa_alpha` / `lm_head_fix` — backend-specific
   PFlash tunables
 
+### 4.11b `cluster`
+
+Always present. `{"active": false}` on a single node; on rank 0 of a
+`--cluster-*` run (server/docs/CLUSTER.md) it describes the cluster this
+server is the head of. Every field is constant after bootstrap, so a client
+may cache it for the lifetime of the process.
+
+```json
+"cluster": {
+  "active": true,
+  "size": 2,
+  "rank": 0,
+  "ifname": "enp197s0f3np3",
+  "ib_hca": "rocep197s0f3",
+  "gid_index": 1,
+  "placement": "uniform",
+  "placement_hash": 5021064427384964593,
+  "replicate_hot": 0,
+  "shared_expert": "replicate",
+  "allreduce_dtype": "auto",
+  "ingraph_allreduce": true,
+  "gpudirect": false,
+  "resident_expert_bytes": 49056579584,
+  "timeout_ms": 30000
+}
+```
+
+- `placement` — `uniform`, `balanced`, or the path of the placement file
+- `placement_hash` — the hash every rank agreed on in its `Hello`; two ranks
+  with different hashes refuse to form a cluster
+- `ingraph_allreduce` — path 3b: the collective runs as a graph node and the
+  fused whole-model graph is in use. `false` means the per-layer host path
+- `gpudirect` — always `false` on gfx1151; the fabric bounces through host
+  memory, which on Strix Halo is the DRAM the GPU uses anyway
+- `resident_expert_bytes` — this rank's routed-expert shard
+
+Per-request cluster timings are a different thing and live under
+`usage.timings.cluster`; see server/docs/API.md.
+
 ### 4.12 `prefix_cache`
 
 ```json
@@ -495,6 +534,10 @@ clients. The current schema is `2`.
   upstream URL from the sidecar; the lookup-hit filepath / label
   lives at `budget_envelope.model_card_source`.
 - **`1`** — Initial schema.
+
+Additions that did not bump the schema: the `cluster` section (4.11b), which
+is `{"active": false}` on every single-node server and therefore cannot break
+an existing client.
 
 ### 5.1 Non-breaking changes (no version bump)
 

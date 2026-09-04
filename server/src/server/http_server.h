@@ -30,6 +30,7 @@
 #include "adaptive_keep_ratio.h"
 #include "server_status.h"
 #include "sse_emitter.h"
+#include "common/cluster_view.h"
 #include <nlohmann/json.hpp>
 
 #include <atomic>
@@ -339,9 +340,12 @@ bool ppp_prefers_tools_boundary(bool ppp_enabled, bool has_tools);
 // Build the /props response body. Exposed (non-static) so unit tests
 // can assert on its shape without spinning up a real socket. See
 // docs/specs/props-endpoint.md for the wire contract.
+// `cluster` is null on a single node and adds the "cluster" object described
+// in the same spec when the backend is a cluster head (WP6).
 json build_props_body(const ServerConfig & config,
                       const PrefixCache & prefix_cache,
-                      const ToolMemory & tool_memory);
+                      const ToolMemory & tool_memory,
+                      const dflash::common::ClusterPropsView * cluster = nullptr);
 
 // ─── HTTP server ────────────────────────────────────────────────────────
 class HttpServer {

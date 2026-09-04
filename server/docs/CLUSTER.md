@@ -503,9 +503,48 @@ The all-reduce is not the prefill bottleneck: 535 ms of 7.6 s at 1517 tokens,
 (29.2 s) dominate, and attention is replicated on every rank, so long-context
 prefill cannot gain much from more ranks.
 
-Not yet done: `usage.timings.cluster` (WP6); and the in-graph all-reduce
-reports its bytes to the cluster runtime's own counters, so the per-step
-`cluster_allreduce` field of the `[deepseek4-timing]` banner reads 0 on path 3b.
+## Observability (WP6)
+
+Three surfaces, all filled on a two-node run:
+
+* **`usage.timings.cluster`** — per-request, per-rank: `compute_ms`,
+  `allreduce_calls` / `_bytes` / `_wait_ms`, `ctrl_wait_ms`, `device_bytes`,
+  plus `verify_hash` counts when `--cluster-verify-hash` is on and `error`
+  when the report gather failed. Present in every response shape, streaming
+  included, because it rides on `GenTimings` — the one struct that reaches all
+  six places that emit `usage.timings`. Documented in `server/docs/API.md`.
+* **`/props.cluster`** — what this cluster is: size, rank, `ifname`, `ib_hca`,
+  `gid_index`, placement and its hash, shared-expert mode, all-reduce dtype,
+  `ingraph_allreduce` (path 3b), `gpudirect` (always false here) and this
+  rank's `resident_expert_bytes`. Constant after bootstrap.
+  `{"active": false}` on a single node. Spec: `docs/specs/props-endpoint.md`
+  §4.11b.
+* **`/status/json.cluster`** and `perf_history[].cluster_size` — size, rank,
+  placement and whether path 3b is active. The status *page* renders the JSON
+  it already knew about; a per-rank panel in `share/status.html` is not built.
+
+The seam is two virtuals on `ModelBackend` returning plain structs
+(`server/src/common/cluster_view.h`), the same shape as `get_routing_stats()`.
+`server/src/server/` therefore still contains no cluster include and is
+unchanged with `-DDFLASH27B_CLUSTER=OFF`.
+
+Reading a two-node request:
+
+```
+per_rank[0] compute_ms 3607.0  allreduce_wait_ms  11.1  ctrl_wait_ms  1.1
+per_rank[1] compute_ms 3606.4  allreduce_wait_ms 128.4  ctrl_wait_ms 17.8
+```
+
+Equal `compute_ms` means the placement is balanced. Rank 1's larger
+`allreduce_wait_ms` and `ctrl_wait_ms` are it waiting for rank 0, which also
+samples, drafts and serves HTTP — the expected asymmetry, and the number to
+watch if a node ever falls behind.
+
+Two limits worth knowing. `allreduce_wait_ms` is **0 for decode on path 3b**:
+the collective runs inside the graph, so its cost is part of `compute_ms` and
+not separable; the non-zero values come from prefill, which still takes path
+3a. For the same reason the `[deepseek4-timing]` banner's `cluster_allreduce`
+field stays 0 on path 3b while `cluster_bytes` is correct.
 
 ### M1 artifact and diagnostics
 - Diagnostic placement JSON: `python server/scripts/cluster/build_expert_placement.py --dims 43,256,6 -n 2 --all-on-rank 0 -o all_rank0.json`

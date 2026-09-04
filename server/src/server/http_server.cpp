@@ -698,7 +698,8 @@ static std::string build_stall_tool_prefix(const json & tools,
 // Non-static so unit tests can call it directly (declared in http_server.h).
 json build_props_body(const ServerConfig & config,
                       const PrefixCache & prefix_cache,
-                      const ToolMemory & tool_memory) {
+                      const ToolMemory & tool_memory,
+                      const dflash::common::ClusterPropsView * cluster) {
     // arch-gated capabilities (mirrors Python _capabilities()).
     const bool is_qwen = (config.arch.rfind("qwen", 0) == 0);
     const bool is_deepseek4 = (config.arch == "deepseek4");
@@ -881,6 +882,25 @@ json build_props_body(const ServerConfig & config,
             }},
         }},
         {"pflash", pflash},
+        {"cluster", cluster && cluster->active
+            ? json{
+                {"active",                true},
+                {"size",                  cluster->size},
+                {"rank",                  cluster->rank},
+                {"ifname",                cluster->ifname},
+                {"ib_hca",                cluster->ib_hca},
+                {"gid_index",             cluster->gid_index},
+                {"placement",             cluster->placement},
+                {"placement_hash",        cluster->placement_hash},
+                {"replicate_hot",         cluster->replicate_hot},
+                {"shared_expert",         cluster->shared_expert},
+                {"allreduce_dtype",       cluster->allreduce_dtype},
+                {"ingraph_allreduce",     cluster->ingraph_allreduce},
+                {"gpudirect",             cluster->gpudirect},
+                {"resident_expert_bytes", cluster->resident_expert_bytes},
+                {"timeout_ms",            cluster->timeout_ms},
+              }
+            : json{{"active", false}}},
         {"prefix_cache", {
             {"capacity",      pcs.capacity},
             {"in_use",        pcs.in_use},
@@ -1437,6 +1457,16 @@ int HttpServer::run() {
     std::fprintf(stderr, "[server] listening on http://%s:%d\n",
                  config_.host.c_str(), config_.port);
 
+    // WP6: the cluster identity is constant after bootstrap, so publish it to
+    // the status page once instead of asking the backend on every poll.
+    {
+        dflash::common::ClusterPropsView cluster;
+        if (backend_.cluster_props(cluster) && cluster.active) {
+            status_.set_cluster(cluster.size, cluster.rank, cluster.placement,
+                                cluster.ingraph_allreduce);
+        }
+    }
+
     // A backend-provided sequence engine replaces the one-request worker
     // with the concurrent scheduler. Upstream forwarding stays on the
     // classic path even when the local backend exposes an engine.
@@ -1561,7 +1591,10 @@ void HttpServer::handle_client(SocketHandle fd) {
 
     // Introspection: server config + cache stats + arch + capabilities.
     if (hr.method == "GET" && hr.path == "/props") {
-        json body = build_props_body(config_, prefix_cache_, tool_memory_);
+        dflash::common::ClusterPropsView cluster_props;
+        const bool have_cluster = backend_.cluster_props(cluster_props);
+        json body = build_props_body(config_, prefix_cache_, tool_memory_,
+                                     have_cluster ? &cluster_props : nullptr);
         send_response(fd, 200, "application/json", body.dump() + "\n");
         socket_close(fd);
         return;
@@ -4134,6 +4167,11 @@ void HttpServer::process_job(ServerJob * job) {
         effective_prompt_tokens,
         agent_turn_cache_hit,
     };
+    // WP6: on a cluster head this fills usage.timings.cluster for every
+    // response shape, streaming included. Read here, on the thread that just
+    // ran the request, which is the only thread the head's report is stable
+    // on. Returns false on any other backend, so nothing changes off-cluster.
+    backend_.cluster_request_telemetry(gen_timings.cluster);
 
     // Record performance for /status page.
     if (result.ok()) {
@@ -4153,6 +4191,7 @@ void HttpServer::process_job(ServerJob * job) {
         perf.cache_hit = cache_hit;
         perf.pflash = pflash_compressed;
         perf.spec_decode = result.spec_decode_ran;
+        perf.cluster_size = gen_timings.cluster.active ? gen_timings.cluster.size : 0;
         perf.timestamp = std::chrono::steady_clock::now();
         status_.record_perf(perf);
         status_.update_completion_tokens(completion_tokens);

@@ -330,8 +330,14 @@ GenerateResult ClusterHeadBackend::run_request(const GenerateRequest & req, cons
         return result;
     }
 
+    const auto compute_t0 = std::chrono::steady_clock::now();
     result = restore_slot >= 0 ? inner_->restore_and_generate_impl(restore_slot, req, io)
                                : inner_->generate_impl(req, io);
+    // Rank 0's own prefill+decode wall time, the counterpart of the workers'
+    // compute_us. Comparing them across ranks is how an imbalanced expert
+    // placement or a slow node shows up.
+    head_compute_us_ = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - compute_t0).count();
 
     // The decode loop reports channel failures as DecodeFailed with the
     // message already logged; a dead worker also shows up here.
@@ -366,6 +372,7 @@ bool ClusterHeadBackend::gather_reports(uint64_t request_id, uint32_t steps) {
     head.request_id = request_id;
     head.rank = 0;
     head.steps = steps;
+    head.compute_us = head_compute_us_;
     if (comm_) {
         const ClusterCommStats s = comm_->stats();
         head.allreduce_calls = s.allreduce_calls;
@@ -373,6 +380,9 @@ bool ClusterHeadBackend::gather_reports(uint64_t request_id, uint32_t steps) {
         head.allreduce_wait_us = s.allreduce_wait_us;
     }
     head.ctrl_wait_us = hooks_->counters().ctrl_wait_us;
+    const uint64_t head_device_bytes = cluster_device_bytes_in_use(device_);
+    if (head_device_bytes > peak_device_bytes_) peak_device_bytes_ = head_device_bytes;
+    head.peak_device_bytes = peak_device_bytes_;
     last_report_.head_ctrl_wait_us = head.ctrl_wait_us;
     last_report_.hash_probes = hooks_->counters().hash_probes;
     last_report_.hash_mismatches = hooks_->counters().hash_mismatches;
@@ -411,6 +421,67 @@ bool ClusterHeadBackend::gather_reports(uint64_t request_id, uint32_t steps) {
                 (unsigned long long) request_id, r.rank, r.steps, (unsigned long long) r.compute_us,
                 (unsigned long long) r.allreduce_calls, (unsigned long long) r.allreduce_bytes,
                 (unsigned long long) r.allreduce_wait_us, (unsigned long long) r.ctrl_wait_us);
+        }
+    }
+    return true;
+}
+
+// ─── WP6: snapshots for the HTTP layer ──────────────────────────────────
+
+bool ClusterHeadBackend::cluster_request_telemetry(common::ClusterTelemetryView & out) const {
+    out = common::ClusterTelemetryView{};
+    if (!initialized_) return false;
+    out.active              = true;
+    out.size                = last_report_.size ? last_report_.size : cfg_.size;
+    out.request_id          = last_report_.request_id;
+    out.steps               = last_report_.steps;
+    out.complete            = last_report_.complete;
+    out.head_ctrl_wait_us   = last_report_.head_ctrl_wait_us;
+    out.hash_probes         = last_report_.hash_probes;
+    out.hash_mismatches     = last_report_.hash_mismatches;
+    out.first_mismatch_rank = last_report_.first_mismatch_rank;
+    out.first_mismatch_step = last_report_.first_mismatch_step;
+    out.error               = last_report_.error;
+    out.ranks.reserve(last_report_.ranks.size());
+    for (const RequestReportMsg & r : last_report_.ranks) {
+        common::ClusterRankTiming t;
+        t.rank              = r.rank;
+        t.steps             = r.steps;
+        t.compute_us        = r.compute_us;
+        t.allreduce_calls   = r.allreduce_calls;
+        t.allreduce_bytes   = r.allreduce_bytes;
+        t.allreduce_wait_us = r.allreduce_wait_us;
+        t.ctrl_wait_us      = r.ctrl_wait_us;
+        t.peak_device_bytes = r.peak_device_bytes;
+        out.ranks.push_back(t);
+    }
+    return true;
+}
+
+bool ClusterHeadBackend::cluster_props(common::ClusterPropsView & out) const {
+    out = common::ClusterPropsView{};
+    out.active          = true;
+    out.size            = cfg_.size;
+    out.rank            = cfg_.rank;
+    out.ifname          = cfg_.ifname;
+    out.ib_hca          = cfg_.ib_hca;
+    out.gid_index       = cfg_.gid_index;
+    out.placement       = cfg_.placement_source == PlacementSource::File
+                              ? cfg_.placement_file
+                              : placement_source_name(cfg_.placement_source);
+    out.replicate_hot   = cfg_.replicate_hot;
+    out.shared_expert   = shared_expert_mode_name(cfg_.shared_expert);
+    out.allreduce_dtype = allreduce_dtype_name(cfg_.allreduce_dtype);
+    out.timeout_ms      = cfg_.timeout_ms;
+    // gfx1151 has no GPUDirect; the fabric bounces through host memory, which
+    // on Strix Halo is the same DRAM the GPU uses anyway.
+    out.gpudirect       = false;
+    if (inner_) {
+        out.placement_hash = backend_placement_hash(*inner_);
+        if (const common::Ds4ClusterRuntime * rt = inner_->cluster_runtime()) {
+            out.resident_expert_bytes = rt->resident_expert_bytes;
+            out.ingraph_allreduce =
+                common::ds4_cluster_fused_graph_available(rt);
         }
     }
     return true;

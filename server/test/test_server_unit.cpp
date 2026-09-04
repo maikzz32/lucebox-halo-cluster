@@ -5987,6 +5987,105 @@ TEST_CASE(ServerUnitFixture, test_usage_timings_reports_prefix_cache_work) {
     TEST_ASSERT(j["agent_turn_cache_hit"].get<bool>());
 }
 
+TEST_CASE(ServerUnitFixture, test_usage_timings_cluster_absent_on_single_node) {
+    // The cluster section must be entirely absent off-cluster, so a
+    // single-node response keeps the shape its clients already parse.
+    GenTimings t{0.1, 1.0};
+    json j = build_timings_json(t, /*completion_tokens=*/25);
+    TEST_ASSERT(!j.contains("cluster"));
+}
+
+TEST_CASE(ServerUnitFixture, test_usage_timings_cluster_per_rank) {
+    GenTimings t{0.1, 1.0};
+    t.cluster.active = true;
+    t.cluster.size = 2;
+    t.cluster.request_id = 7;
+    t.cluster.complete = true;
+    t.cluster.head_ctrl_wait_us = 1100;
+    dflash::common::ClusterRankTiming head;
+    head.rank = 0; head.steps = 40; head.compute_us = 3607000;
+    head.allreduce_calls = 1806; head.allreduce_bytes = 51429376;
+    head.allreduce_wait_us = 11100; head.ctrl_wait_us = 1100;
+    head.peak_device_bytes = 67561107456ull;
+    dflash::common::ClusterRankTiming worker = head;
+    worker.rank = 1; worker.ctrl_wait_us = 17800;
+    t.cluster.ranks = {head, worker};
+
+    json j = build_timings_json(t, /*completion_tokens=*/40);
+    TEST_ASSERT(j.contains("cluster"));
+    const json & c = j["cluster"];
+    TEST_ASSERT(c["size"].get<int>() == 2);
+    TEST_ASSERT(c["request_id"].get<uint64_t>() == 7);
+    TEST_ASSERT(c["complete"].get<bool>());
+    TEST_ASSERT(c["ctrl_wait_ms"].get<double>() == 1.1);
+    TEST_ASSERT(c["per_rank"].size() == 2);
+    TEST_ASSERT(c["per_rank"][0]["rank"].get<int>() == 0);
+    TEST_ASSERT(c["per_rank"][0]["compute_ms"].get<double>() == 3607.0);
+    TEST_ASSERT(c["per_rank"][0]["allreduce_calls"].get<uint64_t>() == 1806);
+    // 64-bit byte counts must survive as integers, not doubles.
+    TEST_ASSERT(c["per_rank"][0]["device_bytes"].get<uint64_t>() == 67561107456ull);
+    TEST_ASSERT(c["per_rank"][1]["ctrl_wait_ms"].get<double>() == 17.8);
+    // No probes ran, so the verify-hash section stays out.
+    TEST_ASSERT(!c.contains("verify_hash"));
+    TEST_ASSERT(!c.contains("error"));
+}
+
+TEST_CASE(ServerUnitFixture, test_usage_timings_cluster_reports_hash_mismatch) {
+    GenTimings t{0.1, 1.0};
+    t.cluster.active = true;
+    t.cluster.size = 2;
+    t.cluster.hash_probes = 16;
+    t.cluster.hash_mismatches = 1;
+    t.cluster.first_mismatch_rank = 1;
+    t.cluster.first_mismatch_step = 8;
+    t.cluster.error = "RequestReport gather timed out";
+    json j = build_timings_json(t, /*completion_tokens=*/8);
+    const json & c = j["cluster"];
+    TEST_ASSERT(c["verify_hash"]["probes"].get<uint64_t>() == 16);
+    TEST_ASSERT(c["verify_hash"]["mismatches"].get<uint64_t>() == 1);
+    TEST_ASSERT(c["verify_hash"]["first_mismatch_rank"].get<int>() == 1);
+    TEST_ASSERT(c["verify_hash"]["first_mismatch_step"].get<uint32_t>() == 8);
+    TEST_ASSERT(c["error"].get<std::string>() == "RequestReport gather timed out");
+}
+
+TEST_CASE(ServerUnitFixture, test_props_cluster_section) {
+    ServerConfig cfg;
+    cfg.arch = "deepseek4";
+    Tokenizer tok;
+    PrefixCache pc(0, tok);
+    ToolMemory tm;
+
+    // Single node: present but inactive, so clients can branch on one key.
+    json off = build_props_body(cfg, pc, tm);
+    TEST_ASSERT(off.contains("cluster"));
+    TEST_ASSERT(!off["cluster"]["active"].get<bool>());
+    TEST_ASSERT(!off["cluster"].contains("size"));
+
+    dflash::common::ClusterPropsView view;
+    view.active = true;
+    view.size = 4;
+    view.rank = 0;
+    view.ifname = "enp197s0f3np3";
+    view.ib_hca = "rocep197s0f3";
+    view.gid_index = 1;
+    view.placement = "uniform";
+    view.placement_hash = 5021064427384964593ull;
+    view.shared_expert = "replicate";
+    view.allreduce_dtype = "auto";
+    view.ingraph_allreduce = true;
+    view.resident_expert_bytes = 49056579584ull;
+    view.timeout_ms = 30000;
+    json on = build_props_body(cfg, pc, tm, &view);
+    const json & c = on["cluster"];
+    TEST_ASSERT(c["active"].get<bool>());
+    TEST_ASSERT(c["size"].get<int>() == 4);
+    TEST_ASSERT(c["ifname"].get<std::string>() == "enp197s0f3np3");
+    TEST_ASSERT(c["placement_hash"].get<uint64_t>() == 5021064427384964593ull);
+    TEST_ASSERT(c["ingraph_allreduce"].get<bool>());
+    TEST_ASSERT(!c["gpudirect"].get<bool>());
+    TEST_ASSERT(c["resident_expert_bytes"].get<uint64_t>() == 49056579584ull);
+}
+
 TEST_CASE(ServerUnitFixture, test_usage_timings_omitted_when_null) {
     // Backward compat: emit_finish(n) (no timings) emits the legacy
     // usage block — no `timings` key. Guards the SDK-facing default

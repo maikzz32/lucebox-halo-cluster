@@ -32,6 +32,24 @@
 
 namespace dflash::cluster {
 
+uint64_t cluster_device_bytes_in_use(int device) {
+#ifdef DFLASH27B_CLUSTER_RCCL
+    if (device < 0) return 0;
+    int previous = 0;
+    if (hipGetDevice(&previous) != hipSuccess) return 0;
+    if (device != previous && hipSetDevice(device) != hipSuccess) return 0;
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    const hipError_t rc = hipMemGetInfo(&free_bytes, &total_bytes);
+    if (device != previous) hipSetDevice(previous);
+    if (rc != hipSuccess || total_bytes == 0 || free_bytes > total_bytes) return 0;
+    return (uint64_t) (total_bytes - free_bytes);
+#else
+    (void) device;
+    return 0;
+#endif
+}
+
 namespace {
 
 const char * const kNoRcclMsg =

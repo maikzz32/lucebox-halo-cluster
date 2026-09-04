@@ -70,12 +70,50 @@ static double round1(double x) {
     return std::round(x * 10.0) / 10.0;
 }
 
+// usage.timings.cluster: one entry per rank plus the head's view of the
+// exchange. `wait_us` is host time blocked on collectives and is 0 on path 3b,
+// where they run inside the graph and their cost is part of compute_us.
+static json build_cluster_timings_json(const dflash::common::ClusterTelemetryView & c) {
+    json ranks = json::array();
+    for (const dflash::common::ClusterRankTiming & r : c.ranks) {
+        ranks.push_back(json{
+            {"rank",              r.rank},
+            {"steps",             r.steps},
+            {"compute_ms",        round1(r.compute_us / 1000.0)},
+            {"allreduce_calls",   r.allreduce_calls},
+            {"allreduce_bytes",   r.allreduce_bytes},
+            {"allreduce_wait_ms", round1(r.allreduce_wait_us / 1000.0)},
+            {"ctrl_wait_ms",      round1(r.ctrl_wait_us / 1000.0)},
+            {"device_bytes",      r.peak_device_bytes},
+        });
+    }
+    json out = {
+        {"size",         c.size},
+        {"request_id",   c.request_id},
+        {"complete",     c.complete},
+        {"ctrl_wait_ms", round1(c.head_ctrl_wait_us / 1000.0)},
+        {"per_rank",     std::move(ranks)},
+    };
+    if (c.hash_probes > 0 || c.hash_mismatches > 0) {
+        out["verify_hash"] = {
+            {"probes",     c.hash_probes},
+            {"mismatches", c.hash_mismatches},
+        };
+        if (c.first_mismatch_rank >= 0) {
+            out["verify_hash"]["first_mismatch_rank"] = c.first_mismatch_rank;
+            out["verify_hash"]["first_mismatch_step"] = c.first_mismatch_step;
+        }
+    }
+    if (!c.error.empty()) out["error"] = c.error;
+    return out;
+}
+
 json build_timings_json(const GenTimings & t, int completion_tokens) {
     const double prefill_ms = round1(t.prefill_s * 1000.0);
     const double decode_ms  = round1(t.decode_s  * 1000.0);
     const double tps = t.decode_s > 0.0
         ? round1((double)completion_tokens / t.decode_s) : 0.0;
-    return json{
+    json out = {
         {"prefill_ms",            prefill_ms},
         {"decode_ms",             decode_ms},
         {"decode_tokens_per_sec", tps},
@@ -85,6 +123,8 @@ json build_timings_json(const GenTimings & t, int completion_tokens) {
         {"effective_prompt_tokens", t.effective_prompt_tokens},
         {"agent_turn_cache_hit",  t.agent_turn_cache_hit}
     };
+    if (t.cluster.active) out["cluster"] = build_cluster_timings_json(t.cluster);
+    return out;
 }
 
 // ─── Constructor ────────────────────────────────────────────────────────

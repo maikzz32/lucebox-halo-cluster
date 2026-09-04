@@ -9,6 +9,7 @@
 #include "tool_memory.h"
 #include "reasoning.h"
 #include "api_types.h"
+#include "common/cluster_view.h"
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
@@ -47,6 +48,13 @@ struct GenTimings {
     int    prefilled_tokens     = 0;
     int    effective_prompt_tokens = 0;
     bool   agent_turn_cache_hit = false;
+    // WP6: filled only on a cluster head, and only for the request that just
+    // finished. It rides here because GenTimings is the one struct that
+    // reaches all six places that emit usage.timings (three non-streaming
+    // builders and three streaming ones); the streaming emitter has no
+    // GenerateResult and no backend handle. Defaulted and appended last so
+    // the positional aggregate initializers elsewhere keep compiling.
+    dflash::common::ClusterTelemetryView cluster{};
 };
 
 // Build the `timings` sub-object emitted under `usage`.

@@ -47,6 +47,38 @@ under `usage.timings`:
 - `cached_prefix_tokens`: backend-confirmed tokens restored from KV state.
 - `prefilled_tokens`: prompt tokens computed for this request.
 
+### `usage.timings.cluster` (multi-node runs only)
+
+Present only when the server is rank 0 of a `--cluster-*` run (see
+`server/docs/CLUSTER.md`). It reports what each rank actually did for **this**
+request, which is how an imbalanced expert placement or a slow node is found.
+The section appears in every response shape, streaming included.
+
+```json
+"cluster": {
+  "size": 2, "request_id": 1, "complete": true, "ctrl_wait_ms": 1.1,
+  "per_rank": [
+    {"rank": 0, "steps": 40, "compute_ms": 3607.0,
+     "allreduce_calls": 1806, "allreduce_bytes": 51429376,
+     "allreduce_wait_ms": 11.1, "ctrl_wait_ms": 1.1,
+     "device_bytes": 67561107456},
+    {"rank": 1, "...": "..."}
+  ]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `size` | ranks that served the request; `per_rank[0]` is the head |
+| `complete` | every worker's report arrived; `false` means the numbers are partial |
+| `compute_ms` | that rank's own prefill+decode wall time. Ranks should be within a few percent of each other; a gap is placement imbalance or a slow node |
+| `allreduce_calls` / `allreduce_bytes` | collectives issued and payload summed across the ranks |
+| `allreduce_wait_ms` | host time blocked on collectives. **0 for decode on path 3b**, where the collective runs inside the graph and its cost is part of `compute_ms`; non-zero for prefill, which still takes path 3a |
+| `ctrl_wait_ms` | host time blocked on the control channel. A worker's value is how long it waited for the head's decisions |
+| `device_bytes` | device memory in use on that rank, high-water mark sampled at request ends |
+| `verify_hash` | only with `--cluster-verify-hash n`: probe and mismatch counts, plus the first divergent rank and step |
+| `error` | only when the report gather failed |
+
 ---
 
 ## POST `/v1/chat/completions` (OpenAI-compatible)
