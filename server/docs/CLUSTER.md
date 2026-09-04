@@ -504,6 +504,24 @@ The all-reduce is not the prefill bottleneck: 535 ms of 7.6 s at 1517 tokens,
 (29.2 s) dominate, and attention is replicated on every rank, so long-context
 prefill cannot gain much from more ranks.
 
+## Upstream pull requests
+
+Four pieces of this fork are not cluster-specific and were offered back to
+`Luce-Org/lucebox` on 2026-09-04. Each is compile-verified against
+`upstream/main` on its own branch (`upstream-pr/*`), not just as part of this
+fork:
+
+| PR | What | Branch |
+|---|---|---|
+| [#698](https://github.com/Luce-Org/lucebox/pull/698) | **A real upstream bug**: the cached q=1 output graph never fills the verifier's all-logits hook, so a verify batch split at a compressor boundary comes back empty and speculative decode fails | `upstream-pr/verify-all-logits` |
+| [#699](https://github.com/Luce-Org/lucebox/pull/699) | `ggml_backend_cuda_get_stream` / `_get_device_id`, so work submitted outside ggml can be stream-ordered with a backend | `upstream-pr/ggml-backend-stream-accessors` |
+| [#700](https://github.com/Luce-Org/lucebox/pull/700) | `ggml_cluster_allreduce`: an in-graph collective node that calls a caller-registered callback, so ggml gains no collective-library dependency | `upstream-pr/ggml-ingraph-collective` |
+| [#701](https://github.com/Luce-Org/lucebox/pull/701) | `MoeHybridColdBackend::None` plus the expert-major prefill it unlocks (34.1 s -> 11.45 s on a 1517-token prompt) | `upstream-pr/moe-cold-owner-none` |
+
+Deliberately **not** offered: the N-rank expert placement, the control channel,
+the decision hooks and the feature-gate rows. They only mean something with a
+cluster attached and would be dead weight in a single-node tree.
+
 ## Shared-expert sharding (WP8, opt-in)
 
 `--cluster-shared-expert shard` gives each rank `n_ff / N` of the shared
