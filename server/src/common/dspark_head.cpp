@@ -206,11 +206,14 @@ struct MarkovChainGraphCache {
     ggml_backend_t backend = nullptr;
     int            n_cand = -1;
     bool           want_confidence = false;
+    int            split_v0 = -1;
+    int            split_count = -1;
 
     bool matches(const DraftWeights & dw, ggml_tensor * head, ggml_backend_t be,
-                 int cand, bool conf) const {
+                 int cand, bool conf, int v0, int vc) const {
         return built && lm_head == head && backend == be && n_cand == cand &&
                want_confidence == conf &&
+               split_v0 == v0 && split_count == vc &&
                markov_w1 == dw.dspark.markov_w1 &&
                markov_w2 == dw.dspark.markov_w2 &&
                confidence_w == dw.dspark.confidence_w;
@@ -272,9 +275,18 @@ bool build_markov_chain_graph(const DraftWeights & dw,
                               bool corrected_are_outputs,
                               bool confidence_are_outputs,
                               std::vector<uint8_t> & arena,
-                              MarkovChainGraph & out) {
+                              MarkovChainGraph & out,
+                              const DsparkVocabSplit * split = nullptr) {
     const int hdim   = dw.n_embd;
-    const int vocab  = (int)lm_head->ne[1];
+    const int vocab_global = (int)lm_head->ne[1];
+    // A sliced rank projects only its own columns; everything downstream of
+    // the collective is full width again.
+    const bool sliced = split && split->active() &&
+                        split->vocab_global == vocab_global;
+    const int vocab  = sliced ? split->v_count : vocab_global;
+    // The topk caller reads `corrected` back directly and would get a slice,
+    // so refuse rather than hand it a short buffer. It never asks for a split.
+    if (sliced && corrected_are_outputs) return false;
     const int n_corr = n_positions - first_corrected;
     if (n_positions <= 0 || n_corr <= 0) return false;
     const bool have_confidence = confidence_are_outputs &&
@@ -283,7 +295,7 @@ bool build_markov_chain_graph(const DraftWeights & dw,
         (dw.dspark.confidence_dim == hdim ||
          dw.dspark.confidence_dim == hdim + dw.dspark.markov_rank);
 
-    const size_t arena_size = ggml_tensor_overhead() * (size_t)(64 + 16 * n_corr) +
+    const size_t arena_size = ggml_tensor_overhead() * (size_t)(64 + 24 * n_corr) +
                               ggml_graph_overhead_custom(512, false) + 2 * 1024 * 1024;
     if (arena.size() < arena_size) arena.resize(arena_size);
 
@@ -305,7 +317,19 @@ bool build_markov_chain_graph(const DraftWeights & dw,
     ggml_set_input(out.inp_hidden);
     ggml_set_input(out.inp_seed);
 
-    out.base = ggml_mul_mat(out.ctx, lm_head, out.inp_hidden);
+    ggml_tensor * head_w = lm_head;
+    ggml_tensor * mw2_w  = dw.dspark.markov_w2;
+    if (sliced) {
+        // Both weights carry the vocabulary in ne[1], so a row window is a
+        // plain view: rows are contiguous, and the byte offset is exact.
+        head_w = ggml_view_2d(out.ctx, lm_head, lm_head->ne[0], vocab,
+                              lm_head->nb[1], (size_t)split->v0 * lm_head->nb[1]);
+        mw2_w  = ggml_view_2d(out.ctx, dw.dspark.markov_w2,
+                              dw.dspark.markov_w2->ne[0], vocab,
+                              dw.dspark.markov_w2->nb[1],
+                              (size_t)split->v0 * dw.dspark.markov_w2->nb[1]);
+    }
+    out.base = ggml_mul_mat(out.ctx, head_w, out.inp_hidden);
     if (first_corrected > 0) {
         // The uncorrected rows are read back by the caller.
         ggml_set_output(out.base);
@@ -319,7 +343,7 @@ bool build_markov_chain_graph(const DraftWeights & dw,
     for (int i = 0; i < n_corr; ++i) {
         const int row = first_corrected + i;
         ggml_tensor * prev_emb = ggml_get_rows(out.ctx, dw.dspark.markov_w1, prev_ids);
-        ggml_tensor * bias = ggml_mul_mat(out.ctx, dw.dspark.markov_w2, prev_emb);
+        ggml_tensor * bias = ggml_mul_mat(out.ctx, mw2_w, prev_emb);
         ggml_tensor * base_i = ggml_view_2d(out.ctx, out.base, vocab, 1,
                                             out.base->nb[1], (size_t)row * out.base->nb[1]);
         ggml_tensor * corrected = ggml_add(out.ctx, base_i, bias);
@@ -327,7 +351,21 @@ bool build_markov_chain_graph(const DraftWeights & dw,
             ggml_set_output(corrected);
             ggml_build_forward_expand(out.gf, corrected);
         }
-        ggml_tensor * tok = ggml_argmax(out.ctx, corrected);
+        ggml_tensor * argmax_in = corrected;
+        if (sliced) {
+            // Zero everywhere this rank does not own, then sum across ranks:
+            // every column is contributed by exactly one rank, so the result
+            // is bit-exact and the argmax below sees the same 129280 values
+            // in the same order a single node would.
+            argmax_in = ggml_pad_ext(out.ctx, corrected,
+                                     split->v0,
+                                     vocab_global - split->v0 - vocab,
+                                     0, 0, 0, 0, 0, 0);
+            argmax_in = ggml_cluster_allreduce(out.ctx, argmax_in,
+                                               split->combine_fn,
+                                               split->combine_user);
+        }
+        ggml_tensor * tok = ggml_argmax(out.ctx, argmax_in);
         ggml_set_output(tok);
         ggml_build_forward_expand(out.gf, tok);
         out.corrected[(size_t)i] = corrected;
@@ -365,7 +403,8 @@ bool dspark_markov_correct_greedy_chain_fused(const DraftWeights & dw,
                                               int32_t last_tok,
                                               std::vector<int32_t> & draft_tok,
                                               std::vector<float> * confidence_out,
-                                              const float * confidence_hidden) {
+                                              const float * confidence_hidden,
+                                              const DsparkVocabSplit * split) {
     if (q_len <= 1) return false;
     if (!dspark_fused_usable(dw, backend, lm_head, local_hidden, "dspark_fused")) return false;
     const int hdim   = dw.n_embd;
@@ -375,14 +414,17 @@ bool dspark_markov_correct_greedy_chain_fused(const DraftWeights & dw,
     const bool want_confidence = confidence_out != nullptr;
     if (confidence_out) confidence_out->clear();
 
+    const int split_v0 = (split && split->active()) ? split->v0 : -1;
+    const int split_count = (split && split->active()) ? split->v_count : -1;
     const bool reuse = !dspark_chain_graph_cache_disabled() &&
-        cache.matches(dw, lm_head, backend, n_cand, want_confidence);
+        cache.matches(dw, lm_head, backend, n_cand, want_confidence,
+                      split_v0, split_count);
     if (!reuse) {
         cache.invalidate();
         if (!build_markov_chain_graph(dw, lm_head, n_cand, /*first_corrected=*/0,
                                       /*corrected_are_outputs=*/false,
                                       /*confidence_are_outputs=*/want_confidence,
-                                      cache.arena, cache.g)) {
+                                      cache.arena, cache.g, split)) {
             return false;
         }
         if (!cache.galloc) {
@@ -401,6 +443,8 @@ bool dspark_markov_correct_greedy_chain_fused(const DraftWeights & dw,
         cache.backend = backend;
         cache.n_cand = n_cand;
         cache.want_confidence = want_confidence;
+        cache.split_v0 = split_v0;
+        cache.split_count = split_count;
         cache.built = true;
     }
     MarkovChainGraph & g = cache.g;

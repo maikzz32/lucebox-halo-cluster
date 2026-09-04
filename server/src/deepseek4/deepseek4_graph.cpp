@@ -10201,6 +10201,12 @@ void ds4_set_draft_cluster_runtime(Ds4ClusterRuntime * rt) {
     g_draft_cluster_rt = rt;
 }
 
+// The same pointer, ungated. ds4_draft_shard_runtime() above answers only for
+// the drafter's own opt-in; other DSpark-side features gate themselves.
+Ds4ClusterRuntime * ds4_dspark_cluster_runtime() {
+    return g_draft_cluster_rt;
+}
+
 bool deepseek4_dspark_draft_forward(ggml_backend_t backend,
                                     const DSparkDrafter & d,
                                     const float * noise_embed,

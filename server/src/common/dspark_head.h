@@ -26,6 +26,37 @@ bool dspark_markov_correct_greedy_chain(const DraftWeights & dw,
 // non-null, has the same padded layout as `local_hidden` and supplies the
 // pre-output-norm state expected by the confidence head. Callers without a
 // separate state retain the legacy behavior by leaving it null.
+// A vocabulary slice of the DSpark head, for cluster ranks. Each rank
+// projects only [v0, v0 + v_count) of lm_head and markov_w2, the sliced
+// logits are padded back to the full width with zeros, and `combine_fn` sums
+// them across ranks -- exact in F32, since every element is contributed by
+// exactly one rank. The argmax then runs over the full, unchanged width.
+//
+// That last point is the whole reason for this shape. ggml_argmax breaks ties
+// by the shuffle-butterfly topology at its column count, not by lowest index,
+// so a design that reduced per-rank argmaxes would resolve ties differently
+// from a single node. Gathering before the argmax does not preserve the
+// tie-break rule; it never disturbs it.
+//
+// markov_w1 is deliberately NOT sliced: get_rows indexes it by a global token
+// id and does no bounds check, so a sliced table would return plausible
+// garbage in silence.
+//
+// Plain ggml and POD types only -- server/src/common/ must not gain a cluster
+// dependency.
+struct DsparkVocabSplit {
+    int   v0 = 0;             // first vocabulary column owned by this rank
+    int   v_count = 0;        // columns owned by this rank
+    int   vocab_global = 0;   // full vocabulary width
+    ggml_cluster_allreduce_fn combine_fn = nullptr;
+    void * combine_user = nullptr;
+
+    bool active() const {
+        return combine_fn && v_count > 0 && vocab_global > v_count &&
+               v0 >= 0 && v0 + v_count <= vocab_global;
+    }
+};
+
 bool dspark_markov_correct_greedy_chain_fused(const DraftWeights & dw,
                                               ggml_backend_t backend,
                                               ggml_tensor * lm_head,
@@ -34,7 +65,8 @@ bool dspark_markov_correct_greedy_chain_fused(const DraftWeights & dw,
                                               int32_t last_tok,
                                               std::vector<int32_t> & draft_tok,
                                               std::vector<float> * confidence_out = nullptr,
-                                              const float * confidence_hidden = nullptr);
+                                              const float * confidence_hidden = nullptr,
+                                              const DsparkVocabSplit * split = nullptr);
 
 // DDTree candidate generation with the Markov correction: base logits for
 // all n_tokens positions in ONE lm_head matmul; rows 1..n-1 get the low-rank

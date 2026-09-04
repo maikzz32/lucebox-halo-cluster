@@ -472,6 +472,10 @@ bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
 struct Ds4ClusterRuntime;
 void ds4_set_draft_cluster_runtime(Ds4ClusterRuntime * rt);
 
+// This process's cluster runtime, or nullptr outside a cluster. Ungated: the
+// caller decides whether its own feature is enabled.
+Ds4ClusterRuntime * ds4_dspark_cluster_runtime();
+
 bool register_deepseek4_moe_hybrid_mix_tables(
     const std::string &         path,
     const DeepSeek4Weights &    w,

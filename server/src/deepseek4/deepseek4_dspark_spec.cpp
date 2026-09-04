@@ -22,6 +22,7 @@
 // DFLASH_DS4_FULL_SNAP=1 for A/B validation.
 
 #include "deepseek4_dspark.h"
+#include "deepseek4_cluster.h"
 #include "deepseek4_internal.h"
 #include "deepseek4_roctx.h"
 #include "cluster/cluster_decision_hooks.h"
@@ -662,6 +663,34 @@ bool run_deepseek4_dspark_spec_decode(
     // Cluster lockstep (WP4 plumbing). Only a real head/worker hook changes
     // behaviour; nullptr and LocalHooks leave the single-node algorithm as is.
     const bool cluster_spec = cluster_hooks && cluster_hooks->is_cluster();
+    // DFLASH_CLUSTER_SPLIT_LM_HEAD=1: project only this rank's slice of the
+    // vocabulary in the DSpark head and sum the padded logits back to full
+    // width before the argmax. Opt-in, and refused unless the vocabulary
+    // divides evenly -- unequal slices would make the graph shape
+    // rank-dependent, and an odd rank count changes which mul_mat kernel
+    // serves the sliced weight.
+    DsparkVocabSplit vocab_split;
+    if (cluster_spec && spec_env_flag("DFLASH_CLUSTER_SPLIT_LM_HEAD")) {
+        Ds4ClusterRuntime * rt = ds4_dspark_cluster_runtime();
+        const int vocab = drafter.vocab_size;
+        if (rt && rt->size() > 1 && vocab > 0 && (vocab % rt->size()) == 0) {
+            vocab_split.vocab_global = vocab;
+            vocab_split.v_count = vocab / rt->size();
+            vocab_split.v0 = rt->rank() * vocab_split.v_count;
+            vocab_split.combine_fn = ds4_cluster_allreduce_fn();
+            vocab_split.combine_user = rt;
+            std::fprintf(stderr,
+                "[ds4-spec] lm_head vocabulary split: rank %d owns [%d, %d) of %d\n",
+                rt->rank(), vocab_split.v0,
+                vocab_split.v0 + vocab_split.v_count, vocab);
+        } else if (rt && rt->size() > 1) {
+            std::fprintf(stderr,
+                "[ds4-spec] lm_head vocabulary split requested but vocab %d does "
+                "not divide %d ways; staying replicated\n", vocab, rt->size());
+        }
+    }
+    const DsparkVocabSplit * vocab_split_p =
+        vocab_split.active() ? &vocab_split : nullptr;
     const bool cluster_spec_head = cluster_spec && cluster_hooks->is_head();
     const uint64_t cluster_req = cluster_hooks ? cluster_hooks->current_request() : 0;
     const int block = drafter.block_size;
@@ -907,7 +936,19 @@ bool run_deepseek4_dspark_spec_decode(
                             q_step_cap, lt, draft_tok,
                             use_confidence_width ? &draft_confidence : nullptr,
                             use_confidence_width
-                                ? padded_confidence_hidden.data() : nullptr);
+                                ? padded_confidence_hidden.data() : nullptr,
+                            vocab_split_p);
+            if (!ds_ok && vocab_split_p) {
+                // With the split active this rank is inside a collective its
+                // peers are waiting on. Taking a private fallback would hang
+                // them until the 30 s watchdog, so fail the request loudly.
+                std::fprintf(stderr,
+                    "[ds4-spec] fused head failed while the vocabulary split is "
+                    "active; failing the request rather than diverging from the "
+                    "other ranks\n");
+                ok = false;
+                break;
+            }
             if (!ds_ok) {
                 ds_ok = dspark_markov_correct_greedy_chain(dw, backend, target,
                             padded_hidden.data(), q_step_cap, lt, 0.0f, draft_tok);

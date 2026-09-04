@@ -172,6 +172,14 @@ ggml_tensor * ds4_cluster_allreduce_node(ggml_context * ctx,
                                          ggml_tensor * partial,
                                          Ds4ClusterRuntime & rt);
 
+// The same sum-all-reduce as a raw callback, for graphs built outside the
+// deepseek4 layer. server/src/common/dspark_head.cpp needs it to combine the
+// vocabulary-sliced logits of the DSpark head, and must not gain a cluster
+// dependency to do so, so it takes an ggml_cluster_allreduce_fn and a void*
+// rather than the runtime itself. Pass `&rt` as the user pointer: errors land
+// in rt.node_error and byte counts in the usual telemetry.
+ggml_cluster_allreduce_fn ds4_cluster_allreduce_fn();
+
 // DFLASH_CLUSTER_NO_ATTENTION_PARALLEL=1: keep attention replicated on every
 // rank (the state before WP8). Cached after the first call.
 bool ds4_cluster_attention_parallel_enabled();

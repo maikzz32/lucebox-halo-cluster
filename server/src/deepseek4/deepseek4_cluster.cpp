@@ -574,6 +574,10 @@ static void ds4_cluster_allreduce_graph_callback(void * user, void * data,
     rt->telemetry.allreduce_bytes += (uint64_t) n * sizeof(float);
 }
 
+ggml_cluster_allreduce_fn ds4_cluster_allreduce_fn() {
+    return &ds4_cluster_allreduce_graph_callback;
+}
+
 ggml_tensor * ds4_cluster_allreduce_node(ggml_context * ctx,
                                          ggml_tensor * partial,
                                          Ds4ClusterRuntime & rt) {
