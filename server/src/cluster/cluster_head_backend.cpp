@@ -23,6 +23,12 @@ namespace {
 
 constexpr int kAbortCodeControl   = 1;   // control channel failure
 constexpr int kAbortCodeCollective = 2;  // RCCL failure
+// Watchdog poll period. Heartbeats are 1 s with a 10 s timeout, so this only
+// bounds how quickly the abort follows the detection, not the detection.
+constexpr int kWatchdogPeriodMs   = 250;
+// Time between aborting the cluster and exiting, so the failed request's HTTP
+// error response is written before the supervisor takes the process.
+constexpr int kFatalExitGraceMs   = 2000;
 constexpr int kAbortCodeRequest   = 3;   // a rank failed the request
 
 // Self-test sizes from the WP1 exit criteria: 1000 x 64 KiB, 43 x 16 MiB.
@@ -252,6 +258,7 @@ bool ClusterHeadBackend::init() {
         return false;
     }
     initialized_ = true;
+    start_watchdog();
     return true;
 }
 
@@ -268,6 +275,10 @@ void ClusterHeadBackend::print_ready_banner() const {
 void ClusterHeadBackend::fail_cluster(const std::string & reason, int code, uint64_t request_id) {
     if (fatal_) return;
     fatal_ = true;
+    {
+        std::lock_guard<std::mutex> lk(fault_mu_);
+        if (fault_reason_.empty()) fault_reason_ = reason;
+    }
     std::fprintf(stderr, "[cluster] head: FATAL (%d): %s\n", code, reason.c_str());
     AbortMsg abort;
     abort.rank = 0;
@@ -282,6 +293,77 @@ void ClusterHeadBackend::fail_cluster(const std::string & reason, int code, uint
         std::fflush(nullptr);
         std::_Exit(3);
     }
+}
+
+// ─── M4: peer-failure watchdog ──────────────────────────────────────────
+
+void ClusterHeadBackend::request_fatal_exit(const std::string & reason, int code,
+                                            uint64_t request_id) {
+    if (exit_scheduled_.exchange(true)) return;
+    std::fprintf(stderr, "[cluster] head: FATAL (%d): %s\n", code, reason.c_str());
+    fatal_ = true;
+    {
+        std::lock_guard<std::mutex> lk(fault_mu_);
+        if (fault_reason_.empty()) fault_reason_ = reason;
+    }
+    // Abort the communicator FIRST: that is what makes a collective that is
+    // already enqueued on the GPU return an error instead of waiting for a
+    // rank that will never arrive. Without it the forward never returns.
+    if (comm_) comm_->abort();
+    AbortMsg abort;
+    abort.rank = 0;
+    abort.code = code;
+    abort.request_id = request_id;
+    abort.reason = reason;
+    control_.broadcast(make_frame(abort), nullptr);
+    if (!exit_on_abort_) return;
+    // Give the request thread time to unwind and the HTTP layer time to write
+    // the error response, then hand over to the supervisor. Detached because
+    // this may run from the watchdog itself.
+    std::thread([reason]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(kFatalExitGraceMs));
+        std::fprintf(stderr,
+                     "[cluster] head: exiting so the supervisor restarts all ranks (%s)\n",
+                     reason.c_str());
+        std::fflush(nullptr);
+        std::_Exit(3);
+    }).detach();
+}
+
+void ClusterHeadBackend::watchdog_loop() {
+    while (!watchdog_stop_.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(kWatchdogPeriodMs));
+        if (watchdog_stop_.load()) break;
+        // Only meaningful while a forward can be blocked in a collective.
+        if (!request_in_flight_.load() || fatal_) continue;
+
+        std::string err;
+        const std::vector<int> dead = control_.dead_ranks();
+        const bool async_failed = comm_ && comm_->async_error(&err);
+        if (dead.empty() && !async_failed) continue;
+
+        std::string reason;
+        if (!dead.empty()) {
+            reason = "rank";
+            for (int r : dead) reason += " " + std::to_string(r);
+            reason += " stopped responding during a request";
+        } else {
+            reason = "communicator error during a request: " + err;
+        }
+        request_fatal_exit(reason, dead.empty() ? kAbortCodeCollective : kAbortCodeControl,
+                           last_report_.request_id);
+    }
+}
+
+void ClusterHeadBackend::start_watchdog() {
+    if (watchdog_.joinable()) return;
+    watchdog_stop_.store(false);
+    watchdog_ = std::thread([this] { watchdog_loop(); });
+}
+
+void ClusterHeadBackend::stop_watchdog() {
+    watchdog_stop_.store(true);
+    if (watchdog_.joinable()) watchdog_.join();
 }
 
 // ─── Generation ─────────────────────────────────────────────────────────
@@ -331,8 +413,10 @@ GenerateResult ClusterHeadBackend::run_request(const GenerateRequest & req, cons
     }
 
     const auto compute_t0 = std::chrono::steady_clock::now();
+    request_in_flight_.store(true);
     result = restore_slot >= 0 ? inner_->restore_and_generate_impl(restore_slot, req, io)
                                : inner_->generate_impl(req, io);
+    request_in_flight_.store(false);
     // Rank 0's own prefill+decode wall time, the counterpart of the workers'
     // compute_us. Comparing them across ranks is how an imbalanced expert
     // placement or a slow node shows up.
@@ -442,6 +526,16 @@ bool ClusterHeadBackend::cluster_request_telemetry(common::ClusterTelemetryView 
     out.first_mismatch_rank = last_report_.first_mismatch_rank;
     out.first_mismatch_step = last_report_.first_mismatch_step;
     out.error               = last_report_.error;
+    {
+        // A cluster fault outranks a stale gather error: it is the reason the
+        // request failed, and without it a failed request is indistinguishable
+        // from a model that answered nothing.
+        std::lock_guard<std::mutex> lk(fault_mu_);
+        if (!fault_reason_.empty()) {
+            out.error = fault_reason_;
+            out.complete = false;
+        }
+    }
     out.ranks.reserve(last_report_.ranks.size());
     for (const RequestReportMsg & r : last_report_.ranks) {
         common::ClusterRankTiming t;
@@ -593,6 +687,7 @@ bool ClusterHeadBackend::spark_bootstrap_finalize(const std::string & profile_pa
 void ClusterHeadBackend::shutdown() {
     if (shut_down_) return;
     shut_down_ = true;
+    stop_watchdog();
     if (initialized_ && !fatal_) {
         ShutdownMsg bye;
         bye.reason = 0;

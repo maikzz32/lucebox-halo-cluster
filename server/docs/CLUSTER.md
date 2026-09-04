@@ -503,6 +503,61 @@ The all-reduce is not the prefill bottleneck: 535 ms of 7.6 s at 1517 tokens,
 (29.2 s) dominate, and attention is replicated on every rank, so long-context
 prefill cannot gain much from more ranks.
 
+## Faults: what happens when a rank dies (M4)
+
+A rank that dies used to be noticed only *between* forwards. Path 3b removed
+the last host-side wait for a collective, so a killed worker left the head
+blocked inside HIP forever: no error, no HTTP answer, no exit. Measured before
+the fix: still hanging 60 s after the kill, threads parked in
+`kfd_wait_on_events`.
+
+Both sides now run a watchdog (250 ms poll) that, **while a request is in
+flight**, checks the control channel's heartbeats and the communicator's async
+error. On a fault it calls `ncclCommAbort` first — that is what makes a
+collective already enqueued on the GPU return an error instead of waiting for
+a rank that will never arrive — and only then tears down.
+
+Measured chain, worker killed 15 s into a 400-token request:
+
+```
+[cluster] head: FATAL (1): rank 1 stopped responding during a request
+[deepseek4-cluster] in-graph all-reduce failed: RCCL communicator aborted
+[ds4-verify] step_layer_range returned false (n_tokens=2 kv_start=255)
+[server] chat DONE ... ok=false ... finish=error error=decode_failed
+[cluster] head: exiting so the supervisor restarts all ranks
+```
+
+The request returned **~1 s after the kill**. The head then waits 2 s so the
+HTTP response is written and exits 3.
+
+**How the failure reaches a client.** The response is HTTP 200 with an empty
+completion and `finish_reason: "stop"` — upstream's non-streaming path sends
+200 regardless of the backend result, for every backend, and this fork does
+not change that global contract. The machine-readable signal is
+`usage.timings.cluster.error`:
+
+```json
+"cluster": {"size": 2, "complete": false, "per_rank": [],
+            "error": "rank 1 stopped responding during a request"}
+```
+
+A client that cares about cluster faults checks that field; the server log
+line says `finish=error`.
+
+**Recovery.** `RESTART=on-failure:3` on `launch_cluster.sh` puts a podman
+restart policy on every rank. Since all ranks exit non-zero on a fault, they
+reform the cluster by themselves: the head listens again and the workers retry
+the handshake. Verified end to end: after the head restarted and rank 1 was
+started again, the cluster was serving after **75 s** and the benchmark was
+byte-identical at the unchanged 29.8 tok/s. One caveat worth knowing: podman
+does not restart a container the *operator* killed, so a `podman kill` needs a
+`podman start`; a real crash is restarted by the policy. The default stays
+`RESTART=no`, because during development a crash should stay a crash instead
+of turning into a restart loop that reloads 50 GB per rank.
+
+`scripts/cluster/fault_drill.sh "strix1 strix2" <target> <dspark>` runs the
+whole drill and fails loudly on each step.
+
 ## Observability (WP6)
 
 Three surfaces, all filled on a two-node run:

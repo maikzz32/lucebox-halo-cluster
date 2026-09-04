@@ -39,6 +39,8 @@ Environment:
   PLACEMENT      --cluster-expert-placement (default uniform)
   HEAD_WAIT      seconds to wait for the head's "cluster: listening" line (default 20)
   SPEC_Q         DFLASH_DS4_SPEC_Q (default 4); SPEC=0 disables DSpark entirely
+  RESTART        podman --restart policy (default no). "on-failure:3" makes the
+                 ranks reform the cluster after a peer failure by themselves.
   PULL           1 = podman pull IMAGE on every host first (default 0)
   BIN_DIR        host dir with server/build/dflash_server (+ deps/**/lib*.so*);
                  mounted at /opt/lucebox-dist and used as entrypoint (dev loop
@@ -73,6 +75,12 @@ GID_INDEX="${GID_INDEX:-1}"
 PLACEMENT="${PLACEMENT:-uniform}"
 HEAD_WAIT="${HEAD_WAIT:-20}"
 SPEC="${SPEC:-1}"
+# Container restart policy. Every rank exits non-zero on a cluster fault (the
+# head with code 3), so "on-failure:N" lets the ranks reform the cluster by
+# themselves: the workers retry the handshake and the head waits for them.
+# Default "no" because during development a crash should stay a crash - a
+# restart loop reloading 50 GB per rank hides the reason it happened.
+RESTART="${RESTART:-no}"
 SPEC_Q="${SPEC_Q:-4}"
 PULL="${PULL:-0}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -194,6 +202,7 @@ podman_cmd() {
     ip="$(rdma_ip "$h")"; id="${ip##*.}"
     iface="$(node_iface "$id")"; hca="$(node_hca "$id")"
     local cmd=(podman run -d --name "lucebox-rank${i}" --hostname "lucebox-rank${i}"
+        --restart "$RESTART"
         --device /dev/kfd --device /dev/dri --device /dev/infiniband
         --group-add keep-groups
         --security-opt seccomp=unconfined --security-opt label=disable

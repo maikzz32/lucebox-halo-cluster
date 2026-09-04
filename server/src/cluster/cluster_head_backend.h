@@ -26,7 +26,10 @@
 #include "deepseek4/deepseek4_backend.h"
 
 #include <cstdint>
+#include <atomic>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -138,6 +141,22 @@ private:
                                        int restore_slot);
     bool broadcast_op(BackendOpKind kind, std::vector<int64_t> args);
     bool gather_reports(uint64_t request_id, uint32_t steps);
+
+    // M4: a dead peer used to be noticed only between forwards. With the
+    // in-graph all-reduce of path 3b nothing on the host waits for a
+    // collective any more, so a rank that dies mid-forward leaves this one
+    // blocked inside HIP forever (observed: a killed worker hung the head
+    // indefinitely, no HTTP answer). This thread polls the control channel's
+    // heartbeats and the communicator's async error while a request is in
+    // flight and calls ncclCommAbort, which makes the pending collective
+    // return an error so the forward can fail and the client gets an answer.
+    void watchdog_loop();
+    void start_watchdog();
+    void stop_watchdog();
+    // Abort the cluster, let the in-flight request fail, and exit after a
+    // grace period so the HTTP response is written before the supervisor
+    // takes over. Idempotent.
+    void request_fatal_exit(const std::string & reason, int code, uint64_t request_id);
     // Broadcast Abort, abort the communicator, mark fatal, maybe exit.
     void fail_cluster(const std::string & reason, int code, uint64_t request_id);
     bool spec_available() const;
@@ -150,6 +169,15 @@ private:
     // ends; the workers keep the same mark and ship it in RequestReport.
     uint64_t                          peak_device_bytes_ = 0;
     uint64_t                          head_compute_us_ = 0;
+    std::thread                       watchdog_;
+    std::atomic<bool>                 watchdog_stop_{false};
+    std::atomic<bool>                 request_in_flight_{false};
+    std::atomic<bool>                 exit_scheduled_{false};
+    // Why the cluster died, set by whichever thread noticed. Read by
+    // cluster_request_telemetry so the failed request's response carries it
+    // in usage.timings.cluster.error instead of looking like an empty answer.
+    mutable std::mutex                fault_mu_;
+    std::string                       fault_reason_;
     ClusterHeadControl                control_;
     std::unique_ptr<IClusterComm>     comm_;
     std::unique_ptr<HeadHooks>        hooks_;

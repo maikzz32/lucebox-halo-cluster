@@ -12,7 +12,9 @@
 #include "common/backend_factory.h"
 #include "deepseek4/deepseek4_backend.h"
 
+#include <atomic>
 #include <chrono>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -77,6 +79,13 @@ struct WorkerState {
     std::unique_ptr<WorkerHooks>               hooks;
     uint64_t                                   requests_served = 0;
     int                                        device = -1;   // local HIP ordinal
+    // M4 watchdog: with the in-graph all-reduce of path 3b nothing on the
+    // host waits for a collective, so a dead head would leave this rank
+    // blocked inside HIP forever. The thread aborts the communicator, which
+    // makes the pending collective return an error.
+    std::thread                                watchdog;
+    std::atomic<bool>                          watchdog_stop{false};
+    std::atomic<bool>                          request_in_flight{false};
     // High-water mark of device memory in use, sampled at request ends.
     uint64_t                                   peak_device_bytes = 0;
 };
@@ -93,6 +102,8 @@ void send_abort(WorkerState & st, int code, uint64_t request_id, const std::stri
 }
 
 void teardown(WorkerState & st) {
+    st.watchdog_stop.store(true);
+    if (st.watchdog.joinable()) st.watchdog.join();
     if (st.ds4) st.ds4->set_cluster_hooks(nullptr);
     if (st.backend_owner) st.backend_owner->shutdown();
     st.control.close();
@@ -142,6 +153,28 @@ bool apply_backend_op(WorkerState & st, const BackendOpMsg & op) {
     return false;
 }
 
+void worker_watchdog_loop(WorkerState & st) {
+    constexpr int kPeriodMs = 250;
+    while (!st.watchdog_stop.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(kPeriodMs));
+        if (st.watchdog_stop.load()) break;
+        if (!st.request_in_flight.load()) continue;
+        std::string err;
+        const bool head_gone = !st.control.alive();
+        const bool async_failed = st.comm && st.comm->async_error(&err);
+        if (!head_gone && !async_failed) continue;
+        std::fprintf(stderr,
+                     "[cluster] worker %d: %s during a request; aborting the communicator\n",
+                     st.cfg.rank,
+                     head_gone ? "the head stopped responding"
+                               : ("communicator error: " + err).c_str());
+        if (st.comm) st.comm->abort();
+        // Leave the exit to the request path: the aborted collective makes the
+        // forward fail, handle_request returns, and the loop tears down.
+        break;
+    }
+}
+
 // Returns the exit code to use, or -1 to keep serving.
 int handle_request(WorkerState & st, const RequestMsg & msg) {
     const uint64_t t0 = now_us();
@@ -152,6 +185,11 @@ int handle_request(WorkerState & st, const RequestMsg & msg) {
     st.hooks->set_current_request(msg.request_id);
     st.hooks->reset_counters();
     if (st.comm) st.comm->reset_stats();
+    st.request_in_flight.store(true);
+    struct InFlightGuard {
+        WorkerState & st;
+        ~InFlightGuard() { st.request_in_flight.store(false); }
+    } in_flight_guard{st};
 
     // WP4: the head speculates only when it broadcast DecodeMode::Speculative.
     // A worker without a drafter would silently decode AR instead and then
@@ -353,6 +391,7 @@ int run_cluster_worker(BackendArgs & args, const BackendFeatureConfig & features
     }
     std::fprintf(stderr, "[cluster] worker %d: %s communicator up (%d ranks)\n", st.cfg.rank,
                  st.comm->backend_name(), st.comm->size());
+    st.watchdog = std::thread([&st] { worker_watchdog_loop(st); });
 
     if (st.cfg.selftest) {
         const bool ok = run_cluster_selftest(*st.comm, init.device, kSelftestIters, kSelftestSmallN,
