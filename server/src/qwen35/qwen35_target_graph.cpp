@@ -31,6 +31,7 @@
 //   conv_kernel      = 4
 
 #include "internal.h"
+#include "qwen4exp/qwen4exp_graph.h"
 #include "bailingmoe3_graph.h"
 #include "delta_net_chunked.h"
 #include "delta_net_specla.h"
@@ -2625,6 +2626,105 @@ QwenGraphOutputs build_qwen35_graph(
     QwenGraphOutputs og = std::move(og_early);
     og.logits = logits;
     return og;
+}
+
+// qwen4exp: the same blocks, a different residual carrier.
+//
+// This architecture has no attn_norm, attn_post_norm or ffn_norm -- the
+// hyper-connection mixer is the norm. So the four points build_single_layer
+// uses them at (norm before attention, residual add after it, norm before the
+// FFN, residual add after that) become mix/combine pairs around a state of
+// [n_embd, n_hc, n_tokens]. The blocks in between are untouched: they see the
+// same [n_embd, n_tokens] they always did, which is why the delta-net and
+// full-attention builders are called here exactly as build_single_layer calls
+// them.
+//
+// `hc_state` is in/out. On the first layer the caller passes a state seeded
+// from the embedding by qwen4exp_hc_init; every layer updates it in place. The
+// return value is the FFN sublayer's mixed input, kept only so the capture
+// path below has the same [n_embd, n_tokens] shape it expects.
+static ggml_tensor * build_single_layer_hc(
+    ggml_context *        ctx,
+    ggml_cgraph *         gf,
+    const TargetWeights & w,
+    TargetCache &         cache,
+    int                   layer_idx,
+    ggml_tensor **        hc_state,    // [n_embd, n_hc, n_tokens], updated
+    ggml_tensor *         positions,
+    ggml_tensor *         attn_mask,
+    int                   kv_start,
+    int                   n_tokens,
+    int                   fa_window,
+    ggml_tensor *         kv_write_rows,
+    ggml_tensor *         parent_ids)
+{
+    const TargetLayer & L = w.layers[layer_idx];
+    const bool is_attn = (((layer_idx + 1) % w.full_attention_interval) == 0);
+    const int n_hc = w.n_hc;
+
+    // ── attention / delta-net sublayer ────────────────────────────────────
+    ggml_tensor * inject = nullptr;
+    ggml_tensor * cur = qwen4exp_hc_mix(
+        ctx, *hc_state, L.hc_attn_norm, L.hc_attn_down, L.hc_attn_up,
+        L.hc_attn_inject, &inject, w.n_embd, n_hc, w.rms_eps);
+    ggml_build_forward_expand(gf, cur);
+
+    if (is_attn) {
+        int fa_idx = 0;
+        for (int il = 0; il < layer_idx; il++) {
+            if (((il + 1) % w.full_attention_interval) == 0) fa_idx++;
+        }
+        cur = build_full_attn_block(
+            ctx, gf, w, L, cur, positions, w.rope_sections,
+            cache.attn_k[fa_idx], cache.attn_v[fa_idx],
+            attn_mask, kv_start, n_tokens,
+            cache.kv_k_type, cache.kv_v_type,
+            cache.kv_k_rotated, fa_window,
+            nullptr, 0, kv_write_rows);
+    } else {
+        int dn_idx = 0;
+        for (int il = 0; il < layer_idx; il++) {
+            if (((il + 1) % w.full_attention_interval) != 0) dn_idx++;
+        }
+        cur = build_delta_net_block(
+            ctx, gf, w, L, cur,
+            cache.conv_state[dn_idx], cache.ssm_state[dn_idx],
+            n_tokens, nullptr, parent_ids,
+            /*skip_gdn_intermediate=*/true,
+            supports_qwen35_fused_kernels(cache.backend));
+    }
+    *hc_state = qwen4exp_hc_combine(ctx, *hc_state, cur, inject, w.n_embd, n_hc);
+
+    // ── FFN sublayer ──────────────────────────────────────────────────────
+    ggml_tensor * ffn_in = qwen4exp_hc_mix(
+        ctx, *hc_state, L.hc_ffn_norm, L.hc_ffn_down, L.hc_ffn_up,
+        L.hc_ffn_inject, &inject, w.n_embd, n_hc, w.rms_eps);
+
+    ggml_tensor * moe_selected = nullptr;
+    ggml_tensor * ffn = build_qwen35moe_ffn(ctx, ffn_in, w, L, &moe_selected);
+    *hc_state = qwen4exp_hc_combine(ctx, *hc_state, ffn, inject, w.n_embd, n_hc);
+
+    return ffn_in;
+}
+
+ggml_tensor * build_qwen4exp_layer(
+    ggml_context *        ctx,
+    ggml_cgraph *         gf,
+    const TargetWeights & w,
+    TargetCache &         cache,
+    int                   layer_idx,
+    ggml_tensor **        hc_state,
+    ggml_tensor *         positions,
+    ggml_tensor *         attn_mask,
+    int                   kv_start,
+    int                   n_tokens,
+    int                   fa_window,
+    ggml_tensor *         kv_write_rows,
+    ggml_tensor *         parent_ids)
+{
+    return build_single_layer_hc(ctx, gf, w, cache, layer_idx, hc_state,
+                                 positions, attn_mask, kv_start, n_tokens,
+                                 fa_window, kv_write_rows, parent_ids);
 }
 
 ggml_tensor * build_qwen35_layer(
