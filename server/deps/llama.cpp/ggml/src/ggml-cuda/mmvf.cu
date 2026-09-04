@@ -786,6 +786,25 @@ void ggml_cuda_op_mul_mat_vec_f(
     GGML_UNUSED_VARS(ctx, src1, dst, src1_ddq_i, src1_ncols, src1_padded_row_size);
 }
 
+// LUCE_MMVF_MAX_NCOLS_F16: ceiling on ne11 below which the F16 mul_mat_vec
+// kernel is preferred over rocBLAS on AMD. 0 (default) keeps the per-
+// architecture values below.
+//
+// RDNA 3.5 (gfx1151, Strix Halo) inherits the RDNA3 ceiling of 3, which was
+// measured on discrete RX 7000 cards. It has never been measured on unified
+// memory, and one column above the ceiling is a cliff rather than a slope:
+// rocBLAS serves a tall-skinny weight such as DeepSeek V4's HC functions
+// ([16384, 24]) with a macro tile that covers the whole output in a SINGLE
+// workgroup and reduces K = 16384 in it, using about 1/40 of the GPU.
+static int luce_mmvf_f16_max_ncols() {
+    static const int value = []() {
+        const char * e = getenv("LUCE_MMVF_MAX_NCOLS_F16");
+        const int v = e ? atoi(e) : 0;
+        return v > 0 ? v : 0;
+    }();
+    return value;
+}
+
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {
     if (src0_ne[0] % 2 != 0) {
         return false;
@@ -835,6 +854,10 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 return ne11 <= 8;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
                 if (fp16_mma_hardware_available(cc)) {
+                    const int ceiling = luce_mmvf_f16_max_ncols();
+                    if (ceiling > 0) {
+                        return ne11 <= ceiling;
+                    }
                     if (GGML_CUDA_CC_IS_RDNA3(cc)) {
                         return ne11 <= 3;
                     }
