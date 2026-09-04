@@ -239,13 +239,10 @@ bool ds4_cluster_build_placement(const cluster::ClusterConfig & cfg,
         set_err(err, "cluster config is not enabled or rank is out of range");
         return false;
     }
-    if (cfg.shared_expert != cluster::SharedExpertMode::Replicate) {
-        // TODO(cluster-verify): Shard (n_ff/N slice summed in the same
-        // all-reduce) and Rank0 are M3 work; the per-layer path below adds
-        // the locally computed shared expert after the reduction.
+    if (cfg.shared_expert == cluster::SharedExpertMode::Rank0) {
         set_err(err, std::string("shared expert mode '") +
                      cluster::shared_expert_mode_name(cfg.shared_expert) +
-                     "' is not implemented yet; use replicate");
+                     "' is not implemented yet; use replicate or shard");
         return false;
     }
 
@@ -306,6 +303,28 @@ bool ds4_cluster_build_placement(const cluster::ClusterConfig & cfg,
     if (&cfg != &rt.cfg_storage) rt.cfg_storage = cfg;
     rt.cfg = &rt.cfg_storage;
     rt.trace = cluster::cluster_env_trace();
+
+    // Shared-expert sharding: this rank's slice of the intermediate axis. The
+    // down projection contracts over that axis, so the slice is a partial sum
+    // and has to be added to the routed partial BEFORE the all-reduce.
+    rt.shexp_ff_begin = 0;
+    rt.shexp_ff_count = 0;
+    if (cfg.shared_expert == cluster::SharedExpertMode::Shard && cfg.size > 1) {
+        if (w.n_ff_exp > 0 && w.n_ff_exp % cfg.size == 0) {
+            rt.shexp_ff_count = w.n_ff_exp / cfg.size;
+            rt.shexp_ff_begin = cfg.rank * rt.shexp_ff_count;
+            std::fprintf(stderr,
+                         "[deepseek4-cluster] rank %d/%d shared expert intermediate %d..%d "
+                         "of %d; its partial rides in the routed all-reduce\n",
+                         cfg.rank, cfg.size, rt.shexp_ff_begin,
+                         rt.shexp_ff_begin + rt.shexp_ff_count - 1, w.n_ff_exp);
+        } else {
+            std::fprintf(stderr,
+                         "[deepseek4-cluster] shared expert stays replicated: %d "
+                         "intermediate units do not split %d ways\n",
+                         w.n_ff_exp, cfg.size);
+        }
+    }
 
     // Attention head parallelism. The split has to be in whole output groups,
     // because the grouped output projection's first stage is indexed by group;
@@ -443,7 +462,7 @@ bool ds4_cluster_attention_parallel_enabled() {
 bool ds4_cluster_fused_graph_available(const Ds4ClusterRuntime * rt) {
     if (!rt || !rt->comm || rt->comm->size() <= 1) return false;
     if (!ds4_cluster_ingraph_allreduce_enabled()) return false;
-    if (rt->cfg && rt->cfg->shared_expert != cluster::SharedExpertMode::Replicate) {
+    if (rt->cfg && rt->cfg->shared_expert == cluster::SharedExpertMode::Rank0) {
         return false;
     }
     for (int32_t owner : rt->placement.owner) {

@@ -783,12 +783,31 @@ static bool ds4_build_fused_verify_graph(
         // the shared expert is added exactly once, and the reduction sees
         // only routed contributions.
         if (cluster_hybrid) {
-            ffn_out = ds4_cluster_allreduce_node(ctx, ffn_out, *cache.cluster_rt);
-            if (!ffn_out) return false;
-            if (L.ffn_gate_shexp && L.ffn_up_shexp && L.ffn_down_shexp) {
-                ggml_tensor * shared = build_shared_ffn(ctx, ffn_normed, w, L);
+            const bool have_shexp =
+                L.ffn_gate_shexp && L.ffn_up_shexp && L.ffn_down_shexp;
+            const int shexp_ff_count = cache.cluster_rt->shexp_ff_count;
+            if (have_shexp && shexp_ff_count > 0) {
+                // Sharded: this rank's slice is a partial sum over the down
+                // projection's contraction axis, so it is added to the routed
+                // partial and the two ride in ONE reduction. Cheaper than
+                // replicating the shared expert, at the price of a different
+                // summation order than a single node uses - which is why this
+                // is opt-in (--cluster-shared-expert shard).
+                ggml_tensor * shared = build_shared_ffn_slice(
+                    ctx, ffn_normed, w, L,
+                    cache.cluster_rt->shexp_ff_begin, shexp_ff_count);
                 if (!shared) return false;
                 ffn_out = ggml_add(ctx, ffn_out, shared);
+                ffn_out = ds4_cluster_allreduce_node(ctx, ffn_out, *cache.cluster_rt);
+                if (!ffn_out) return false;
+            } else {
+                ffn_out = ds4_cluster_allreduce_node(ctx, ffn_out, *cache.cluster_rt);
+                if (!ffn_out) return false;
+                if (have_shexp) {
+                    ggml_tensor * shared = build_shared_ffn(ctx, ffn_normed, w, L);
+                    if (!shared) return false;
+                    ffn_out = ggml_add(ctx, ffn_out, shared);
+                }
             }
         }
 

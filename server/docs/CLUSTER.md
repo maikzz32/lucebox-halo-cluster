@@ -504,6 +504,35 @@ The all-reduce is not the prefill bottleneck: 535 ms of 7.6 s at 1517 tokens,
 (29.2 s) dominate, and attention is replicated on every rank, so long-context
 prefill cannot gain much from more ranks.
 
+## Shared-expert sharding (WP8, opt-in)
+
+`--cluster-shared-expert shard` gives each rank `n_ff / N` of the shared
+expert's intermediate axis. The down projection contracts over that axis, so a
+rank's slice is a **partial sum** — it is added to the routed partial *before*
+the reduction and both ride in the same message. No extra collective.
+
+`gate` and `up` are sliced by output row (a contiguous view). `down` is not:
+it contracts over the intermediate axis, so slicing it would need a strided
+view of every row. The local intermediate is zero-padded back to full width
+instead and the full `down` is applied — 2 of the 3 weights saved per rank.
+
+Prefill takes the host-driven path and computes the shared expert replicated
+even in this mode; both forms compute the same quantity, and only the fused
+decode/verify graph can carry the sliced one.
+
+**Measured, two nodes, on top of head parallelism:**
+
+| | replicated | sharded |
+|---|---|---|
+| DSpark q=4, 128 tokens | 30.00 tok/s | **30.20 tok/s** |
+| AR decode | 21.6 tok/s | **22.1 tok/s** |
+
+Byte-identical to the single-node reference in both. It stays **opt-in**
+because it changes the summation order — the shared expert is summed inside
+the reduction rather than added once after it — and the default keeps the
+order a single node uses. `replicate` remains the default;
+`--cluster-shared-expert rank0` is still unimplemented.
+
 ## Attention head parallelism (WP8)
 
 Attention used to run in full on every rank. Each rank now builds only its

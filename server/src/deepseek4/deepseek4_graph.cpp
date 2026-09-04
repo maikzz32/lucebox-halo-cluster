@@ -3151,6 +3151,51 @@ static ggml_tensor * build_shared_ffn(
     return ggml_mul_mat(ctx, L.ffn_down_shexp, mid_sh);
 }
 
+// Cluster shared-expert sharding: build only the intermediate range
+// [ff_begin, ff_begin + ff_count) of the shared expert. The result is a
+// PARTIAL SUM of the shared expert over that range, because the down
+// projection contracts over the intermediate axis - so the caller must add it
+// to the routed partial BEFORE the all-reduce, and the reduction then sums
+// both contributions in one message.
+//
+// gate and up are sliced by output row, which is a contiguous view. `down`
+// contracts over the intermediate axis, so slicing it would need a strided
+// view of every row; instead the local intermediate is zero-padded back to
+// full width and the full `down` is applied. The zeros contribute nothing.
+// That is 2 of the 3 weights saved per rank.
+static ggml_tensor * build_shared_ffn_slice(
+        ggml_context * ctx,
+        ggml_tensor * cur,
+        const DeepSeek4Weights & w,
+        const DeepSeek4Layer & L,
+        int ff_begin,
+        int ff_count) {
+    if (ff_count <= 0 || !L.ffn_gate_shexp || !L.ffn_up_shexp || !L.ffn_down_shexp) {
+        return build_shared_ffn(ctx, cur, w, L);
+    }
+    const int64_t n_ff = L.ffn_gate_shexp->ne[1];
+    if (ff_begin < 0 || (int64_t) ff_begin + ff_count > n_ff) {
+        return build_shared_ffn(ctx, cur, w, L);
+    }
+    auto row_slice = [&](ggml_tensor * t) {
+        return ggml_view_2d(ctx, t, t->ne[0], (int64_t) ff_count, t->nb[1],
+                            (size_t) ff_begin * t->nb[1]);
+    };
+    ggml_tensor * gate_sh = ggml_mul_mat(ctx, row_slice(L.ffn_gate_shexp), cur);
+    ggml_tensor * up_sh   = ggml_mul_mat(ctx, row_slice(L.ffn_up_shexp), cur);
+    ggml_tensor * mid_sh  = build_clamped_swiglu(ctx, gate_sh, up_sh, w.swiglu_clamp_exp);
+    if ((int64_t) ff_count != n_ff) {
+        ggml_tensor * zeros = ggml_scale(ctx, mid_sh, 0.0f);
+        ggml_tensor * padded = nullptr;
+        for (int64_t off = 0; off < n_ff; off += ff_count) {
+            ggml_tensor * piece = (off == (int64_t) ff_begin) ? mid_sh : zeros;
+            padded = padded ? ggml_concat(ctx, padded, piece, 0) : piece;
+        }
+        mid_sh = padded;
+    }
+    return ggml_mul_mat(ctx, L.ffn_down_shexp, mid_sh);
+}
+
 static bool eval_ds4_hybrid(
         ggml_backend_t backend,
         ggml_backend_t cpu_backend,
@@ -5996,11 +6041,25 @@ static bool eval_ds4_layer_range_hybrid_ffn(
     const MoeLayerDesc shared_desc = desc;
     if (cluster_rt) {
         if (cluster_rt->cfg &&
-            cluster_rt->cfg->shared_expert != cluster::SharedExpertMode::Replicate) {
+            cluster_rt->cfg->shared_expert == cluster::SharedExpertMode::Rank0) {
             std::fprintf(stderr,
                          "[deepseek4-cluster] layer %d: shared expert mode %s not implemented\n",
                          layer, cluster::shared_expert_mode_name(cluster_rt->cfg->shared_expert));
             return false;
+        }
+        // Prefill takes this host-driven path and adds the shared expert once
+        // after the reduction, i.e. it behaves as Replicate even when Shard is
+        // configured. Both compute the same quantity; only decode/verify has
+        // the fused graph in which the sliced form can ride along.
+        if (cluster_rt->cfg &&
+            cluster_rt->cfg->shared_expert == cluster::SharedExpertMode::Shard) {
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                std::fprintf(stderr,
+                             "[deepseek4-cluster] shared-expert sharding applies to the fused "
+                             "decode/verify graph; prefill computes it replicated\n");
+            }
         }
         ds4_cluster_mask_routes(*cluster_rt, layer, selected.data(), weights.data(),
                                 route_width, n_tokens);

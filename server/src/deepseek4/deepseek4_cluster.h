@@ -74,6 +74,11 @@ struct Ds4ClusterRuntime {
     // grouped output projection. count 0 = attention stays replicated.
     int attn_head_begin = 0;
     int attn_head_count = 0;
+    // Shared-expert sharding (--cluster-shared-expert shard): this rank's
+    // slice of the intermediate axis. count 0 = the shared expert is
+    // replicated and added once after the reduction.
+    int shexp_ff_begin = 0;
+    int shexp_ff_count = 0;
 
     // Device staging for host-resident partials (path 3a): one F32 [n] and
     // one bf16 [n] (stored as I16) tensor in a single backend buffer, grown
