@@ -392,6 +392,50 @@ void ds4_cluster_checksum(const float * data, size_t n, double * sum, double * s
     if (sum_abs) *sum_abs = a;
 }
 
+bool ds4_cluster_ingraph_allreduce_enabled() {
+    static const bool enabled = [] {
+        const char * v = std::getenv("DFLASH_CLUSTER_NO_INGRAPH_ALLREDUCE");
+        const bool off = v && v[0] && std::strcmp(v, "0") != 0;
+        if (off) {
+            std::fprintf(stderr,
+                         "[deepseek4-cluster] DFLASH_CLUSTER_NO_INGRAPH_ALLREDUCE=1: "
+                         "per-layer host all-reduce (path 3a), no fused graph\n");
+        }
+        return !off;
+    }();
+    return enabled;
+}
+
+bool ds4_cluster_fused_graph_available(const Ds4ClusterRuntime * rt) {
+    if (!rt || !rt->comm || rt->comm->size() <= 1) return false;
+    if (!ds4_cluster_ingraph_allreduce_enabled()) return false;
+    if (rt->cfg && rt->cfg->shared_expert != cluster::SharedExpertMode::Replicate) {
+        return false;
+    }
+    for (int32_t owner : rt->placement.owner) {
+        if (owner == cluster::kReplicated) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                std::fprintf(stderr,
+                             "[deepseek4-cluster] DFLASH_CLUSTER_FUSED ignored: a "
+                             "replicated expert is owned per token slot, which the "
+                             "fused graph's per-expert owner table cannot express; "
+                             "using path 3a\n");
+            }
+            return false;
+        }
+    }
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        std::fprintf(stderr,
+                     "[deepseek4-cluster] path 3b: fused whole-model graph with an "
+                     "in-graph all-reduce per MoE layer\n");
+    }
+    return true;
+}
+
 bool ds4_cluster_env_prefill_single_token() {
     static const bool enabled = [] {
         const char * v = std::getenv("DFLASH_CLUSTER_PREFILL_SINGLE_TOKEN");
@@ -424,6 +468,41 @@ void ds4_cluster_mask_routes(const Ds4ClusterRuntime & rt,
 }
 
 // ─── All-reduce ─────────────────────────────────────────────────────────
+
+// Path 3b: invoked by GGML_MOE_FUSED_CLUSTER_ALLREDUCE while the graph runs.
+// It enqueues the collective on the stream ggml handed us, which is the same
+// stream the surrounding kernels use, so ordering needs no host synchronize.
+static void ds4_cluster_allreduce_graph_callback(void * user, void * data,
+                                                 size_t n, void * stream) {
+    Ds4ClusterRuntime * rt = static_cast<Ds4ClusterRuntime *>(user);
+    if (!rt || !rt->comm || rt->comm->size() <= 1 || n == 0 || !data) return;
+    std::string err;
+    if (!rt->comm->allreduce_sum_f32(data, n, (cluster::DeviceStream) stream, &err)) {
+        // Keep the first failure: the rest of the graph still runs, and the
+        // caller turns this into a failed forward once the compute returns.
+        if (rt->node_error.empty()) {
+            rt->node_error = err.empty() ? "in-graph all-reduce failed" : err;
+        }
+        return;
+    }
+    rt->telemetry.allreduce_calls += 1;
+    rt->telemetry.allreduce_bytes += (uint64_t) n * sizeof(float);
+}
+
+ggml_tensor * ds4_cluster_allreduce_node(ggml_context * ctx,
+                                         ggml_tensor * partial,
+                                         Ds4ClusterRuntime & rt) {
+    if (!ctx || !partial) return nullptr;
+    if (!rt.comm || rt.comm->size() <= 1) return partial;
+    if (partial->type != GGML_TYPE_F32 || !ggml_is_contiguous(partial)) {
+        std::fprintf(stderr,
+                     "[deepseek4-cluster] in-graph all-reduce needs a contiguous "
+                     "F32 partial\n");
+        return nullptr;
+    }
+    return ggml_cluster_allreduce(ctx, partial,
+                                  &ds4_cluster_allreduce_graph_callback, &rt);
+}
 
 bool ds4_cluster_allreduce_layer(Ds4ClusterRuntime & rt,
                                  ggml_backend_t backend,

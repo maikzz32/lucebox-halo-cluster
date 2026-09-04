@@ -11,12 +11,11 @@ those changes visible as a regenerable patch series, and
 | File | Topic | Owner |
 |---|---|---|
 | `0010-ggml-cuda-stream-and-device-accessors.patch` | `ggml_backend_cuda_get_stream()` / `ggml_backend_cuda_get_device_id()` in `ggml-cuda.h` + `ggml-cuda.cu` so `ClusterComm` can enqueue RCCL collectives on the backend's own stream | Agent A (landed) |
-| `0020-ggml-cuda-cluster-allreduce-op.patch` | `GGML_MOE_FUSED_CLUSTER_ALLREDUCE` sub-op in `moe-fused.cu` (template: `GGML_MOE_FUSED_DEFERRED_PEER_COPY`, ~line 713), `ggml-cuda/cluster-allreduce.cu`, comm setter | WP3b (planned) |
+| `0020-ggml-cuda-cluster-allreduce-op.patch` | `ggml_cluster_allreduce()` (`ggml.h`/`ggml.c`) and the `GGML_MOE_FUSED_CLUSTER_ALLREDUCE` sub-op in `moe-fused.cu` (template: `GGML_MOE_FUSED_DEFERRED_PEER_COPY`), plus the graph-capture guard in `ggml-cuda.cu`. The node calls a **callback** the server registers, so no collective library becomes a ggml dependency and there is no comm setter to maintain | WP3b (landed) |
 | `0090-ggml-misc.patch` | anything else under `server/deps/llama.cpp` that differs from upstream | — |
 | `BASE` | the `upstream/main` commit the series was generated against | — |
 
-Patches that would be empty are not written, so a missing `0020-*` simply
-means WP3b has not landed yet.
+Patches that would be empty are not written.
 
 ## Workflow
 

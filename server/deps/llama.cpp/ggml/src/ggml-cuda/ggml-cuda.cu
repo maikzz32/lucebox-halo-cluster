@@ -3911,6 +3911,19 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 #endif
         }
 
+        // A cluster all-reduce node calls into a collective library on this
+        // stream. Whether such a collective may be captured into a graph and
+        // replayed is runtime- and library-specific, and it is unverified on
+        // gfx1151/RCCL, so a graph containing one is executed eagerly. This
+        // costs nothing for non-cluster builds: no such node exists there.
+        if (node->op == GGML_OP_MOE_FUSED &&
+            ggml_get_op_params_i32(node, 0) == GGML_MOE_FUSED_CLUSTER_ALLREDUCE) {
+            use_cuda_graph = false;
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: disabling CUDA graphs due to a cluster all-reduce node\n", __func__);
+#endif
+        }
+
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;

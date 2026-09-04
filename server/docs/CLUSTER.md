@@ -24,6 +24,21 @@ not be quoted.
   broadcasts every sampling / acceptance / EOS / cancel decision (a few int32
   per step) over a TCP control channel. Kernel non-determinism therefore
   cannot make ranks diverge.
+* **Path 3b: the all-reduce is a graph node (default).** `ggml_cluster_allreduce()`
+  adds a node whose value is its input summed across the ranks; the CUDA/HIP
+  backend runs the collective on the same stream as the surrounding kernels, so
+  no host round trip separates producer and consumer. That is what lets a
+  cluster rank use the **fused whole-model graph**: one graph per forward
+  instead of 43 host-driven per-layer graphs plus a separate router graph, a
+  separate shared-expert graph and three synchronizing copies around every
+  all-reduce. ggml itself stays free of any collective library: the node calls
+  a callback the server registers. Because a rank holds only its shard, the
+  graph masks foreign routes on device through the owner LUT that the hybrid
+  machinery already builds (`valid_lut`), with id -1 so the MMVQ kernels retire
+  those routes early instead of computing them and multiplying by zero. The
+  shared expert is left out of the routed partial and added after the
+  reduction, so it is counted exactly once. `DFLASH_CLUSTER_NO_INGRAPH_ALLREDUCE=1`
+  returns to path 3a, which is still the path prefill takes.
 * **DSpark on the cluster (WP4).** Every rank loads the drafter and drafts, but
   only rank 0's block, its adaptive width, its accept count and its bonus token
   are authoritative; they travel as `Draft` and `Accept` frames inside the
@@ -378,7 +393,44 @@ Correctness proof from `DFLASH_CLUSTER_TRACE=1`: for every layer `partial_pre(ra
 
 Quality probe (5 short reasoning/translation questions, 48 tokens): cluster 3/5 = single node 3/5 (both misses are truncations).
 
-## Measured results, DSpark (2026-09-04, same nodes, artifact and binary, `DFLASH_DS4_SPEC=1 DFLASH_DS4_SPEC_Q=4`)
+## Measured results, path 3b (2026-09-04, same nodes and artifact)
+
+All decode numbers below are the 128-token benchmark prompt at temperature 0,
+median of 3 runs, `DeepSeek-V4-Flash-ROCMFP2-STRIX.gguf`, uniform placement.
+
+| Configuration | AR decode tok/s | DSpark q=4 tok/s | Output |
+|---|---|---|---|
+| single node, monolithic | 16.6 | 27.2 | sha256 `87964cbd…` |
+| 2 nodes, path 3a (host all-reduce per layer) | 14.3 | 22.4 | `87964cbd…` |
+| **2 nodes, path 3b (in-graph all-reduce, fused graph)** | **21.5** | **29.8** | `87964cbd…` |
+| 4 nodes, path 3b | 21.5 | 20.3 | differs (see below) |
+
+Path 3b is worth **1.50x** on AR decode and **1.33x** with DSpark against the
+cluster's own path 3a, and it is the first configuration that beats a single
+node: 1.29x (AR) and 1.10x (DSpark). Every 2-node run is byte-identical to the
+single-node completion. On a free-form 200-token prompt the 2-node cluster
+reaches 16.75 tok/s against 12.1 on one node (1.38x).
+
+Where the win comes from, measured over 63 AR decode steps at N=2: path 3a
+spent 357 ms in `cluster_allreduce` (three synchronizing copies plus a stream
+wait per layer, 132 us x 43 layers x 63 steps) and another 337 ms in the
+host-driven router and hybrid evaluator that the fused graph does not need.
+Path 3b replaces all of it with one graph compute per step: 33 ms per step
+against 70 ms.
+
+**Four nodes do not pay for this model.** AR decode is unchanged at 21.5 tok/s
+and DSpark drops to 20.3. Halving the expert work again does not help because
+at batch 1 the expert matmuls are launch-bound, while the collective gets more
+expensive (4-rank all-reduce p50 125 us against 73 us at 2 ranks, 43 of them
+per token) and every rank waits for the slowest. The graph compute per AR step
+rises from 33 ms at N=2 to 44 ms at N=4. The 4-node output is coherent and
+stable across runs but differs from the 2-node one: a different reduction
+partition changes the last bits and flips a greedy near-tie, the same float
+chaos documented for free-form prompts below. **Two nodes is the sweet spot
+for DeepSeek V4 Flash on this fabric**, and the 50 tok/s target of the original
+plan is not reachable by adding Strix Halo nodes.
+
+## Measured results, DSpark on path 3a (2026-09-04, `DFLASH_DS4_SPEC=1 DFLASH_DS4_SPEC_Q=4`)
 
 | Configuration | 128-token benchmark prompt, tok/s (median of 3) | Free-form prompt, 200 tokens, tok/s | Output |
 |---|---|---|---|
@@ -410,7 +462,11 @@ killed mid-generation): the head stopped at step 38 and rank 1 stopped at the
 same step 38 with the same accept rate, and the next request was served
 normally. That is the empty-draft end marker doing its job.
 
-Not yet done: prefill performance (WP5), `usage.timings.cluster` (WP6), 4-node model run, performance work (M2/M3).
+Not yet done: prefill performance (WP5) - prefill still runs on path 3a,
+because the fused graph covers q=1 decode and verify batches, not 2048-token
+chunks; `usage.timings.cluster` (WP6); and the in-graph all-reduce reports its
+bytes to the cluster runtime's own counters, so the per-step `cluster_allreduce`
+field of the `[deepseek4-timing]` banner reads 0 on path 3b.
 
 ### M1 artifact and diagnostics
 - Diagnostic placement JSON: `python server/scripts/cluster/build_expert_placement.py --dims 43,256,6 -n 2 --all-on-rank 0 -o all_rank0.json`

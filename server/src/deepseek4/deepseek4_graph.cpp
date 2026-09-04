@@ -7051,6 +7051,16 @@ bool deepseek4_step_layer_range(
         moe_hybrid->materialized_cold_experts &&
         moe_hybrid->cold_backend_kind == MoeHybridColdBackend::Gpu &&
         moe_hybrid->cold_backend && moe_hybrid->cold_backend != backend;
+    // Path 3b: the same whole-model graph on a cluster rank. There is no peer
+    // GPU here; the expert stack is this rank's shard, foreign routes are
+    // masked out by the owner LUT on device, and the routed partial is summed
+    // across ranks by an in-graph all-reduce node before the shared expert is
+    // added. This is the default; DFLASH_CLUSTER_NO_INGRAPH_ALLREDUCE=1
+    // returns to path 3a.
+    const bool cluster_fused_ready =
+        cluster_mode && moe_hybrid && !expert_runtime &&
+        moe_hybrid->cold_backend_kind == MoeHybridColdBackend::None &&
+        ds4_cluster_fused_graph_available(cache.cluster_rt);
     const bool wide_verify_candidate =
         n_tokens == DS4_Q5_VERIFY_TOKENS &&
         ds4_env_flag("DFLASH_DS4_Q5_VERIFY");
@@ -7363,8 +7373,10 @@ bool deepseek4_step_layer_range(
     // implementation, otherwise the first speculative seed can diverge from
     // native AR before the drafter has run at all.
     const bool fused_hybrid_decode =
-        fused_hybrid_ready && n_tokens == 1 && allow_decode_graph_reuse &&
-        !cluster_mode && ds4_env_flag("DFLASH_DS4_FUSED_HYBRID_DECODE");
+        (fused_hybrid_ready && !cluster_mode &&
+         ds4_env_flag("DFLASH_DS4_FUSED_HYBRID_DECODE") ||
+         cluster_fused_ready) &&
+        n_tokens == 1 && allow_decode_graph_reuse;
     std::vector<int> fused_hybrid_decode_capture_ids;
     Ds4VerifyHooks fused_hybrid_decode_hooks;
     if (fused_hybrid_decode && !verify_hooks) {
@@ -7374,17 +7386,17 @@ bool deepseek4_step_layer_range(
     Ds4VerifyHooks * fused_graph_hooks =
         (fused_hybrid_decode && !verify_hooks)
             ? &fused_hybrid_decode_hooks : verify_hooks;
-    if ((!moe_hybrid || fused_hybrid_ready) &&
+    if ((!moe_hybrid || fused_hybrid_ready || cluster_fused_ready) &&
         ((n_tokens >= 2 &&
           (n_tokens <= DS4_CONSERVATIVE_VERIFY_MAX_TOKENS ||
            wide_verify_candidate) && verify_hooks) ||
          fused_hybrid_decode) &&
         layer_begin == 0 && is_last_shard &&
         out_logits && ds4_backend_is_gpu(backend) && ds4_fused_verify_enabled() &&
-        // A whole-model fused graph has no insertion point for the per-layer
-        // all-reduce. fused_verify_candidate above says the same for the
-        // warning; this is the dispatch that has to honour it.
-        !cluster_mode) {
+        // Without path 3b a whole-model fused graph has no insertion point
+        // for the per-layer all-reduce, so a cluster rank may only enter here
+        // through cluster_fused_ready.
+        (!cluster_mode || cluster_fused_ready)) {
         const bool q1_feature_capture =
             n_tokens == 1 && verify_hooks && verify_hooks->capture_out;
         // q=1 target-feature capture walks many prompt-position shapes. Keep
@@ -7393,13 +7405,23 @@ bool deepseek4_step_layer_range(
         Ds4FusedVerifyCache & graph_cache = q1_feature_capture
             ? layer_range_cache.fused_capture_graph_cache
             : layer_range_cache.fused_verify_graph_cache;
+        if (cluster_fused_ready) cache.cluster_rt->node_error.clear();
         const int vrc = ds4_try_fused_verify_step(
             graph_cache, q1_feature_capture, fused_decode_graph_cache,
             backend, w, cache,
             hc_layer_weights_range, hc_output_weights_range, hash_routing_tables_range,
             scratch.hash_expert_ids, embed, n_tokens, kv_start, *out_logits, token_ids,
-            fused_graph_hooks, telemetry, fused_hybrid_ready ? moe_hybrid : nullptr,
+            fused_graph_hooks, telemetry,
+            (fused_hybrid_ready || cluster_fused_ready) ? moe_hybrid : nullptr,
             routing_stats);
+        // An in-graph all-reduce cannot report a failure through its return
+        // value; it records the first one and the forward fails here, before
+        // the logits of an incomplete sum reach the sampler.
+        if (cluster_fused_ready && !cache.cluster_rt->node_error.empty()) {
+            std::fprintf(stderr, "[deepseek4-cluster] in-graph all-reduce failed: %s\n",
+                         cache.cluster_rt->node_error.c_str());
+            return false;
+        }
         if (vrc < 0) return false;
         if (vrc > 0) {
             const int np = kv_start + n_tokens;

@@ -158,10 +158,16 @@ static bool ds4_fused_verify_trace_node(
 static void ds4_fused_verify_refresh_hybrid_luts(
         const DeepSeek4Weights & w,
         MoeHybridStorage * hybrid,
-        DeepSeek4FusedDecodeGraph & fg) {
+        DeepSeek4FusedDecodeGraph & fg,
+        bool force_masked_routes = false) {
     if (!hybrid) return;
+    // A route this owner does not hold is either sent to local slot 0 and
+    // multiplied by a zero weight (correct, but it pays the full expert
+    // matmul) or given id -1, which the MMVQ kernels retire early with an
+    // exact zero. A cluster rank owns only its shard, so masking is where the
+    // sharding actually saves work: it is not optional there.
     const int32_t invalid_route =
-        ds4_env_flag("DFLASH_DS4_TP_MASKED_ROUTES") ? -1 : 0;
+        (force_masked_routes || ds4_env_flag("DFLASH_DS4_TP_MASKED_ROUTES")) ? -1 : 0;
     for (size_t hi = 0; hi < fg.hybrid_inputs.size(); ++hi) {
         const int il = (int) hi;
         const MoeHybridLayerStorage & layer = hybrid->layers[(size_t) il];
@@ -387,7 +393,13 @@ static bool ds4_build_fused_verify_graph(
     }
     const int n_embd = w.n_embd;
     const int n_hc = w.n_hc;
-    const BackendPairCapabilities pair_capabilities = hybrid
+    // Cluster path 3b: the hybrid storage holds this rank's expert shard and
+    // there is no peer GPU. The graph therefore lives on one backend, the
+    // routed partial is summed across ranks by an in-graph all-reduce node,
+    // and the shared expert is added to that sum (it is replicated, so it
+    // must not enter the reduction).
+    const bool cluster_hybrid = hybrid && cache.cluster_rt != nullptr;
+    const BackendPairCapabilities pair_capabilities = (hybrid && !cluster_hybrid)
         ? backend_pair_capabilities(backend, hybrid->cold_backend)
         : BackendPairCapabilities{true, true};
     const bool same_gpu_runtime = pair_capabilities.same_runtime;
@@ -624,10 +636,10 @@ static bool ds4_build_fused_verify_graph(
             const bool allow_fused_combine =
                 same_gpu_runtime || cross_vendor_owner_sums;
             const bool allow_direct_device_join =
-                pair_capabilities.native_gpu_handoff &&
+                !cluster_hybrid && pair_capabilities.native_gpu_handoff &&
                 mixed_policy.direct_device_join;
             const bool schedule_host_staged_branches =
-                !same_gpu_runtime &&
+                !cluster_hybrid && !same_gpu_runtime &&
                 mixed_policy.schedule_branches;
             ggml_cgraph * hybrid_schedule_graph =
                 (allow_direct_device_join || schedule_host_staged_branches)
@@ -664,7 +676,7 @@ static bool ds4_build_fused_verify_graph(
             // six routes in one owner graph: the legacy 4 + padded-2 split
             // computes two duplicate expert paths whose weights are zero.
             const bool native_route_width =
-                !same_gpu_runtime ||
+                cluster_hybrid || !same_gpu_runtime ||
                 mixed_policy.native_route_width;
             if (lane_q > 1 && hybrid_cfg.n_expert_used > 4 && has_hot_routed &&
                 !native_route_width) {
@@ -737,8 +749,10 @@ static bool ds4_build_fused_verify_graph(
                         hybrid_cfg, desc,
                         hybrid->layers[(size_t) il],
                         ffn_normed, selected, router_weights,
-                        lane_q, inputs, true, allow_fused_combine,
-                        join_mode)) {
+                        lane_q, inputs, /*include_shared=*/!cluster_hybrid,
+                        allow_fused_combine, join_mode,
+                        cluster_hybrid ? MoeHybridRouteBalance::Disabled
+                                       : MoeHybridRouteBalance::Allowed)) {
                     return false;
                 }
                 ffn_out = inputs.output;
@@ -750,6 +764,21 @@ static bool ds4_build_fused_verify_graph(
             }
         }
         if (!ffn_out) return false;
+
+        // Cluster path 3b: sum the ranks' routed partials as a graph node,
+        // then add this rank's copy of the replicated shared expert. Doing it
+        // in this order is what keeps the result identical to a single node:
+        // the shared expert is added exactly once, and the reduction sees
+        // only routed contributions.
+        if (cluster_hybrid) {
+            ffn_out = ds4_cluster_allreduce_node(ctx, ffn_out, *cache.cluster_rt);
+            if (!ffn_out) return false;
+            if (L.ffn_gate_shexp && L.ffn_up_shexp && L.ffn_down_shexp) {
+                ggml_tensor * shared = build_shared_ffn(ctx, ffn_normed, w, L);
+                if (!shared) return false;
+                ffn_out = ggml_add(ctx, ffn_out, shared);
+            }
+        }
 
         // ── Batched HC post (FFN); capture at drafter layers ──
         if (fused_hc_join_inputs) {
@@ -843,7 +872,7 @@ static bool ds4_build_fused_verify_graph(
         }
     }
 
-    if (hybrid) {
+    if (hybrid && !cluster_hybrid) {
         ggml_backend_t peer = hybrid->cold_backend;
         if (!peer || peer == backend) {
             std::fprintf(stderr,
@@ -1003,6 +1032,13 @@ static bool ds4_build_fused_verify_graph(
         if (!fg.sg.alloc || !ggml_gallocr_alloc_graph(fg.sg.alloc, fg.sg.gf)) {
             std::fprintf(stderr, "[ds4-fused-verify] graph alloc failed\n");
             return false;
+        }
+        if (cluster_hybrid) {
+            // Same owner LUTs as the two-GPU path, but this rank's map has a
+            // local slot only for its own shard: every other expert gets
+            // valid = 0 and is masked out of the route weights on device.
+            ds4_fused_verify_refresh_hybrid_luts(w, hybrid, fg,
+                                                 /*force_masked_routes=*/true);
         }
     }
     fg.shape_key = std::move(shape_key);

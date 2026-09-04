@@ -69,15 +69,21 @@ check required "$GGML/src/ggml-cuda/ggml-cuda.cu" \
 check required "$GGML/src/ggml-cuda/ggml-cuda.cu" \
     '^int ggml_backend_cuda_get_device_id\(ggml_backend_t backend\)' \
     'ggml_backend_cuda_get_device_id defined'
-check planned "$GGML/src/ggml-cuda/moe-fused.cuh" \
-    'GGML_MOE_FUSED_CLUSTER_ALLREDUCE' \
-    'GGML_MOE_FUSED_CLUSTER_ALLREDUCE sub-op (WP3b)'
-check planned "$GGML/src/ggml-cuda/cluster-allreduce.cu" \
-    'ggml_cuda_cluster_allreduce|cluster_allreduce' \
-    'ggml-cuda/cluster-allreduce.cu (WP3b)'
-check planned "$GGML/include/ggml-cuda.h" \
-    'ggml_backend_cuda_set_cluster_comm|ggml_backend_cuda_cluster_set_comm' \
-    'comm setter for the in-graph all-reduce (WP3b)'
+check required "$GGML/include/ggml.h" \
+    'GGML_MOE_FUSED_CLUSTER_ALLREDUCE  = -7' \
+    'GGML_MOE_FUSED_CLUSTER_ALLREDUCE sub-op declared'
+check required "$GGML/include/ggml.h" \
+    'typedef void .\*ggml_cluster_allreduce_fn' \
+    'collective callback typedef (keeps RCCL out of ggml)'
+check required "$GGML/src/ggml.c" \
+    '^struct ggml_tensor . ggml_cluster_allreduce' \
+    'ggml_cluster_allreduce builder defined'
+check required "$GGML/src/ggml-cuda/moe-fused.cu" \
+    'mode == GGML_MOE_FUSED_CLUSTER_ALLREDUCE' \
+    'in-graph all-reduce dispatched on the backend stream'
+check required "$GGML/src/ggml-cuda/ggml-cuda.cu" \
+    'disabling CUDA graphs due to a cluster all-reduce node' \
+    'graph capture disabled for graphs holding a collective'
 
 # ── regenerate / verify the series ──────────────────────────────────────────
 gen_series() { # gen_series <outdir>
@@ -89,7 +95,8 @@ gen_series() { # gen_series <outdir>
     local base; base="$(git -C "$REPO" rev-parse "$UPSTREAM")"
     # Topic split by path; everything else lands in 0090-misc.
     local -a p1=(server/deps/llama.cpp/ggml/include/ggml-cuda.h server/deps/llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu)
-    local -a p2=(server/deps/llama.cpp/ggml/src/ggml-cuda/moe-fused.cu server/deps/llama.cpp/ggml/src/ggml-cuda/moe-fused.cuh
+    local -a p2=(server/deps/llama.cpp/ggml/include/ggml.h server/deps/llama.cpp/ggml/src/ggml.c
+                 server/deps/llama.cpp/ggml/src/ggml-cuda/moe-fused.cu server/deps/llama.cpp/ggml/src/ggml-cuda/moe-fused.cuh
                  server/deps/llama.cpp/ggml/src/ggml-cuda/cluster-allreduce.cu server/deps/llama.cpp/ggml/src/ggml-cuda/cluster-allreduce.cuh
                  server/deps/llama.cpp/ggml/src/ggml-cuda/CMakeLists.txt server/deps/llama.cpp/ggml/src/ggml-hip/CMakeLists.txt)
     local -a excl=()

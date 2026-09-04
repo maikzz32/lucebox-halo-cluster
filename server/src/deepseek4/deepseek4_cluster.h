@@ -64,6 +64,10 @@ struct Ds4ClusterRuntime {
     int slot_validity_n_slots = 0;
     cluster::ClusterStepTelemetry telemetry;
     bool trace = false;
+    // Path 3b: a graph node cannot return an error, so the in-graph
+    // all-reduce records the first failure here and the forward fails after
+    // the compute. Cleared before every graph that contains such a node.
+    std::string node_error;
 
     // Device staging for host-resident partials (path 3a): one F32 [n] and
     // one bf16 [n] (stored as I16) tensor in a single backend buffer, grown
@@ -146,6 +150,28 @@ bool ds4_cluster_allreduce_layer(Ds4ClusterRuntime & rt,
                                  int layer,
                                  DeepSeek4StepTelemetry * telemetry,
                                  std::string * err);
+
+// Path 3b: an all-reduce as an ordinary graph node. `partial` is summed
+// across the ranks on the executing backend's stream, so no host round trip
+// separates the kernels that produce it from those that consume the sum.
+// Returns `partial` unchanged for a single-rank runtime and nullptr when the
+// tensor cannot be reduced (non-contiguous or not F32). Errors during the
+// compute land in rt.node_error.
+ggml_tensor * ds4_cluster_allreduce_node(ggml_context * ctx,
+                                         ggml_tensor * partial,
+                                         Ds4ClusterRuntime & rt);
+
+// True when this runtime may use the fused whole-model graph (path 3b): the
+// opt-in is set, a real multi-rank communicator is attached, the shared
+// expert is replicated, and expert ownership is a function of the expert id
+// alone. Replicated experts are owned per token slot, which the fused graph's
+// per-expert owner LUT cannot express, so they fall back to path 3a.
+bool ds4_cluster_fused_graph_available(const Ds4ClusterRuntime * rt);
+
+// Path 3b (default). DFLASH_CLUSTER_NO_INGRAPH_ALLREDUCE=1 falls back to the
+// host-enqueued per-layer all-reduce of path 3a, which also gives up the
+// fused whole-model graph. Cached after the first call.
+bool ds4_cluster_ingraph_allreduce_enabled();
 
 // Host-resident variant used by the per-layer path: uploads to the runtime's
 // device scratch, all-reduces on the backend stream, waits (deadline

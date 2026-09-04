@@ -347,6 +347,6 @@ trace toggle below are environment variables.
 
 | Variable | Purpose |
 |---|---|
-| `DFLASH_CLUSTER_NO_INGRAPH_ALLREDUCE` | 🔀 **kill-switch** Disable the in-graph `GGML_MOE_FUSED_CLUSTER_ALLREDUCE` node (path 3b) and fall back to the host-enqueued `ClusterComm::allreduce_*` after the FFN graph (path 3a). Slower (breaks the fused verify graph) but isolates graph-integration bugs. |
+| `DFLASH_CLUSTER_NO_INGRAPH_ALLREDUCE` | 🔀 **kill-switch** Disable the in-graph `GGML_MOE_FUSED_CLUSTER_ALLREDUCE` node (path 3b, the default since 2026-09-04) and fall back to the host-enqueued `ClusterComm::allreduce_*` after the FFN graph (path 3a). Measured cost of doing so on two nodes: 29.8 -> 22.4 tok/s with DSpark, 21.5 -> 14.3 AR. Use it to isolate graph-integration bugs; prefill takes path 3a either way. |
 | `DFLASH_CLUSTER_NO_GRAPH_CAPTURE` | 🔀 **kill-switch** Never capture HIP graphs for graphs that contain a cluster collective (RCCL under HIP graph capture on gfx1151 is unverified). Default in M1; intended to become opt-in once measured. |
 | `DFLASH_CLUSTER_TRACE` | 🐛 **debug** Per-step trace of control-channel messages, collective sizes/latencies and, together with `--cluster-verify-hash n`, the first divergent layer between ranks. Very verbose; never required for serving. |
