@@ -195,18 +195,57 @@ The server starts:
 [server] listening on http://127.0.0.1:18120
 ```
 
+## Stage 3a: the hyper-connection pair
+
+`server/src/qwen4exp/qwen4exp_graph.{h,cpp}`. Two functions in pure ggml, no
+new kernel:
+
+    cur, inject = hc_mix(state, norm, down, up, inject_w)   // [n_embd, T]
+    cur         = <ordinary attention / delta-net / FFN block>
+    state       = hc_combine(state, cur, inject)            // [n_embd, n_hc, T]
+
+`hc_mix` runs a grouped RMSNorm -- the reduction is over ONE stream, then the
+flat `[n_hc*n_embd]` gamma scales all of them -- gates the flattened state with
+`sigmoid(up(silu(down(xn)/n_hc)))`, and collapses the streams by their mean.
+`hc_combine` writes a block's output back into every stream weighted by
+`2*sigmoid(inject/n_hc)`; the factor 2 centres that on 1, so a zero injection
+is a plain residual add rather than a halving.
+
+**Where the semantics came from.** Not from the tensor shapes: they do not say
+how four streams collapse to one, and a guess would have produced a model that
+runs and cannot be shown wrong. qwen4exp is in upstream llama.cpp
+(ggml-org/llama.cpp#27742, merged 2026-08-27), and that implementation is the
+specification this follows.
+
+Verified numerically on the CPU backend:
+
+| check | error |
+|---|---|
+| `hc_combine` with zero injection equals `state + block_out` in every stream | 0 |
+| `hc_mix` stream collapse equals `0.5 * rms_norm(stream)` when the gate is forced to 0.5 | 5.7e-08 |
+
+The second is the sharper one: it forces `w_down = 0` so the gate is
+`sigmoid(0) = 0.5` everywhere and makes all four streams identical, which turns
+the expected value into something computable by hand. A wrong stride in the
+collapse loop would show up as a factor or as the wrong stream.
+
 ## Status
 
-Stages 0, 1 and 2 complete. `--model` accepts the file, the weights land on
+Stages 0, 1, 2 and 3a complete. `--model` accepts the file, the weights land on
 the device, and the server listens.
 
 **It cannot generate correct text yet, and this is the point to be careful
-about.** The graph is still qwen35's, which knows nothing of hyper-connections:
-it expects one residual stream of width 2560 and this model carries four. A
-request would produce tokens, and they would be wrong. Stage 3 is the layer
-builder that fixes that -- and the danger it carries is that its output will
-*sound* fine long before it is right, which is why the per-layer RMS check and
-a recorded quality baseline come with it rather than after it.
+about.** The hyper-connection pair is written and verified, but nothing calls
+it: the graph is still qwen35's, which expects one residual stream of width
+2560 where this model carries four. A request would produce tokens, and they
+would be wrong.
+
+Stage 3b is the wiring -- expose qwen35's `build_delta_net_block` and
+`build_full_attn_block`, then drive them from a loop that carries the
+`[n_embd, n_hc, T]` state. The blocks themselves need no change: they see the
+same `[n_embd, T]` they always did. The danger in that stage is that its output
+will *sound* fine long before it is right, which is why the per-layer RMS check
+and a recorded quality baseline belong with it rather than after it.
 
 Two open items:
 
