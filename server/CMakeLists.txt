@@ -532,6 +532,7 @@ add_library(dflash_common STATIC
     src/laguna/laguna_layer_split_adapter.cpp
     src/laguna/laguna_dflash_target.cpp
     src/common/backend_ipc.cpp
+    src/common/gguf_shards.cpp
     src/common/dynamic_backend.cpp
     src/common/domino_head.cpp
     src/common/dspark_head.cpp

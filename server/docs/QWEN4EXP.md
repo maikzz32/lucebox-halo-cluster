@@ -74,7 +74,38 @@ back. That is the opposite of the worst case.
 terminates. No `v.*` or vision tensors in the main shards, so the model is
 loadable text-only; the vision tower ships separately.
 
+## Stage 1: the multi-shard reader
+
+`server/src/common/gguf_shards.h/.cpp`. `GgufShardSet::open()` expands a
+`-00001-of-00003.gguf` name into its siblings, opens each with its own
+`gguf_context` and `GgufMmap`, and indexes every tensor name across all parts.
+`find()` bounds-checks against the file size of the shard that holds the
+tensor, never against a sum -- the invariant in `gguf_bounds.h` is
+parameterised, not relaxed. A single unsplit file is the N == 1 case, so a
+loader can use this unconditionally.
+
+**A finding that corrected the design.** gguf-split does NOT duplicate the
+metadata into every part. Measured on this model: part 1 carries 66 key/value
+pairs, parts 2 and 3 carry three each (`split.no`, `split.count`,
+`split.tensors.count`) and nothing else -- no `general.architecture`. The first
+version of the validator compared the architecture across all parts and
+rejected the model. It now requires part 1 to declare one and compares only
+against parts that do.
+
+Verified against the real model:
+
+```
+opened: 3 part(s), 1224 tensors, 98.5 GiB
+resolved 1224 tensors, 0 failures, 98.5 GiB of tensor data
+per part: part1=115 part2=810 part3=299
+absent-tensor probe: rejected as expected
+```
+
+1224 matches `split.tensors.count`, and the per-part counts match the header
+dump. The probe list in the harness is the full per-layer tensor inventory, so
+resolving 1224 of 1224 also confirms the inventory itself.
+
 ## Status
 
-Stage 0 complete. Next: the multi-shard reader (stage 1), which is a
-prerequisite for loading anything at all.
+Stages 0 and 1 complete. Next: the loader and the arch registration (stage 2),
+which is the first state that accepts `--model`.
