@@ -547,10 +547,22 @@ static bool ds4_build_fused_verify_graph(
         std::vector<DeepSeek4I32ArrayBinding> i32ab;
         std::vector<DeepSeek4I64ArrayBinding> i64ab;
         ggml_tensor * normed = build_rms_norm(ctx, attn_in, L.attn_norm, w.rms_eps);
+        // Cluster head parallelism: this rank builds only its own heads, so
+        // `attn_out` is a partial sum over the grouped output projection and
+        // is all-reduced below, exactly like the routed FFN partial.
+        const int attn_head_begin = cluster_hybrid ? cache.cluster_rt->attn_head_begin : 0;
+        const int attn_head_count = cluster_hybrid ? cache.cluster_rt->attn_head_count : 0;
         ggml_tensor * attn_out = build_mla_attention(ctx, gf, normed, w, L, lc, il,
                                                      lane_kv_start, lane_q, &ain,
-                                                     i32b, i32ab, i64ab);
+                                                     i32b, i32ab, i64ab,
+                                                     /*f32_array_inputs=*/nullptr,
+                                                     DeepSeek4AttentionImpl::Explicit,
+                                                     attn_head_begin, attn_head_count);
         if (!attn_out) return false;
+        if (attn_head_count > 0) {
+            attn_out = ds4_cluster_allreduce_node(ctx, attn_out, *cache.cluster_rt);
+            if (!attn_out) return false;
+        }
         if (!i32b.empty() || !i32ab.empty() || !i64ab.empty()) {
             std::fprintf(stderr, "[ds4-fused-verify] layer %d dynamic bindings; cannot fuse\n", il);
             return false;

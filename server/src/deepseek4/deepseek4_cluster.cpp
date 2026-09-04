@@ -307,6 +307,32 @@ bool ds4_cluster_build_placement(const cluster::ClusterConfig & cfg,
     rt.cfg = &rt.cfg_storage;
     rt.trace = cluster::cluster_env_trace();
 
+    // Attention head parallelism. The split has to be in whole output groups,
+    // because the grouped output projection's first stage is indexed by group;
+    // a rank count that does not divide the groups (or the heads) keeps
+    // attention replicated instead of splitting it unevenly.
+    rt.attn_head_begin = 0;
+    rt.attn_head_count = 0;
+    if (ds4_cluster_attention_parallel_enabled() && cfg.size > 1 &&
+        w.n_out_group > 0 && w.n_head > 0 &&
+        w.n_out_group % cfg.size == 0 && w.n_head % cfg.size == 0) {
+        rt.attn_head_count = w.n_head / cfg.size;
+        rt.attn_head_begin = cfg.rank * rt.attn_head_count;
+        std::fprintf(stderr,
+                     "[deepseek4-cluster] rank %d/%d attention heads %d..%d of %d "
+                     "(%d of %d output groups); the attention output is a partial sum "
+                     "and is all-reduced with the routed experts\n",
+                     cfg.rank, cfg.size, rt.attn_head_begin,
+                     rt.attn_head_begin + rt.attn_head_count - 1, w.n_head,
+                     w.n_out_group / cfg.size, w.n_out_group);
+    } else if (cfg.size > 1) {
+        std::fprintf(stderr,
+                     "[deepseek4-cluster] rank %d/%d attention stays replicated "
+                     "(%d heads / %d output groups do not split %d ways, or the "
+                     "kill-switch is set)\n",
+                     cfg.rank, cfg.size, w.n_head, w.n_out_group, cfg.size);
+    }
+
     std::fprintf(stderr, "[deepseek4-cluster] rank %d/%d %s source=%s resident_experts=%d/%d\n",
                  cfg.rank, cfg.size,
                  rt.placement.describe(have_stats ? &stats : nullptr).c_str(),
@@ -402,6 +428,14 @@ bool ds4_cluster_ingraph_allreduce_enabled() {
                          "per-layer host all-reduce (path 3a), no fused graph\n");
         }
         return !off;
+    }();
+    return enabled;
+}
+
+bool ds4_cluster_attention_parallel_enabled() {
+    static const bool enabled = [] {
+        const char * v = std::getenv("DFLASH_CLUSTER_NO_ATTENTION_PARALLEL");
+        return !(v && v[0] && std::strcmp(v, "0") != 0);
     }();
     return enabled;
 }

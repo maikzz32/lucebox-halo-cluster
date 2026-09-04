@@ -68,6 +68,12 @@ struct Ds4ClusterRuntime {
     // all-reduce records the first failure here and the forward fails after
     // the compute. Cleared before every graph that contains such a node.
     std::string node_error;
+    // Attention head parallelism: this rank builds only heads
+    // [attn_head_begin, attn_head_begin + attn_head_count) and the ranks
+    // all-reduce the attention output, which is a partial sum over the
+    // grouped output projection. count 0 = attention stays replicated.
+    int attn_head_begin = 0;
+    int attn_head_count = 0;
 
     // Device staging for host-resident partials (path 3a): one F32 [n] and
     // one bf16 [n] (stored as I16) tensor in a single backend buffer, grown
@@ -160,6 +166,10 @@ bool ds4_cluster_allreduce_layer(Ds4ClusterRuntime & rt,
 ggml_tensor * ds4_cluster_allreduce_node(ggml_context * ctx,
                                          ggml_tensor * partial,
                                          Ds4ClusterRuntime & rt);
+
+// DFLASH_CLUSTER_NO_ATTENTION_PARALLEL=1: keep attention replicated on every
+// rank (the state before WP8). Cached after the first call.
+bool ds4_cluster_attention_parallel_enabled();
 
 // True when this runtime may use the fused whole-model graph (path 3b): the
 // opt-in is set, a real multi-rank communicator is attached, the shared

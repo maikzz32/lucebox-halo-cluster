@@ -504,6 +504,56 @@ The all-reduce is not the prefill bottleneck: 535 ms of 7.6 s at 1517 tokens,
 (29.2 s) dominate, and attention is replicated on every rank, so long-context
 prefill cannot gain much from more ranks.
 
+## Attention head parallelism (WP8)
+
+Attention used to run in full on every rank. Each rank now builds only its
+share of the 64 heads and the ranks all-reduce the result.
+
+Why that works without a second collective type: the DS4 output projection is
+grouped, and its second stage contracts over `n_lora_o * n_out_group = 8192`.
+A rank that owns half the heads produces a **partial sum over that contraction**,
+so the recombination is an all-reduce of `[n_embd, n_tokens]` F32 — the same
+shape, type and size as the MoE one, using the same in-graph node. No
+all-gather, no new ggml op.
+
+Three weights are sliced, all as plain views: `attn_q_b` by output rows,
+`attn_sinks` by head, `attn_output_a` by group. The dense-mix codebook registry
+keys a slice by `(pointer - base) / stride`, so a view at a slice boundary
+resolves to the right codebook. The second projection stage is **not** sliced:
+its weight would need a strided view of every row, so instead this rank's
+groups are put back at their own offset with the foreign groups zeroed
+(16 KiB per layer at `n_tokens = 1`). The zeros contribute nothing, and summing
+the ranks reproduces the full contraction.
+
+The split has to be in whole output groups, because the projection's first
+stage is indexed by group. A rank count that does not divide the 8 groups (or
+the 64 heads) keeps attention replicated. `DFLASH_CLUSTER_NO_ATTENTION_PARALLEL=1`
+does the same.
+
+**Measured, two nodes, same binary, kill-switch off vs on:**
+
+| | replicated attention | head-parallel |
+|---|---|---|
+| DSpark q=4, 128 tokens | 29.40 tok/s | **30.00 tok/s** (+2.0 %) |
+| AR decode, 128 tokens | 21.25 tok/s | **21.6 tok/s** (+1.6 %) |
+
+Byte-identical to the single-node reference in both configurations.
+
+**Why only 2 %, when the arithmetic says 12 %.** The gross saving is real —
+half of `attn_q_b` and `attn_output_a`, and half the per-head attention work —
+but it is bought with a **second collective per layer**: 86 per forward instead
+of 43. At 63 us each that is 2.7 ms added to a ~46 ms step, which eats roughly
+two thirds of the gain. Two further things bound it: the latent KV cache cannot
+be sharded (MLA has one KV head shared by all 64), so the KV read is unchanged
+and its share grows with context; and the second projection stage still reads
+its full weight on every rank.
+
+Two environment sweeps were run against this and neither helped:
+`NCCL_PROTO=LL` gave 29.6 tok/s (slightly worse) and
+`NCCL_IB_QPS_PER_CONNECTION=1` gave 30.0 (unchanged). The 63 us is fixed
+overhead — kernel launch, host bounce, RDMA doorbell — not something a protocol
+knob moves. At 25 GbE the wire time for 16 KiB is about 1 us.
+
 ## Where a decode step actually goes (measured 2026-09-04)
 
 Two diagnostics were added to answer this with numbers instead of reasoning:

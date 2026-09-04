@@ -1629,13 +1629,30 @@ static ggml_tensor * build_mla_attention(
         std::vector<DeepSeek4I32ArrayBinding> & i32_array_inputs,
         std::vector<DeepSeek4I64ArrayBinding> & i64_array_inputs,
         std::vector<DeepSeek4F32ArrayBinding> * f32_array_inputs = nullptr,
-        DeepSeek4AttentionImpl attention_impl = DeepSeek4AttentionImpl::Explicit) {
+        DeepSeek4AttentionImpl attention_impl = DeepSeek4AttentionImpl::Explicit,
+        // Cluster head parallelism: build only heads
+        // [head_begin, head_begin + head_count). head_count == 0 means all of
+        // them, which is what every non-cluster caller passes. The heads this
+        // rank skips contribute zero to the grouped output projection, so the
+        // result is a PARTIAL SUM over [n_embd, n_tokens] and the caller has
+        // to all-reduce it. The split is in whole output groups because the
+        // projection's first stage is indexed by group.
+        int head_begin = 0,
+        int head_count = 0) {
 
     const int n_embd    = w.n_embd;
     const int head_dim  = w.head_dim;
-    const int n_head    = w.n_head;
+    const int n_head_all = w.n_head;
+    const int n_out_group_all = w.n_out_group;
+    const int heads_per_group = n_out_group_all > 0 ? n_head_all / n_out_group_all : n_head_all;
+    // Everything below works on THIS rank's heads; the two _all values above
+    // are only needed where a full-width tensor is addressed.
+    const int n_head    = head_count > 0 ? head_count : n_head_all;
+    const int head_first = head_count > 0 ? head_begin : 0;
+    const bool head_parallel = n_head != n_head_all;
+    const int n_out_group = heads_per_group > 0 ? n_head / heads_per_group : n_out_group_all;
+    const int group_first = heads_per_group > 0 ? head_first / heads_per_group : 0;
     const int n_rot     = w.n_rot;
-    const int n_out_group = w.n_out_group;
     const int n_lora_o  = w.n_lora_o;
     const int ratio     = w.compress_ratios[layer_idx];
 
@@ -1645,7 +1662,19 @@ static ggml_tensor * build_mla_attention(
     // qr_norm is reused by the ratio-4 indexer before the main q_b projection.
     qr = build_rms_norm(ctx, qr, L.attn_q_a_norm, w.rms_eps);
     // q_b: [n_lora_q, n_tokens] → [n_head * head_dim, n_tokens]
-    ggml_tensor * q = ggml_mul_mat(ctx, L.attn_q_b, qr);
+    // A contiguous range of output rows, so the view stays contiguous and the
+    // dense-mix codebook registry still resolves it (one codebook per tensor,
+    // and the view's pointer lies inside the registered range).
+    ggml_tensor * q_b_w = head_parallel
+        ? ggml_view_2d(ctx, L.attn_q_b, L.attn_q_b->ne[0],
+                       (int64_t) n_head * head_dim, L.attn_q_b->nb[1],
+                       (size_t) head_first * head_dim * L.attn_q_b->nb[1])
+        : L.attn_q_b;
+    ggml_tensor * q = ggml_mul_mat(ctx, q_b_w, qr);
+    ggml_tensor * attn_sinks_w = (L.attn_sinks && head_parallel)
+        ? ggml_view_1d(ctx, L.attn_sinks, n_head,
+                       (size_t) head_first * ggml_type_size(L.attn_sinks->type))
+        : L.attn_sinks;
     // Reshape to [head_dim, n_head, n_tokens] for per-head ops
     q = ggml_reshape_3d(ctx, q, head_dim, n_head, n_tokens);
     // Reference DS4 applies unweighted RMSNorm independently to every Q head.
@@ -2184,7 +2213,7 @@ static ggml_tensor * build_mla_attention(
                     ctx, q_band, k_band, k_band, mask_fa,
                     kq_scale, 0.0f, 0.0f);
                 if (L.attn_sinks) {
-                    ggml_flash_attn_ext_add_sinks(result, L.attn_sinks);
+                    ggml_flash_attn_ext_add_sinks(result, attn_sinks_w);
                 }
                 ggml_flash_attn_ext_set_prec(result, GGML_PREC_F32);
                 ggml_flash_attn_ext_set_ds4_sparse(
@@ -2250,7 +2279,7 @@ static ggml_tensor * build_mla_attention(
             context = ggml_flash_attn_ext(ctx, q_fa, k_fa, v_fa, mask_fa,
                                           kq_scale, 0.0f, 0.0f);
             if (L.attn_sinks) {
-                ggml_flash_attn_ext_add_sinks(context, L.attn_sinks);
+                ggml_flash_attn_ext_add_sinks(context, attn_sinks_w);
             }
             ggml_flash_attn_ext_set_prec(context, GGML_PREC_F32);
             // Always publish the raw/compressed boundary. A zero keep count leaves
@@ -2315,7 +2344,7 @@ static ggml_tensor * build_mla_attention(
         // sink contributes no value vector.
         ggml_tensor * probs = nullptr;
         if (L.attn_sinks) {
-            ggml_tensor * sink_scores = ggml_reshape_2d(ctx, L.attn_sinks,
+            ggml_tensor * sink_scores = ggml_reshape_2d(ctx, attn_sinks_w,
                                                         1, n_head);
             if (n_tokens > 1) {
                 ggml_tensor * sink_shape = ggml_new_tensor_2d(
@@ -2377,10 +2406,36 @@ static ggml_tensor * build_mla_attention(
         attn_out = ggml_cont(ctx, attn_out);
     }
     // attn_out is now [group_dim, n_tokens, n_out_group]
-    ggml_tensor * out_a_3d = ggml_reshape_3d(ctx, L.attn_output_a, group_dim, n_lora_o, n_out_group);
+    ggml_tensor * out_a_3d = ggml_reshape_3d(ctx, L.attn_output_a, group_dim, n_lora_o,
+                                             n_out_group_all);
+    if (head_parallel) {
+        // A contiguous range of groups: the registry keys a slice by
+        // (pointer - base) / nb[2], so this view resolves to the right
+        // codebook slice.
+        out_a_3d = ggml_view_3d(ctx, out_a_3d, group_dim, n_lora_o, n_out_group,
+                                out_a_3d->nb[1], out_a_3d->nb[2],
+                                (size_t) group_first * out_a_3d->nb[2]);
+    }
     // out_a_3d: [group_dim, n_lora_o, n_out_group] — ne[2] matches
     ggml_tensor * attn_low = ggml_mul_mat(ctx, out_a_3d, attn_out);
     // attn_low: [n_lora_o, n_tokens, n_out_group]
+    if (head_parallel) {
+        // The second projection stage contracts over ALL groups at once, and
+        // its weight cannot be sliced along that axis without a strided view
+        // of every row. So put this rank's groups back at their own offset and
+        // zero the rest: the foreign groups then contribute nothing, and
+        // summing the ranks' results reproduces the full contraction. The
+        // padding is [n_lora_o, n_tokens, groups] - 16 KiB per layer at
+        // n_tokens = 1, against the 33.5 M weights this avoids re-slicing.
+        ggml_tensor * zeros = ggml_scale(ctx, attn_low, 0.0f);
+        ggml_tensor * padded = nullptr;
+        for (int g = 0; g < n_out_group_all; g += n_out_group) {
+            ggml_tensor * piece = (g == group_first) ? attn_low : zeros;
+            padded = padded ? ggml_concat(ctx, padded, piece, 2) : piece;
+        }
+        attn_low = padded;
+    }
+    const int n_out_group_proj = head_parallel ? n_out_group_all : n_out_group;
     ggml_tensor * out = nullptr;
     const bool grouped_output_projection =
         n_tokens > 1 &&
@@ -2397,7 +2452,7 @@ static ggml_tensor * build_mla_attention(
         // volume avoided by the grouped path.
         attn_low = ggml_cont(ctx, ggml_permute(ctx, attn_low, 0, 2, 1, 3));
         attn_low = ggml_reshape_2d(
-            ctx, attn_low, n_lora_o * n_out_group, n_tokens);
+            ctx, attn_low, n_lora_o * n_out_group_proj, n_tokens);
         out = ggml_mul_mat(ctx, L.attn_output_b, attn_low);
     }
 
