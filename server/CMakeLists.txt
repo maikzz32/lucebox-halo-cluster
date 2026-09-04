@@ -534,6 +534,7 @@ add_library(dflash_common STATIC
     src/common/backend_ipc.cpp
     src/common/gguf_shards.cpp
     src/qwen4exp/qwen4exp_loader.cpp
+    src/qwen4exp/qwen4exp_backend.cpp
     src/common/dynamic_backend.cpp
     src/common/domino_head.cpp
     src/common/dspark_head.cpp

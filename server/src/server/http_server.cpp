@@ -23,6 +23,7 @@
 #include "tool_hint.h"
 #include "pin_friendly_prompt.h"
 #include "common/kv_rotation.h"
+#include "common/model_capabilities.h"
 #include "common/sha1.h"
 #include "freeze_history.h"
 
@@ -704,7 +705,14 @@ json build_props_body(const ServerConfig & config,
     const bool is_qwen = (config.arch.rfind("qwen", 0) == 0);
     const bool is_deepseek4 = (config.arch == "deepseek4");
     const bool reasoning_supported = is_qwen || is_deepseek4;
-    const bool speculative_supported = is_qwen;
+    // A name prefix is a poor proxy for a capability, and qwen4exp is where it
+    // first goes wrong: it starts with "qwen" but its capability row sets every
+    // speculative option to Never, so advertising it here would promise a
+    // feature the backend refuses. Ask the table instead of the name.
+    const dflash::common::ArchCapabilities * caps =
+        dflash::common::find_arch_capabilities(config.arch.c_str());
+    const bool speculative_supported =
+        is_qwen && caps && caps->decode_draft != dflash::common::FeatureSupport::Never;
     const bool tools_supported = is_qwen || config.arch == "deepseek4";
 
     auto pcs  = prefix_cache.stats();

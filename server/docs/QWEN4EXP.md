@@ -173,22 +173,49 @@ Verified on a Radeon 8060S with the real model:
 layer counts match the schedule the metadata declares, and a readback from the
 device confirms real weights rather than zeros.
 
+## Stage 2c: registration
+
+`Qwen4ExpBackend` extends `Qwen35Backend` and overrides only the loader and
+the banner, the same shape bailingmoe3 uses. The capability row is all
+`false`/`kNever`: one sequence, no speculative decode, no paged serving, no
+expert offload. Those come after the autoregressive path has a baseline to be
+measured against.
+
+`http_server.cpp` derived `speculative_supported` from
+`arch.rfind("qwen", 0) == 0`. `"qwen4exp"` matches that prefix, so `/props`
+would have advertised speculative decode that the capability row refuses. It
+now asks the table instead of the name.
+
+The server starts:
+
+```
+[backend_factory] detected arch=qwen4exp
+[tokenizer] loaded vocab=248320 merges=247587 bos=248044 eos=248046 pre=qwen35
+[qwen4exp] loaded 1222 tensors from 3 part(s), 98.5 GiB, 62.3 GiB on device
+[server] listening on http://127.0.0.1:18120
+```
+
 ## Status
 
-Stages 0, 1, 2a and 2b complete: the model loads. Next is the arch
-registration that makes `--model` accept the file through the normal factory
-path, and then stage 3, the hyper-connection layer builder -- the first state
-that produces a token.
+Stages 0, 1 and 2 complete. `--model` accepts the file, the weights land on
+the device, and the server listens.
 
-Two things to carry into the next stage:
+**It cannot generate correct text yet, and this is the point to be careful
+about.** The graph is still qwen35's, which knows nothing of hyper-connections:
+it expects one residual stream of width 2560 and this model carries four. A
+request would produce tokens, and they would be wrong. Stage 3 is the layer
+builder that fixes that -- and the danger it carries is that its output will
+*sound* fine long before it is right, which is why the per-layer RMS check and
+a recorded quality baseline come with it rather than after it.
 
-- `http_server.cpp` derives `speculative_supported` from
-  `arch.rfind("qwen", 0) == 0`, which `"qwen4exp"` matches. That line must be
-  changed, or `/props` will advertise speculative decode that the capability
-  row sets to `kNever`.
+Two open items:
+
 - The 90-row difference between `sum(ple.head_vocab_sizes)` (320,001,446) and
-  `per_layer_token_embd.ne[1]` (320,001,536) is still unexplained. It does not
-  block loading, but PLE cannot be called correct until it is understood.
+  `per_layer_token_embd.ne[1]` (320,001,536) is unexplained. It does not block
+  loading, but PLE cannot be called correct until it is understood.
+- 60 tensors are quant type 100, which `mmq.cu` has no case for: `attn_qkv`,
+  `attn_k` and `attn_v`. The experts are all type 101 and keep MMQ, so this
+  costs prefill speed on the attention projections only.
 
 Note for stage 2b: `http_server.cpp` derives `speculative_supported` from
 `arch.rfind("qwen", 0) == 0`, which `"qwen4exp"` matches. That line must be
