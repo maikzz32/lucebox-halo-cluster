@@ -44,7 +44,7 @@ Environment:
   FUSED_CACHE_SLOTS DFLASH_DS4_TP_FUSED_CACHE_SLOTS (default 12 = the hard cap; upstream is 2 at q<=4)
   SHARD_DRAFTER  DFLASH_CLUSTER_SHARD_DRAFTER (default 1; 0 = drafter replicated)
   SPLIT_LM_HEAD  DFLASH_CLUSTER_SPLIT_LM_HEAD (default 1; 0 = head replicated)
-  COMP_PAD_STRIDE DFLASH_DS4_COMP_PAD_STRIDE (default 128; upstream is 16)
+  COMP_PAD_STRIDE DFLASH_DS4_COMP_PAD_STRIDE (default 16; 128 is faster but changes output)
   RESTART        podman --restart policy (default no). "on-failure:3" makes the
                  ranks reform the cluster after a peer failure by themselves.
   PREFIX_SLOTS   --prefix-cache-slots on every rank (default 32; 0 disables)
@@ -115,11 +115,22 @@ SPLIT_LM_HEAD="${SPLIT_LM_HEAD:-1}"
 # Rounding granularity for the compressor row count. It enters the fused
 # verify graph's shape key, so a fine stride makes the key wander as the
 # sequence grows and the graph cache misses -- 11.2 ms of pure rebuild per
-# step on a free-form prompt. Padded rows are masked to -1e30 and underflow to
-# zero in the softmax, so a coarser stride is bit-identical by construction;
-# it only reads a few more masked rows. Free prompt 22.1 -> 25.2 tok/s,
-# rebuild 11.2 -> 3.6 ms. Accepts 16, 32, 64, 128.
-COMP_PAD_STRIDE="${COMP_PAD_STRIDE:-128}"
+# step on a free-form prompt. A coarser stride is worth a lot: free prompt
+# 22.1 -> 25.2 tok/s on two nodes and 12.7 -> 16.9 on one.
+#
+# It is NOT output-preserving, despite the claim at deepseek4_graph.cpp:1492
+# that a padded read is bit-identical. The padded rows do underflow to exactly
+# zero, but the reduction they join is longer, and a longer parallel reduction
+# sums in a different order. Measured on one node, free-form prompt, each
+# stride internally deterministic across runs: stride 16 gives 326182af...,
+# stride 128 gives 973cc7a4... Short prompts stay identical (the 128-token
+# benchmark still matches reference 87964cbd) because they never cross a
+# differing padding boundary.
+#
+# Default stays at the upstream 16 for that reason. Set 128 to take the speed
+# and give up byte-identity; quality is unaffected (60/60 exact-copy fidelity
+# either way).
+COMP_PAD_STRIDE="${COMP_PAD_STRIDE:-16}"
 # Container restart policy. Every rank exits non-zero on a cluster fault (the
 # head with code 3), so "on-failure:N" lets the ranks reform the cluster by
 # themselves: the workers retry the handshake and the head waits for them.
