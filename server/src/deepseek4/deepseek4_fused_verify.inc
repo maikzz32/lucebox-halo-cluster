@@ -845,7 +845,35 @@ static bool ds4_build_fused_verify_graph(
     ggml_tensor * final_all = ggml_ds4_hc_out(
         ctx, omix, obase, hc_cur, n_hc, hc_out_weights.scale_data[0]);
     ggml_tensor * out_normed = build_rms_norm(ctx, final_all, w.out_norm, w.rms_eps);
-    fg.logits = ggml_mul_mat(ctx, w.output, out_normed);   // [n_vocab, q]
+    // Vocabulary split of the target's output projection. w.output is
+    // [n_embd, n_vocab] and carries the vocabulary in ne[1], so a rank window
+    // is a plain row view; the sliced logits are zero-padded back to full
+    // width and summed, which is exact because every column is produced by
+    // exactly one rank. Everything downstream -- the all-logits hook, the
+    // argmax, the accept decision -- sees the same full-width tensor it saw
+    // before. Refused unless the vocabulary divides evenly: unequal slices
+    // would make the graph shape rank-dependent.
+    ggml_tensor * out_w = w.output;
+    bool split_out = false;
+    int out_v0 = 0, out_vc = 0;
+    if (cluster_hybrid && ds4_env_flag("DFLASH_CLUSTER_SPLIT_LM_HEAD")) {
+        const int size = cache.cluster_rt->size();
+        const int vocab = (int) w.output->ne[1];
+        if (size > 1 && vocab > 0 && (vocab % size) == 0) {
+            out_vc = vocab / size;
+            out_v0 = cache.cluster_rt->rank() * out_vc;
+            out_w = ggml_view_2d(ctx, w.output, w.output->ne[0], out_vc,
+                                 w.output->nb[1], (size_t) out_v0 * w.output->nb[1]);
+            split_out = true;
+        }
+    }
+    fg.logits = ggml_mul_mat(ctx, out_w, out_normed);   // [n_vocab or slice, q]
+    if (split_out) {
+        fg.logits = ggml_pad_ext(
+            ctx, fg.logits, out_v0,
+            (int) w.output->ne[1] - out_v0 - out_vc, 0, 0, 0, 0, 0, 0);
+        fg.logits = ds4_cluster_allreduce_node(ctx, fg.logits, *cache.cluster_rt);
+    }
     ggml_set_output(fg.logits);
     ggml_build_forward_expand(gf, fg.logits);
     if (ds4_env_flag("DFLASH_DS4_GPU_ARGMAX_VERIFY")) {
