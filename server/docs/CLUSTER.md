@@ -462,11 +462,50 @@ killed mid-generation): the head stopped at step 38 and rank 1 stopped at the
 same step 38 with the same accept rate, and the next request was served
 normally. That is the empty-draft end marker doing its job.
 
-Not yet done: prefill performance (WP5) - prefill still runs on path 3a,
-because the fused graph covers q=1 decode and verify batches, not 2048-token
-chunks; `usage.timings.cluster` (WP6); and the in-graph all-reduce reports its
-bytes to the cluster runtime's own counters, so the per-step `cluster_allreduce`
-field of the `[deepseek4-timing]` banner reads 0 on path 3b.
+## Measured results, prefill (WP5, 2026-09-04, two nodes)
+
+Prefill keeps path 3a: the fused graph covers q=1 decode and small verify
+batches, not 2048-token chunks. Wall time of the prefill phase, `--ds4-prefill
+sparse --chunk 2048`:
+
+| Prompt | single node | cluster before WP5 | cluster after WP5 | + `DFLASH_DS4_HYBRID_PREFILL_GPU_HC=1` |
+|---|---|---|---|---|
+| 1517 tokens | 8.03 s | 34.1 s | 11.45 s | **7.58 s** (1.06x) |
+| 12017 tokens | 64.9 s | 283.9 s | 96.9 s | **68.6 s** (0.95x) |
+
+Two independent findings.
+
+**A cluster rank was evaluating its experts one token at a time.** A rank holds
+a reduced expert stack, and `mmq_safe_full_batch` is false for such a stack
+because MMQ's `mul_mat_id` illegal-accesses on it. The batched evaluator
+therefore fell into its sub-batch loop, whose size is
+`min(mmq_safe_sub_batch(), prefill limit)` = **1** on gfx1151: 1517 tokens x 43
+layers = 65k graph computes, 25.9 s of FFN against 7.6 s for a single node's
+whole prefill graph. The fix is the packing the heterogeneous prefill already
+uses: with cold owner `None` there is exactly one owner, every surviving route
+is resident, and the whole batch is packed by expert into one graph per layer
+(`eval_moe_owner_expert_major_batched`). FFN drops to 3.7 s and the output is
+unchanged. This is cluster-only: no upstream configuration uses cold owner
+`None`.
+
+**Host-side HC is then the largest remaining item** (3.3 s of 11.5 s at 1517
+tokens, 36 s of 97 s at 12017). `DFLASH_DS4_HYBRID_PREFILL_GPU_HC=1` moves it
+into the graph and brings prefill to parity with a single node. It stays
+**opt-in**, exactly as upstream ships it, because HC computed on the GPU
+differs from the host implementation in its last bits: with the flag the
+greedy completion of the 128-token benchmark changes (sha256 `8d1ec7d8…`
+instead of `87964cbd…`), and the byte-identity that proves the sharding exact
+is worth more than 30 % of prefill by default. Turn it on for long-prompt
+serving, leave it off when comparing against a single node.
+
+The all-reduce is not the prefill bottleneck: 535 ms of 7.6 s at 1517 tokens,
+3.5 s of 68.6 s at 12017. At 12k tokens attention (24.7 s) and the expert FFN
+(29.2 s) dominate, and attention is replicated on every rank, so long-context
+prefill cannot gain much from more ranks.
+
+Not yet done: `usage.timings.cluster` (WP6); and the in-graph all-reduce
+reports its bytes to the cluster runtime's own counters, so the per-step
+`cluster_allreduce` field of the `[deepseek4-timing]` banner reads 0 on path 3b.
 
 ### M1 artifact and diagnostics
 - Diagnostic placement JSON: `python server/scripts/cluster/build_expert_placement.py --dims 43,256,6 -n 2 --all-on-rank 0 -o all_rank0.json`
