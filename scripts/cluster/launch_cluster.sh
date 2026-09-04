@@ -40,6 +40,7 @@ Environment:
   HEAD_WAIT      seconds to wait for the head's "cluster: listening" line (default 20)
   SPEC_Q         DFLASH_DS4_SPEC_Q (default 4); SPEC=0 disables DSpark entirely
   MMVF_F16       LUCE_MMVF_MAX_NCOLS_F16 (default 4; 0 = upstream per-arch value)
+  PINNED_ROLLBACK DFLASH_DS4_PINNED_ROLLBACK (default 1; 0 = pageable staging)
   RESTART        podman --restart policy (default no). "on-failure:3" makes the
                  ranks reform the cluster after a peer failure by themselves.
   PREFIX_SLOTS   --prefix-cache-slots on every rank (default 32; 0 disables)
@@ -83,6 +84,11 @@ SPEC="${SPEC:-1}"
 # Two nodes, q=4: 30.5 -> 38.6 tok/s, byte-identical. 0 restores the upstream
 # per-architecture value.
 MMVF_F16="${MMVF_F16:-4}"
+# Stage the speculative rollback rows through pinned host memory. The copy is
+# on the critical path between verify and the next draft, and pageable memory
+# makes it a synchronous staging copy: 4.9 -> 0.5 ms per step, 42.9 -> 44.9
+# tok/s on two nodes, output byte-identical. 0 restores pageable staging.
+PINNED_ROLLBACK="${PINNED_ROLLBACK:-1}"
 # Container restart policy. Every rank exits non-zero on a cluster fault (the
 # head with code 3), so "on-failure:N" lets the ranks reform the cluster by
 # themselves: the workers retry the handshake and the head waits for them.
@@ -228,7 +234,8 @@ podman_cmd() {
         -e "NCCL_SOCKET_IFNAME=${iface}" -e "GLOO_SOCKET_IFNAME=${iface}" -e "NCCL_IB_HCA=${hca}"
         -e NCCL_ASYNC_ERROR_HANDLING=1 -e NCCL_IB_QPS_PER_CONNECTION=2
         -e NCCL_IB_TIMEOUT=22 -e NCCL_IB_RETRY_CNT=7 -e HIP_FORCE_DEV_KERNARG=1
-        -e "LUCE_MMVF_MAX_NCOLS_F16=${MMVF_F16}")
+        -e "LUCE_MMVF_MAX_NCOLS_F16=${MMVF_F16}"
+        -e "DFLASH_DS4_PINNED_ROLLBACK=${PINNED_ROLLBACK}")
     local kv
     for kv in $EXTRA_ENV; do cmd+=(-e "$kv"); done
     if [ -n "$BIN_DIR" ]; then
