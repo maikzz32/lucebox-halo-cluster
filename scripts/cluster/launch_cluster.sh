@@ -41,7 +41,7 @@ Environment:
   SPEC_Q         DFLASH_DS4_SPEC_Q (default 4); SPEC=0 disables DSpark entirely
   MMVF_F16       LUCE_MMVF_MAX_NCOLS_F16 (default 4; 0 = upstream per-arch value)
   PINNED_ROLLBACK DFLASH_DS4_PINNED_ROLLBACK (default 1; 0 = pageable staging)
-  FUSED_CACHE_SLOTS DFLASH_DS4_TP_FUSED_CACHE_SLOTS (default 16; upstream is 2 at q<=4)
+  FUSED_CACHE_SLOTS DFLASH_DS4_TP_FUSED_CACHE_SLOTS (default 12 = the hard cap; upstream is 2 at q<=4)
   RESTART        podman --restart policy (default no). "on-failure:3" makes the
                  ranks reform the cluster after a peer failure by themselves.
   PREFIX_SLOTS   --prefix-cache-slots on every rank (default 32; 0 disables)
@@ -90,14 +90,15 @@ MMVF_F16="${MMVF_F16:-4}"
 # makes it a synchronous staging copy: 4.9 -> 0.5 ms per step, 42.9 -> 44.9
 # tok/s on two nodes, output byte-identical. 0 restores pageable staging.
 PINNED_ROLLBACK="${PINNED_ROLLBACK:-1}"
-# Slots in the fused verify graph cache. The upstream default of 2 for q<=4 was
-# chosen against a 31.9 GiB R9700; a cluster rank holds only its half of the
-# experts and has room to spare, and 2 slots miss on every step -- 5.4 ms of
-# pure graph construction per step, 15.0 ms on a free prompt where the adaptive
-# width produces more shapes. Four slots already pin the benchmark prompt; 16
-# is where a free prompt stops improving. Measured flat at 58.2 GiB GTT from 2
-# slots to 64, so the headroom costs nothing here.
-FUSED_CACHE_SLOTS="${FUSED_CACHE_SLOTS:-16}"
+# Slots in the fused verify graph cache. The upstream default of 2 for q<=4
+# misses on every step: 5.4 ms of pure graph construction per step, 15.0 ms on
+# a free prompt where the adaptive width produces more shapes. Four slots
+# already pin the benchmark prompt, and a free prompt keeps improving up to
+# Ds4FusedVerifyCache::kSlotCount, which is 12 and is a hard cap -- a larger
+# value here is silently clamped to it, so 12 is the honest maximum. The slots
+# are nearly free: the cache measured 303 MiB at 2 slots and 351 MiB at the
+# cap, about 0.8 MiB each. Proposed upstream as #704.
+FUSED_CACHE_SLOTS="${FUSED_CACHE_SLOTS:-12}"
 # Container restart policy. Every rank exits non-zero on a cluster fault (the
 # head with code 3), so "on-failure:N" lets the ranks reform the cluster by
 # themselves: the workers retry the handshake and the head waits for them.

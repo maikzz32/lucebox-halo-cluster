@@ -553,6 +553,7 @@ fork:
 | [#701](https://github.com/Luce-Org/lucebox/pull/701) | `MoeHybridColdBackend::None` plus the expert-major prefill it unlocks (34.1 s -> 11.45 s on a 1517-token prompt) | `upstream-pr/moe-cold-owner-none` |
 | [#702](https://github.com/Luce-Org/lucebox/pull/702) | `LUCE_MMVF_MAX_NCOLS_F16`: gfx1151 inherits the discrete-RDNA3 F16 `mul_mat_vec` ceiling of 3, and a verify width of 4 lands one column past it, where rocBLAS runs a tall-skinny F16 weight in a single workgroup (27.9 -> 34.5 tok/s) | `upstream-pr/mmvf-f16-ceiling` |
 | [#703](https://github.com/Luce-Org/lucebox/pull/703) | Register mixed-qtype decode tables for hot-only storage, so an owner with cold owner `None` can run an adaptive artifact. **Stacked on #701** | `upstream-pr/mix-tables-hot-only` |
+| [#704](https://github.com/Luce-Org/lucebox/pull/704) | Raise the q<=4 fused verify graph cache from 2 slots to 8. Two slots miss on every step and rebuild all 5445 nodes (5.4 ms of an 88.9 ms step); a slot costs about 0.8 MiB | `upstream-pr/fused-verify-cache-slots` |
 
 Deliberately **not** offered: the N-rank expert placement, the control channel,
 the decision hooks and the feature-gate rows. They only mean something with a
