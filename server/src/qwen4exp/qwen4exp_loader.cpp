@@ -257,4 +257,219 @@ bool read_qwen4exp_hparams(const GgufShardSet & shards,
     return c.ok;
 }
 
+namespace {
+
+// A tensor we want, and where its bytes are.
+struct Binding {
+    ggml_tensor *   dst = nullptr;   // in the context TargetWeights owns
+    GgufShardTensor src;             // into whichever shard holds it
+};
+
+// Bind one tensor by name. Optional names may be absent; required ones fail.
+struct Binder {
+    const GgufShardSet & shards;
+    ggml_context *       ctx;
+    std::vector<Binding> & out;
+    std::string &        err;
+    bool ok = true;
+
+    ggml_tensor * take(const std::string & name, bool required) {
+        if (!ok) return nullptr;
+        if (!required && !shards.has(name.c_str())) return nullptr;
+        GgufShardTensor src;
+        std::string e;
+        if (!shards.find(name.c_str(), src, e) || !src.meta) {
+            if (!required) return nullptr;
+            err = "qwen4exp: " + e;
+            ok = false;
+            return nullptr;
+        }
+        ggml_tensor * dst = ggml_dup_tensor(ctx, src.meta);
+        if (!dst) {
+            err = "qwen4exp: metadata context exhausted while binding " + name;
+            ok = false;
+            return nullptr;
+        }
+        ggml_set_name(dst, name.c_str());
+        out.push_back(Binding{dst, src});
+        return dst;
+    }
+};
+
+size_t align_up_to(size_t v, size_t a) { return a ? ((v + a - 1) / a) * a : v; }
+
+}  // namespace
+
+bool load_qwen4exp_gguf(const std::string & path,
+                        ggml_backend_t backend,
+                        TargetWeights & out) {
+    GgufShardSet shards;
+    std::string err;
+    if (!shards.open(path, err)) {
+        std::fprintf(stderr, "[qwen4exp] %s\n", err.c_str());
+        return false;
+    }
+    if (!read_qwen4exp_hparams(shards, out, err)) {
+        std::fprintf(stderr, "[qwen4exp] %s\n", err.c_str());
+        return false;
+    }
+
+    // One context of our own holding a copy of every wanted tensor's shape and
+    // type. The shard set has one context per file and closes at the end of
+    // this function; TargetWeights owns exactly one context, so the metadata is
+    // duplicated rather than borrowed.
+    const size_t max_tensors = (size_t) shards.total_tensors() + 16;
+    ggml_init_params ip{};
+    ip.mem_size   = ggml_tensor_overhead() * max_tensors;
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    out.ctx = ggml_init(ip);
+    if (!out.ctx) {
+        std::fprintf(stderr, "[qwen4exp] metadata context allocation failed\n");
+        return false;
+    }
+
+    std::vector<Binding> bindings;
+    bindings.reserve(max_tensors);
+    Binder b{shards, out.ctx, bindings, err};
+
+    auto blk = [](int il, const char * suffix) {
+        return "blk." + std::to_string(il) + "." + suffix;
+    };
+
+    out.layers.resize((size_t) out.n_layer);
+    for (int il = 0; il < out.n_layer && b.ok; ++il) {
+        TargetLayer & L = out.layers[(size_t) il];
+        const bool full_attn = ((il + 1) % out.full_attention_interval) == 0;
+
+        // Hyper-connections replace the usual pre-norms and are on every layer.
+        L.hc_attn_norm   = b.take(blk(il, "hc_attn_norm.weight"),   true);
+        L.hc_attn_down   = b.take(blk(il, "hc_attn_down.weight"),   true);
+        L.hc_attn_up     = b.take(blk(il, "hc_attn_up.weight"),     true);
+        L.hc_attn_inject = b.take(blk(il, "hc_attn_inject.weight"), true);
+        L.hc_ffn_norm    = b.take(blk(il, "hc_ffn_norm.weight"),    true);
+        L.hc_ffn_down    = b.take(blk(il, "hc_ffn_down.weight"),    true);
+        L.hc_ffn_up      = b.take(blk(il, "hc_ffn_up.weight"),      true);
+        L.hc_ffn_inject  = b.take(blk(il, "hc_ffn_inject.weight"),  true);
+
+        if (full_attn) {
+            L.wq     = b.take(blk(il, "attn_q.weight"),      true);
+            L.wk     = b.take(blk(il, "attn_k.weight"),      true);
+            L.wv     = b.take(blk(il, "attn_v.weight"),      true);
+            L.wo     = b.take(blk(il, "attn_output.weight"), true);
+            L.q_norm = b.take(blk(il, "attn_q_norm.weight"), true);
+            L.k_norm = b.take(blk(il, "attn_k_norm.weight"), true);
+            L.indexer_q_proj = b.take(blk(il, "indexer.q_proj.weight"), true);
+            L.indexer_k_proj = b.take(blk(il, "indexer.k_proj.weight"), true);
+            L.indexer_q_norm = b.take(blk(il, "indexer.q_norm.weight"), true);
+            L.indexer_k_norm = b.take(blk(il, "indexer.k_norm.weight"), true);
+        } else {
+            L.wqkv        = b.take(blk(il, "attn_qkv.weight"),   true);
+            L.wqkv_gate   = b.take(blk(il, "attn_gate.weight"),  true);
+            L.ssm_conv1d  = b.take(blk(il, "ssm_conv1d.weight"), true);
+            L.ssm_alpha   = b.take(blk(il, "ssm_alpha.weight"),  true);
+            L.ssm_beta    = b.take(blk(il, "ssm_beta.weight"),   true);
+            L.ssm_a       = b.take(blk(il, "ssm_a"),             true);
+            L.ssm_dt_bias = b.take(blk(il, "ssm_dt.bias"),       true);
+            L.ssm_norm    = b.take(blk(il, "ssm_norm.weight"),   true);
+            L.ssm_out     = b.take(blk(il, "ssm_out.weight"),    true);
+        }
+
+        // MoE: 512 routed experts top-10, plus a shared expert whose scalar
+        // sigmoid gate qwen35moe already knows how to apply.
+        L.ffn_gate_inp       = b.take(blk(il, "ffn_gate_inp.weight"),       true);
+        L.ffn_gate_inp_shexp = b.take(blk(il, "ffn_gate_inp_shexp.weight"), false);
+        L.ffn_gate_exps      = b.take(blk(il, "ffn_gate_exps.weight"),      true);
+        L.ffn_up_exps        = b.take(blk(il, "ffn_up_exps.weight"),        true);
+        L.ffn_down_exps      = b.take(blk(il, "ffn_down_exps.weight"),      true);
+        L.ffn_gate_shexp     = b.take(blk(il, "ffn_gate_shexp.weight"),     false);
+        L.ffn_up_shexp       = b.take(blk(il, "ffn_up_shexp.weight"),       false);
+        L.ffn_down_shexp     = b.take(blk(il, "ffn_down_shexp.weight"),     false);
+
+        if (il == out.ple_layer) {
+            L.ple_key        = b.take(blk(il, "ple_key.weight"),        true);
+            L.ple_value      = b.take(blk(il, "ple_value.weight"),      true);
+            L.ple_conv1d     = b.take(blk(il, "ple_conv1d.weight"),     true);
+            L.ple_norm_key   = b.take(blk(il, "ple_norm_key.weight"),   true);
+            L.ple_norm_query = b.take(blk(il, "ple_norm_query.weight"), true);
+            L.ple_norm_conv  = b.take(blk(il, "ple_norm_conv.weight"),  true);
+        }
+    }
+
+    out.output_hc_norm = b.take("output_hc_norm.weight", true);
+    out.output_hc_down = b.take("output_hc_down.weight", true);
+    out.output_hc_up   = b.take("output_hc_up.weight",   true);
+    out.output         = b.take("output.weight",         true);
+
+    if (!b.ok) {
+        std::fprintf(stderr, "[qwen4exp] %s\n", err.c_str());
+        ggml_free(out.ctx);
+        out.ctx = nullptr;
+        return false;
+    }
+
+    // token_embd and per_layer_token_embd stay off the device: the first is
+    // read a row at a time by the embedder, and the second is tens of GiB of
+    // table touched a few kilobytes per token. Both are metadata only here.
+    GgufShardTensor tok, ple_tab;
+    std::string ignored;
+    if (shards.find("token_embd.weight", tok, ignored) && tok.meta) {
+        out.tok_embd = ggml_dup_tensor(out.ctx, tok.meta);
+        if (out.tok_embd) ggml_set_name(out.tok_embd, "token_embd.weight");
+    }
+    if (shards.find("per_layer_token_embd.weight", ple_tab, ignored) && ple_tab.meta) {
+        out.per_layer_token_embd = ggml_dup_tensor(out.ctx, ple_tab.meta);
+        if (out.per_layer_token_embd)
+            ggml_set_name(out.per_layer_token_embd, "per_layer_token_embd.weight");
+    }
+
+    // ── one buffer, one pass ──────────────────────────────────────────────
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
+    const size_t alignment = ggml_backend_buft_get_alignment(buft);
+    size_t total = 0;
+    std::vector<size_t> offsets;
+    offsets.reserve(bindings.size());
+    for (const Binding & bind : bindings) {
+        total = align_up_to(total, alignment);
+        offsets.push_back(total);
+        total += ggml_backend_buft_get_alloc_size(buft, bind.dst);
+    }
+
+    out.buf = ggml_backend_alloc_buffer(backend, total);
+    if (!out.buf) {
+        std::fprintf(stderr,
+            "[qwen4exp] weight buffer allocation failed, %.1f GiB requested\n",
+            (double) total / (1024.0 * 1024.0 * 1024.0));
+        ggml_free(out.ctx);
+        out.ctx = nullptr;
+        return false;
+    }
+    ggml_backend_buffer_set_usage(out.buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    char * base = static_cast<char *>(ggml_backend_buffer_get_base(out.buf));
+
+    for (size_t i = 0; i < bindings.size(); ++i) {
+        if (ggml_backend_tensor_alloc(out.buf, bindings[i].dst, base + offsets[i]) !=
+            GGML_STATUS_SUCCESS) {
+            std::fprintf(stderr, "[qwen4exp] tensor allocation failed for %s\n",
+                         ggml_get_name(bindings[i].dst));
+            ggml_backend_buffer_free(out.buf);
+            out.buf = nullptr;
+            ggml_free(out.ctx);
+            out.ctx = nullptr;
+            return false;
+        }
+    }
+    for (const Binding & bind : bindings) {
+        // find() already bounds-checked the source against its own shard.
+        shards.advise_willneed(bind.src);
+        ggml_backend_tensor_set(bind.dst, bind.src.data, 0, bind.src.size);
+    }
+
+    std::fprintf(stderr,
+        "[qwen4exp] loaded %zu tensors from %s, %.1f GiB on device\n",
+        bindings.size(), shards.describe().c_str(),
+        (double) total / (1024.0 * 1024.0 * 1024.0));
+    return true;
+}
+
 }  // namespace dflash::common

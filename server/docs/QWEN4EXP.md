@@ -145,11 +145,50 @@ tensors per layer, the four indexer tensors, the six PLE tensors, and the
 nullptr-initialised pointer or a scalar whose default (`n_hc = 1`) means "this
 model does not use hyper-connections", so the other backends are unaffected.
 
+## Stage 2b: bind and upload
+
+`load_qwen4exp_gguf()` walks the 48 layers, binds every tensor by name through
+the shard set, allocates one device buffer and uploads.
+
+Two design points worth stating. The metadata is **duplicated** into a context
+this loader owns rather than borrowed from the shard set: the set has one
+`ggml_context` per file and closes when the function returns, while
+`TargetWeights` owns exactly one. And `token_embd` and `per_layer_token_embd`
+are bound as metadata only, never uploaded -- the first is read a row at a time
+by the embedder and the second is tens of GiB of table touched a few kilobytes
+per token. That is what keeps the resident set at 62.3 GiB out of a 98.5 GiB
+model.
+
+Verified on a Radeon 8060S with the real model:
+
+```
+[qwen4exp] loaded 1222 tensors from 3 part(s), 98.5 GiB, 62.3 GiB on device
+[qwen4exp] layers=48  full-attn=12  delta-net=36  hc=48  indexer=12  ple=1
+[qwen4exp] experts=10/512  ff_exp=640  shared_gate=yes
+[qwen4exp] output head=bound  output_hc=bound  tok_embd=metadata  per_layer_embd=metadata
+[qwen4exp] readback of blk.0.ffn_gate_exps: 63/64 non-zero bytes -> data present
+```
+
+1222 of 1224 tensors bound (the two embedding tables are the exceptions), the
+layer counts match the schedule the metadata declares, and a readback from the
+device confirms real weights rather than zeros.
+
 ## Status
 
-Stages 0, 1 and 2a complete. Next: 2b, the tensor-binding half of the loader
-(find every tensor, upload it, fill `TargetLayer`), then the arch registration
-that makes `--model` accept the file.
+Stages 0, 1, 2a and 2b complete: the model loads. Next is the arch
+registration that makes `--model` accept the file through the normal factory
+path, and then stage 3, the hyper-connection layer builder -- the first state
+that produces a token.
+
+Two things to carry into the next stage:
+
+- `http_server.cpp` derives `speculative_supported` from
+  `arch.rfind("qwen", 0) == 0`, which `"qwen4exp"` matches. That line must be
+  changed, or `/props` will advertise speculative decode that the capability
+  row sets to `kNever`.
+- The 90-row difference between `sum(ple.head_vocab_sizes)` (320,001,446) and
+  `per_layer_token_embd.ne[1]` (320,001,536) is still unexplained. It does not
+  block loading, but PLE cannot be called correct until it is understood.
 
 Note for stage 2b: `http_server.cpp` derives `speculative_supported` from
 `arch.rfind("qwen", 0) == 0`, which `"qwen4exp"` matches. That line must be
