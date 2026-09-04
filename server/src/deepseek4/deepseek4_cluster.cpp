@@ -5,6 +5,7 @@
 // ggml_backend_cuda_get_stream (Agent A's ggml accessor).
 
 #include "deepseek4_cluster.h"
+#include "deepseek4_internal.h"
 
 #include "common/moe_hybrid_routing_stats.h"
 
@@ -367,11 +368,7 @@ bool ds4_cluster_init_experts(const std::string & model_path,
                               MoeHybridStorage & storage,
                               std::string * err) {
     std::string mix_what;
-    if (ds4_cluster_has_mix_experts(w, &mix_what)) {
-        set_err(err, mix_what + " experts need a materialized decode table per owner and "
-                     "are not supported with cluster expert sharding yet");
-        return false;
-    }
+    const bool has_mix = ds4_cluster_has_mix_experts(w, &mix_what);
     const MoeHybridConfig mcfg = ds4_cluster_moe_config(w);
     if (!rt.rank_placement.matches(mcfg)) {
         set_err(err, "rank placement does not match the loaded model dimensions");
@@ -406,6 +403,24 @@ bool ds4_cluster_init_experts(const std::string & model_path,
             return false;
         }
     }
+    // Adaptive (mixed ROCmFPX) experts keep their codebooks out of band and
+    // need a decode table registered per resident tensor. The shard's resident
+    // set is exactly its hot experts, and the registrar treats an absent cold
+    // owner as "nothing to register", so hot-only storage is enough.
+    if (has_mix) {
+        std::string why;
+        if (!register_deepseek4_moe_hybrid_mix_tables(model_path, w, storage, &why)) {
+            set_err(err, "cluster shard could not register decode tables for " +
+                         mix_what + " experts" + (why.empty() ? "" : ": " + why));
+            return false;
+        }
+    }
+    if (has_mix) {
+        std::fprintf(stderr,
+                     "[deepseek4-cluster] rank %d/%d registered %s decode tables for "
+                     "its resident experts\n", rt.rank(), rt.size(), mix_what.c_str());
+    }
+
     rt.resident_expert_bytes = bytes;
     const int total_experts = w.n_layer * w.n_expert;
     std::fprintf(stderr,
