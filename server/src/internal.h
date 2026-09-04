@@ -113,6 +113,37 @@ struct TargetLayer {
     ggml_tensor * ffn_down_exps      = nullptr;  // [n_ff_exp, hidden, n_expert]
     ggml_tensor * ffn_exp_probs_b    = nullptr;  // [n_expert] router correction bias
     ggml_tensor * ffn_gate_up_exps   = nullptr;  // [hidden, 2*n_ff_exp, n_expert] optional fused gate/up
+    // qwen4exp hyper-connections. Four residual streams of width n_embd are
+    // carried between blocks instead of one; hc_*_norm REPLACES attn_norm and
+    // ffn_norm, which this architecture does not have. The read-out is a
+    // low-rank pair (down [n_hc*n_embd, low_rank], up [low_rank, n_hc*n_embd])
+    // and the write-back is a per-stream scalar (inject [n_hc*n_embd, n_hc]).
+    ggml_tensor * hc_attn_norm   = nullptr;  // [n_hc * hidden]
+    ggml_tensor * hc_attn_down   = nullptr;  // [n_hc * hidden, low_rank]
+    ggml_tensor * hc_attn_up     = nullptr;  // [low_rank, n_hc * hidden]
+    ggml_tensor * hc_attn_inject = nullptr;  // [n_hc * hidden, n_hc]
+    ggml_tensor * hc_ffn_norm    = nullptr;
+    ggml_tensor * hc_ffn_down    = nullptr;
+    ggml_tensor * hc_ffn_up      = nullptr;
+    ggml_tensor * hc_ffn_inject  = nullptr;
+
+    // qwen4exp QSA indexer, present only on full-attention layers. Selects
+    // top_k keys before the attention proper.
+    ggml_tensor * indexer_q_proj = nullptr;  // [hidden, n_idx_head * idx_key_len]
+    ggml_tensor * indexer_k_proj = nullptr;  // [hidden, idx_key_len]
+    ggml_tensor * indexer_q_norm = nullptr;  // [idx_key_len]
+    ggml_tensor * indexer_k_norm = nullptr;  // [idx_key_len]
+
+    // qwen4exp PLE, present on the single layer named by ple.layers. A
+    // query/key/value retrieval over the hyper-connection state with its own
+    // norms and a causal conv carrying recurrent state.
+    ggml_tensor * ple_key        = nullptr;  // [hidden, n_hc * hidden]
+    ggml_tensor * ple_value      = nullptr;  // [hidden, hidden]
+    ggml_tensor * ple_conv1d     = nullptr;  // [kernel, n_hc * hidden]
+    ggml_tensor * ple_norm_key   = nullptr;  // [n_hc * hidden]
+    ggml_tensor * ple_norm_query = nullptr;  // [n_hc * hidden]
+    ggml_tensor * ple_norm_conv  = nullptr;  // [n_hc * hidden]
+
     ggml_tensor * ffn_gate_inp_shexp = nullptr;  // [hidden] shared-expert scalar gate
     ggml_tensor * ffn_gate_shexp     = nullptr;  // [hidden, n_ff_shexp]
     ggml_tensor * ffn_up_shexp       = nullptr;  // [hidden, n_ff_shexp]
@@ -231,6 +262,22 @@ struct TargetWeights {
     int kv_lora_rank            = 0;
     int q_lora_rank             = 0;
     float kda_gate_lower_bound  = 0.0f;
+    // qwen4exp hyper-connections and PLE. n_hc == 1 means the architecture
+    // does not use them, which is every other model in this tree.
+    int n_hc                    = 1;
+    int hc_low_rank             = 0;
+    int ple_layer               = -1;   // ple.layers[0]; -1 when absent
+    int ple_ngram_size          = 0;
+    int ple_conv_kernel         = 0;
+    int n_embd_per_layer_input  = 0;
+    int n_indexer_head          = 0;
+    int indexer_key_length      = 0;
+    int indexer_top_k           = 0;
+    ggml_tensor * per_layer_token_embd = nullptr;  // [n_embd_per_layer_input, huge]
+    ggml_tensor * output_hc_norm       = nullptr;  // [n_hc * hidden]
+    ggml_tensor * output_hc_down       = nullptr;  // [n_hc * hidden, low_rank]
+    ggml_tensor * output_hc_up         = nullptr;  // [low_rank, n_hc * hidden]
+
     int ssm_d_conv              = 4;
     int ssm_d_inner             = 6144;
     int ssm_d_state             = 128;

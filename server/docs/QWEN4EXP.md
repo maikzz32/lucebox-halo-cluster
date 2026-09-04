@@ -105,7 +105,53 @@ absent-tensor probe: rejected as expected
 dump. The probe list in the harness is the full per-layer tensor inventory, so
 resolving 1224 of 1224 also confirms the inventory itself.
 
+## Stage 2a: hyperparameters, validated against the weights
+
+`server/src/qwen4exp/qwen4exp_internal.h` and `qwen4exp_loader.cpp`.
+`read_qwen4exp_hparams()` reads all 21 `qwen4exp.*` keys and then checks each
+derived scalar against an `ne` the file itself carries.
+
+This validation is the point of the stage, not decoration. There is no
+reference implementation of this architecture in the tree, so a loader that
+mis-reads one dimension produces a model that loads, runs, and is quietly
+wrong -- the failure mode with no cheap detector. Every equation names both
+numbers when it fails.
+
+Verified against the real model:
+
+```
+layers=48  n_embd=2560  heads=24/2  head_dim=256/256
+experts=10/512  ff_exp=640  ff_shexp=640
+ssm: conv=4 state=128 groups=16 dt_rank=48 inner=6144  (conv_ch=10240)
+hc: count=4 low_rank=320   full_attn_interval=4
+rope: dims=64 sections=[11,11,10,0] theta=10000000  rms_eps=1e-06
+indexer: heads=4 key_len=128 top_k=2048
+ple: layer=1 ngram=3 conv=4 per_layer_input=160
+ALL SHAPE EQUATIONS PASSED
+```
+
+Negative control: forcing `n_hc = 3` yields "the metadata implies 7680 but the
+file's tensor says 10240", i.e. rejection rather than silent acceptance.
+
+The per-layer schedule is checked too: for all 48 layers, a layer carries
+`attn_q` exactly when `(il + 1) % full_attention_interval == 0` and `attn_qkv`
+otherwise. A graph that built the wrong block kind for a layer would be caught
+here rather than in the numerics.
+
+`TargetLayer` and `TargetWeights` (`server/src/internal.h`) gained the fields
+this architecture needs and no other model has: the eight hyper-connection
+tensors per layer, the four indexer tensors, the six PLE tensors, and the
+`n_hc` / `hc_low_rank` / indexer / PLE scalars. Every addition is a
+nullptr-initialised pointer or a scalar whose default (`n_hc = 1`) means "this
+model does not use hyper-connections", so the other backends are unaffected.
+
 ## Status
 
-Stages 0 and 1 complete. Next: the loader and the arch registration (stage 2),
-which is the first state that accepts `--model`.
+Stages 0, 1 and 2a complete. Next: 2b, the tensor-binding half of the loader
+(find every tensor, upload it, fill `TargetLayer`), then the arch registration
+that makes `--model` accept the file.
+
+Note for stage 2b: `http_server.cpp` derives `speculative_supported` from
+`arch.rfind("qwen", 0) == 0`, which `"qwen4exp"` matches. That line must be
+changed, or `/props` will advertise speculative decode that the capability row
+sets to `kNever`.
