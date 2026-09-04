@@ -260,3 +260,68 @@ Note for stage 2b: `http_server.cpp` derives `speculative_supported` from
 `arch.rfind("qwen", 0) == 0`, which `"qwen4exp"` matches. That line must be
 changed, or `/props` will advertise speculative decode that the capability row
 sets to `kNever`.
+
+
+## Stage 4: PLE — the specification, extracted
+
+PLE is the one piece whose semantics cannot be recovered from tensor shapes,
+and it is what stands between the current output and correct text. The
+reference is `src/models/qwen4exp.cpp` in upstream llama.cpp. Recorded here so
+the implementation has something to be checked against.
+
+### The row indices are an n-gram hash, computed on the host
+
+`ple_n_heads = (ngram_size - 1) * heads_per_ngram` = (3-1)*8 = **16**, which is
+exactly the count of `head_vocab_sizes` and `head_offsets`. For each token:
+
+```
+ctx[0] = token[i]
+cut = false
+for s in 1 .. n_gram-1:
+    t   = predecessor s positions back      # from the KV cells; missing reads as EOS
+    cut = cut or t < 0 or t == eos          # an EOS resets everything at or before it
+    ctx[s] = cut ? eos : t
+
+for n in 2 .. n_gram:
+    mixed = ctx[0] * layer_multipliers[0]
+    for j in 1 .. n-1:
+        mixed ^= ctx[j] * layer_multipliers[j]
+    base = (n-2) * heads_per_ngram
+    for g in 0 .. heads_per_ngram-1:
+        h = base + g
+        idx[i*16 + h] = mixed % head_vocab_sizes[h] + head_offsets[h]
+```
+
+The token's own EOS does not cut its own context. Tokens shared by several
+sequences are rejected outright, because their predecessors would be
+ambiguous.
+
+### The graph
+
+```
+emb    = get_rows(per_layer_token_embd, idx)      # [160, 16*T] -> [2560, T]
+key    = ple_key   * emb                          # [n_hc*n_embd, T]
+value  = ple_value * emb                          # [n_embd, T]
+key    = grouped_norm(key,    ple_norm_key)       # rms over ONE stream, flat gamma
+query  = grouped_norm(hidden, ple_norm_query)
+s      = sum_rows(key * query) / sqrt(n_embd)     # per-stream dot product
+gate   = sigmoid(sgn(s) * sqrt(clamp(|s|, 1e-6, inf)))     # signed square root
+gated  = repeat(value, n_hc) * gate
+conv   = silu(depthwise_causal_conv(grouped_norm(gated, ple_norm_conv)))
+return hidden + gated + conv
+```
+
+The convolution is dilated by the n-gram size, kernel 4, and carries
+`(kernel-1) * ngram_size * n_hc * n_embd` = 3*3*4*2560 = **92,160 floats
+(360 KiB) of recurrent state per sequence**. The reference builds it as a sum
+of shifted copies rather than `ggml_conv_1d_dw`, which it documents as
+unreliable.
+
+### One adaptation this hardware wants
+
+Upstream keeps `per_layer_token_embd` resident and calls `ggml_get_rows` on it.
+Here that is 35.8 GiB on top of the 62.3 GiB of weights, on a 124 GiB box.
+But the gather reads 16 rows of 160 values per token -- about 10 KB -- so
+doing it on the host and uploading the result as a graph input keeps 35.8 GiB
+off the device and costs nothing in bandwidth. That is the same trade the
+`CpuEmbedder` already makes for `token_embd`.
