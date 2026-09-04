@@ -1875,7 +1875,20 @@ static ggml_tensor * build_mla_attention(
     }
 
     ggml_tensor * index_comp_kv_source = lc.index_comp_kv;
-    if (ratio == 4 && L.indexer_compressor_kv) {
+    // The indexer compressor's only consumer, build_indexer_topk below, is
+    // gated on SparseFlash with f32 array inputs; the fused verify graph
+    // passes neither, so on every ratio-4 layer of a decode step this
+    // maintains a buffer nothing in that graph reads.
+    //
+    // DFLASH_DS4_SKIP_DEAD_INDEXER=1 skips it in exactly that case. It is
+    // opt-in and NOT safe in general: build_indexer_topk asserts that the two
+    // compressed caches advance together, so a prefill that resumes a prefix
+    // slot after such a decode would trip that assert -- see the guard below.
+    const bool indexer_consumer_live =
+        attention_impl == DeepSeek4AttentionImpl::SparseFlash && f32_array_inputs;
+    static const bool skip_dead_indexer = ds4_env_flag("DFLASH_DS4_SKIP_DEAD_INDEXER");
+    if (ratio == 4 && L.indexer_compressor_kv &&
+        !(skip_dead_indexer && !indexer_consumer_live)) {
         build_indexer_compressor_step(ctx, gf, cur_last, w, L, lc, token_pos,
                                       cached_inputs ? cached_inputs->index_ape_row : nullptr,
                                       cached_inputs ? cached_inputs->index_state_rows : nullptr,
