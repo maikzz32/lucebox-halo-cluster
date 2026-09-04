@@ -2419,14 +2419,23 @@ static ggml_tensor * build_mla_attention(
     // out_a_3d: [group_dim, n_lora_o, n_out_group] — ne[2] matches
     ggml_tensor * attn_low = ggml_mul_mat(ctx, out_a_3d, attn_out);
     // attn_low: [n_lora_o, n_tokens, n_out_group]
-    if (head_parallel) {
-        // The second projection stage contracts over ALL groups at once, and
-        // its weight cannot be sliced along that axis without a strided view
-        // of every row. So put this rank's groups back at their own offset and
-        // zero the rest: the foreign groups then contribute nothing, and
-        // summing the ranks' results reproduces the full contraction. The
-        // padding is [n_lora_o, n_tokens, groups] - 16 KiB per layer at
-        // n_tokens = 1, against the 33.5 M weights this avoids re-slicing.
+    // The second projection stage contracts over all groups at once. Zero-
+    // padding this rank's groups back to full width is correct but reads all
+    // 33.5 M weights on every rank, which is why head parallelism used to buy
+    // almost nothing: two of the three big dense matrices were sharded and
+    // this one was not. Slice the weight instead. attn_low is group-major over
+    // ne[0] (n_lora_o is the fast axis), so a contiguous group range is a
+    // contiguous row range, and the offset is a multiple of n_lora_o - block
+    // aligned for the quant types in play. The dmix registry keys a slice by
+    // (p - base)/nb02, and a 2-D weight has nb02 == ggml_nbytes, so the view
+    // still resolves to slice 0 - the one codebook this tensor carries.
+    //
+    // Each rank then holds a partial contraction over its own groups, exactly
+    // as the padded form did, and the attention all-reduce sums them.
+    ggml_tensor * out_b_w = L.attn_output_b;
+    const bool shard_out_b =
+        head_parallel && !ds4_env_flag("DFLASH_CLUSTER_NO_OUTPUT_B_SHARD");
+    if (head_parallel && !shard_out_b) {
         ggml_tensor * zeros = ggml_scale(ctx, attn_low, 0.0f);
         ggml_tensor * padded = nullptr;
         for (int g = 0; g < n_out_group_all; g += n_out_group) {
@@ -2434,8 +2443,16 @@ static ggml_tensor * build_mla_attention(
             padded = padded ? ggml_concat(ctx, padded, piece, 2) : piece;
         }
         attn_low = padded;
+    } else if (shard_out_b) {
+        out_b_w = ggml_view_2d(
+            ctx, L.attn_output_b,
+            (int64_t) n_lora_o * n_out_group, L.attn_output_b->ne[1],
+            L.attn_output_b->nb[1],
+            ggml_row_size(L.attn_output_b->type,
+                          (size_t) group_first * n_lora_o));
     }
-    const int n_out_group_proj = head_parallel ? n_out_group_all : n_out_group;
+    const int n_out_group_proj =
+        (head_parallel && !shard_out_b) ? n_out_group_all : n_out_group;
     ggml_tensor * out = nullptr;
     const bool grouped_output_projection =
         n_tokens > 1 &&
@@ -2443,7 +2460,7 @@ static ggml_tensor * build_mla_attention(
     if (grouped_output_projection) {
         // Batched ROCmFPX MMQ consumes src1's channel stride directly. This
         // avoids materializing both permutations (~256 MiB/layer at 2K).
-        out = ggml_mul_mat_grouped_src(ctx, L.attn_output_b, attn_low);
+        out = ggml_mul_mat_grouped_src(ctx, out_b_w, attn_low);
     } else {
         // Preserve the established single-token graph and provide an exact
         // fallback for heterogeneous runtimes that cannot retain grouped-view
@@ -2453,7 +2470,7 @@ static ggml_tensor * build_mla_attention(
         attn_low = ggml_cont(ctx, ggml_permute(ctx, attn_low, 0, 2, 1, 3));
         attn_low = ggml_reshape_2d(
             ctx, attn_low, n_lora_o * n_out_group_proj, n_tokens);
-        out = ggml_mul_mat(ctx, L.attn_output_b, attn_low);
+        out = ggml_mul_mat(ctx, out_b_w, attn_low);
     }
 
     return out;
