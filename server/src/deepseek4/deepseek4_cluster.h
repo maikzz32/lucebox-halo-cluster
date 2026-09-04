@@ -168,6 +168,12 @@ ggml_tensor * ds4_cluster_allreduce_node(ggml_context * ctx,
 // per-expert owner LUT cannot express, so they fall back to path 3a.
 bool ds4_cluster_fused_graph_available(const Ds4ClusterRuntime * rt);
 
+// DFLASH_CLUSTER_ALLREDUCE_NOOP=1: the in-graph all-reduce returns without
+// calling RCCL. The output is WRONG (every rank keeps its own partial sum);
+// this exists so a run can be timed with and without the collective to see
+// what it actually costs in a step. Cached after the first call.
+bool ds4_cluster_env_allreduce_noop();
+
 // Path 3b (default). DFLASH_CLUSTER_NO_INGRAPH_ALLREDUCE=1 falls back to the
 // host-enqueued per-layer all-reduce of path 3a, which also gives up the
 // fused whole-model graph. Cached after the first call.

@@ -3888,6 +3888,18 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
 }
 
 #ifdef USE_CUDA_GRAPH
+
+// DFLASH_CLUSTER_GRAPH_CAPTURE=1: allow HIP graph capture of a graph that
+// contains a cluster collective. Off by default until a run proves the
+// captured replay is bit-identical to the eager one on this RCCL build.
+static bool ggml_cuda_cluster_capture_allowed() {
+    static const bool allowed = [] {
+        const char * v = getenv("DFLASH_CLUSTER_GRAPH_CAPTURE");
+        return v && v[0] && strcmp(v, "0") != 0;
+    }();
+    return allowed;
+}
+
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
@@ -3913,11 +3925,16 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
         // A cluster all-reduce node calls into a collective library on this
         // stream. Whether such a collective may be captured into a graph and
-        // replayed is runtime- and library-specific, and it is unverified on
-        // gfx1151/RCCL, so a graph containing one is executed eagerly. This
-        // costs nothing for non-cluster builds: no such node exists there.
+        // replayed is runtime- and library-specific. Blocking capture is the
+        // safe default, but it costs the WHOLE forward its graph: one such
+        // node per MoE layer makes a 43-layer decode step launch every kernel
+        // eagerly, and that step is launch-bound. DFLASH_CLUSTER_GRAPH_CAPTURE=1
+        // allows capture so the two can be compared; the environment read is
+        // cached and costs nothing for non-cluster builds, where no such node
+        // exists in the first place.
         if (node->op == GGML_OP_MOE_FUSED &&
-            ggml_get_op_params_i32(node, 0) == GGML_MOE_FUSED_CLUSTER_ALLREDUCE) {
+            ggml_get_op_params_i32(node, 0) == GGML_MOE_FUSED_CLUSTER_ALLREDUCE &&
+            !ggml_cuda_cluster_capture_allowed()) {
             use_cuda_graph = false;
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: disabling CUDA graphs due to a cluster all-reduce node\n", __func__);

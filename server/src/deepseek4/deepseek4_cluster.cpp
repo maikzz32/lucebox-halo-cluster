@@ -436,6 +436,22 @@ bool ds4_cluster_fused_graph_available(const Ds4ClusterRuntime * rt) {
     return true;
 }
 
+bool ds4_cluster_env_allreduce_noop() {
+    static const bool enabled = [] {
+        const char * v = std::getenv("DFLASH_CLUSTER_ALLREDUCE_NOOP");
+        const bool on = v && v[0] && std::strcmp(v, "0") != 0;
+        if (on) {
+            std::fprintf(stderr,
+                         "[deepseek4-cluster] DFLASH_CLUSTER_ALLREDUCE_NOOP=1: the in-graph "
+                         "all-reduce does nothing. OUTPUT IS WRONG (each rank keeps its own "
+                         "partial sum); this exists only to measure what the collective costs "
+                         "in a step\n");
+        }
+        return on;
+    }();
+    return enabled;
+}
+
 bool ds4_cluster_env_prefill_single_token() {
     static const bool enabled = [] {
         const char * v = std::getenv("DFLASH_CLUSTER_PREFILL_SINGLE_TOKEN");
@@ -476,6 +492,7 @@ static void ds4_cluster_allreduce_graph_callback(void * user, void * data,
                                                  size_t n, void * stream) {
     Ds4ClusterRuntime * rt = static_cast<Ds4ClusterRuntime *>(user);
     if (!rt || !rt->comm || rt->comm->size() <= 1 || n == 0 || !data) return;
+    if (ds4_cluster_env_allreduce_noop()) return;   // measurement probe, wrong output
     std::string err;
     if (!rt->comm->allreduce_sum_f32(data, n, (cluster::DeviceStream) stream, &err)) {
         // Keep the first failure: the rest of the graph still runs, and the

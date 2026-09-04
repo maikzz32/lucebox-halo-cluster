@@ -504,6 +504,41 @@ The all-reduce is not the prefill bottleneck: 535 ms of 7.6 s at 1517 tokens,
 (29.2 s) dominate, and attention is replicated on every rank, so long-context
 prefill cannot gain much from more ranks.
 
+## Where a decode step actually goes (measured 2026-09-04)
+
+Two diagnostics were added to answer this with numbers instead of reasoning:
+
+* `DFLASH_CLUSTER_ALLREDUCE_NOOP=1` — the in-graph all-reduce returns without
+  calling RCCL. **The output is wrong** (each rank keeps its own partial); the
+  point is to time a run with and without the collective.
+* `DFLASH_CLUSTER_GRAPH_CAPTURE=1` — allow HIP graph capture of a graph that
+  contains a cluster collective. Off by default.
+
+**The collectives are not the bottleneck.** AR decode, two nodes, same prompt:
+45.5 ms per step with the collective disabled against 48.2 ms with it. That is
+**2.7 ms for all 43 collectives, under 6 % of the step** — 63 us each, matching
+the 73 us the RCCL selftest measures at 64 KiB. Every idea that makes the
+message cheaper (bf16, reduce-scatter/all-gather, RCCL protocol tuning) is
+therefore optimizing under 6 % of a decode step, and bf16 additionally risks
+the numerics that already produced a wrong early EOS in prefill.
+
+**HIP graph capture works and is bit-exact, and it is slower.** With capture
+allowed the completion stays byte-identical to the reference — so RCCL
+collectives *can* be captured and replayed on this stack, which the code
+previously only called "unverified". But the DS4 fused graph has **5445 nodes**,
+`GGML_CUDA_GRAPH_STATS=1` shows 23 replays per 25 forwards (so this is not
+capture churn), and throughput drops: AR decode 21.5 -> **19.15 tok/s**, DSpark
+29.45 -> **26.65 tok/s**. Replaying a 5.4k-node graph containing collectives
+costs more on this runtime than launching it eagerly. The switch stays off and
+stays in the tree, because "graphs are disabled, that must be the problem" is
+the first thing anyone will think when reading this code.
+
+**What is left is the replicated work.** Only the routed experts are sharded.
+Attention, the indexer, HC, embeddings, lm_head and the shared expert run in
+full on every rank. On a single node attention is 1326 ms of a 3607 ms decode
+(37 %) and the FFN 1311 ms; sharding halves only the second half. That is the
+structural ceiling of the current design, and it is why four nodes do not pay.
+
 ## Prefix cache across ranks (M4)
 
 Until protocol 2 a cluster run had to pass `--prefix-cache-slots 0`, so every
