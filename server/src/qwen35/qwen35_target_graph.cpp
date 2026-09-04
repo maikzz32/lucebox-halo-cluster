@@ -2313,6 +2313,14 @@ static ggml_tensor * build_single_layer(
     return cur;
 }
 
+// fwd: build_qwen4exp_layer is defined below, beside build_qwen35_layer.
+ggml_tensor * build_qwen4exp_layer(
+    ggml_context * ctx, ggml_cgraph * gf, const TargetWeights & w,
+    TargetCache & cache, int layer_idx, ggml_tensor ** hc_state,
+    ggml_tensor * positions, ggml_tensor * attn_mask, int kv_start,
+    int n_tokens, int fa_window, ggml_tensor * kv_write_rows,
+    ggml_tensor * parent_ids);
+
 QwenGraphOutputs build_qwen35_graph(
     ggml_context *         ctx,
     ggml_cgraph *          gf,
@@ -2355,7 +2363,25 @@ QwenGraphOutputs build_qwen35_graph(
         capture_slices.assign((size_t)N_CAPTURE, nullptr);
     }
 
+    // qwen4exp carries n_hc parallel residual streams instead of one, and has
+    // no layer norms: the mixer that reads a stream out is the norm. The
+    // carrier starts as n_hc identical copies of the embedding. n_hc is 1 for
+    // every other architecture, so nothing below changes for them.
+    const bool hyper_connected = w.n_hc > 1;
+    ggml_tensor * hc_state = nullptr;
+    if (hyper_connected) {
+        hc_state = qwen4exp_hc_init(ctx, graph_tensor_f32(ctx, inpL),
+                                    w.n_embd, w.n_hc);
+    }
+
     for (int il = 0; il < w.n_layer; il++) {
+        if (hyper_connected) {
+            build_qwen4exp_layer(ctx, gf, w, cache, il, &hc_state,
+                                 in.positions, in.attn_mask, in.kv_start,
+                                 n_tokens, in.fa_window, in.kv_write_rows,
+                                 in.parent_ids);
+            continue;
+        }
         const TargetLayer & L = w.layers[il];
         const bool is_attn = (((il + 1) % w.full_attention_interval) == 0);
 
@@ -2597,8 +2623,14 @@ QwenGraphOutputs build_qwen35_graph(
         }
     }
 
-    // 2. Final norm
-    ggml_tensor * out = rms_norm_mul(ctx, inpL, w.out_norm, w.rms_eps);
+    // 2. Final norm. For a hyper-connected model the final mixer IS the output
+    //    norm -- there is no separate one, and w.out_norm is null. It takes no
+    //    inject weights because there is no block left to write back into.
+    ggml_tensor * out = hyper_connected
+        ? qwen4exp_hc_mix(ctx, hc_state, w.output_hc_norm, w.output_hc_down,
+                          w.output_hc_up, nullptr, nullptr,
+                          w.n_embd, w.n_hc, w.rms_eps)
+        : rms_norm_mul(ctx, inpL, w.out_norm, w.rms_eps);
 
     // 3. LM head — optionally only for sampled rows (prefill computes just
     //    the last row; fused steps the decode rows plus committing prompts'

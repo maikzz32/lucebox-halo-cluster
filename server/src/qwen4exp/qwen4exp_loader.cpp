@@ -1,6 +1,7 @@
 #include "qwen4exp/qwen4exp_internal.h"
 
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -413,10 +414,26 @@ bool load_qwen4exp_gguf(const std::string & path,
     // table touched a few kilobytes per token. Both are metadata only here.
     GgufShardTensor tok, ple_tab;
     std::string ignored;
-    if (shards.find("token_embd.weight", tok, ignored) && tok.meta) {
-        out.tok_embd = ggml_dup_tensor(out.ctx, tok.meta);
-        if (out.tok_embd) ggml_set_name(out.tok_embd, "token_embd.weight");
+    if (!shards.find("token_embd.weight", tok, err) || !tok.meta) {
+        std::fprintf(stderr, "[qwen4exp] token_embd.weight: %s\n", err.c_str());
+        ggml_free(out.ctx);
+        out.ctx = nullptr;
+        return false;
     }
+    out.tok_embd = ggml_dup_tensor(out.ctx, tok.meta);
+    if (out.tok_embd) ggml_set_name(out.tok_embd, "token_embd.weight");
+    out.n_vocab = (int) tok.meta->ne[1];
+
+    // The embedder owns its copy: the shard set's mappings close when this
+    // function returns, and a row lookup that read through a dangling mmap
+    // would fault at the first token rather than at load.
+    out.embedder.tok_embd_owned.resize(tok.size);
+    std::memcpy(out.embedder.tok_embd_owned.data(), tok.data, tok.size);
+    out.embedder.tok_embd_bytes = out.embedder.tok_embd_owned.data();
+    out.embedder.tok_embd_type  = tok.meta->type;
+    out.embedder.n_embd         = out.n_embd;
+    out.embedder.n_vocab        = out.n_vocab;
+    out.embedder.row_bytes      = tok.size / (size_t) out.n_vocab;
     if (shards.find("per_layer_token_embd.weight", ple_tab, ignored) && ple_tab.meta) {
         out.per_layer_token_embd = ggml_dup_tensor(out.ctx, ple_tab.meta);
         if (out.per_layer_token_embd)
