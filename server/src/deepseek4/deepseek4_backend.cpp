@@ -1101,6 +1101,7 @@ bool DeepSeek4Backend::init() {
     // The per-layer forward reads the cluster runtime through the cache it
     // already receives; nullptr keeps every upstream path byte-identical.
     cache_.cluster_rt = cluster_.get();
+    ds4_set_draft_cluster_runtime(cluster_.get());
 
     if (env_flag_enabled("DFLASH_DS4_MOE_TP") && !init_moe_tensor_parallel()) {
         return false;
@@ -1716,6 +1717,7 @@ bool DeepSeek4Backend::set_cluster(const cluster::ClusterConfig * cfg,
         }
         cluster_.reset();
         cache_.cluster_rt = nullptr;
+        ds4_set_draft_cluster_runtime(nullptr);
         return true;
     }
     if (comm && (comm->size() != cfg->size || comm->rank() != cfg->rank)) {
@@ -1745,6 +1747,7 @@ bool DeepSeek4Backend::set_cluster(const cluster::ClusterConfig * cfg,
         if (comm) cluster_->comm = comm;
         cluster_->trace = cluster::cluster_env_trace();
         cache_.cluster_rt = cluster_.get();
+        ds4_set_draft_cluster_runtime(cluster_.get());
         return true;
     }
 
@@ -1780,6 +1783,7 @@ bool DeepSeek4Backend::set_cluster(const cluster::ClusterConfig * cfg,
         return false;
     }
     cache_.cluster_rt = cluster_.get();
+    ds4_set_draft_cluster_runtime(cluster_.get());
     return true;
 }
 
@@ -1973,6 +1977,7 @@ bool DeepSeek4Backend::unpark(ParkTarget target) {
     }
     cache_.prefill_mode = cfg_.prefill_mode;
     cache_.cluster_rt = cluster_.get();
+    ds4_set_draft_cluster_runtime(cluster_.get());
     return true;
 }
 
@@ -2981,6 +2986,7 @@ void DeepSeek4Backend::shutdown() {
     routing_stats_.reset();
     routing_stats_out_path_.clear();
     cache_.cluster_rt = nullptr;
+    ds4_set_draft_cluster_runtime(nullptr);
     if (cluster_) {
         cluster_->free_scratch();  // device scratch belongs to backend_, freed below
     }

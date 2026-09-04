@@ -240,12 +240,24 @@ static ggml_tensor * build_shared_ffn(ggml_context * ctx,
                                        ggml_tensor * cur,
                                        const DeepSeek4Weights & w,
                                        const DeepSeek4Layer & L);
+// Split of the routed experts across cluster ranks, used by the DSpark draft
+// graph. Unlike the target, the drafter keeps every expert resident on every
+// rank -- it is only 10.6 GB -- so this splits the compute, not the storage:
+// each rank evaluates its own routes and the partial sums are reduced before
+// the replicated shared expert is added.
+struct Ds4MoeShardSpec {
+    Ds4ClusterRuntime * rt = nullptr;
+    ggml_tensor * remap_lut = nullptr;  // I32: this rank's global id, else -1
+    ggml_tensor * valid_lut = nullptr;  // F32: 1.0 for own routes, else 0.0
+};
+
 static ggml_tensor * build_moe_ffn(ggml_context * ctx,
                                     ggml_tensor * cur,
                                     const DeepSeek4Weights & w,
                                     const DeepSeek4Layer & L,
                                     int layer_idx,
-                                    int n_tokens);
+                                    int n_tokens,
+                                    const Ds4MoeShardSpec * shard = nullptr);
 
 struct DeepSeek4CachedDecodeFfnGraph {
     const ggml_context * owner_ctx = nullptr;
@@ -3416,7 +3428,8 @@ static ggml_tensor * build_moe_ffn(
         const DeepSeek4Weights & w,
         const DeepSeek4Layer & L,
         int layer_idx,
-        int n_tokens) {
+        int n_tokens,
+        const Ds4MoeShardSpec * shard) {
 
     const int n_embd = w.n_embd;
     int n_used = w.n_expert_used;
@@ -3429,22 +3442,43 @@ static ggml_tensor * build_moe_ffn(
     } else {
         Ds4MoeRouting routing = build_moe_routing(ctx, cur, w, L, n_tokens);
         n_used = (int) routing.selected->ne[0];
+        ggml_tensor * route_ids = routing.selected;
+        ggml_tensor * route_w   = routing.weights;
+        const bool sharded = shard && shard->rt && shard->remap_lut && shard->valid_lut;
+        if (sharded) {
+            // mul_mat_id skips negative ids (see mmid.cu), which leaves a
+            // foreign route's output slot untouched rather than zeroed, so the
+            // route weight has to be zeroed too or that slot would enter the
+            // sum. Look the mask up with the ORIGINAL ids: the remapped ones
+            // carry -1 and would index nothing.
+            ggml_tensor * valid = ggml_get_rows(ctx, shard->valid_lut, route_ids);
+            route_w = ggml_mul(
+                ctx, route_w, ggml_reshape_2d(ctx, valid, n_used, n_tokens));
+            ggml_tensor * mapped = ggml_get_rows(ctx, shard->remap_lut, route_ids);
+            route_ids = ggml_cont(
+                ctx, ggml_reshape_2d(ctx, mapped, n_used, n_tokens));
+        }
         ggml_tensor * cur_3d = ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens);
-        ggml_tensor * gate_e = ggml_mul_mat_id(ctx, L.ffn_gate_exps, cur_3d, routing.selected);
-        ggml_tensor * up_e = ggml_mul_mat_id(ctx, L.ffn_up_exps, cur_3d, routing.selected);
+        ggml_tensor * gate_e = ggml_mul_mat_id(ctx, L.ffn_gate_exps, cur_3d, route_ids);
+        ggml_tensor * up_e = ggml_mul_mat_id(ctx, L.ffn_up_exps, cur_3d, route_ids);
 
         gate_e = ggml_reshape_3d(ctx, gate_e, n_ff_exp, n_used, n_tokens);
         up_e = ggml_reshape_3d(ctx, up_e, n_ff_exp, n_used, n_tokens);
         ggml_tensor * mid_e = build_clamped_swiglu(ctx, gate_e, up_e, w.swiglu_clamp_exp);
 
-        ggml_tensor * down_e = ggml_mul_mat_id(ctx, L.ffn_down_exps, mid_e, routing.selected);
+        ggml_tensor * down_e = ggml_mul_mat_id(ctx, L.ffn_down_exps, mid_e, route_ids);
         down_e = ggml_reshape_3d(ctx, down_e, n_embd, n_used, n_tokens);
 
-        ggml_tensor * weights_3d = ggml_reshape_3d(ctx, routing.weights, 1, n_used, n_tokens);
+        ggml_tensor * weights_3d = ggml_reshape_3d(ctx, route_w, 1, n_used, n_tokens);
         routed_out = ggml_mul(ctx, down_e, weights_3d);
         routed_out = ggml_cont(ctx, ggml_permute(ctx, routed_out, 1, 0, 2, 3));
         routed_out = ggml_sum_rows(ctx, routed_out);
         routed_out = ggml_reshape_2d(ctx, routed_out, n_embd, n_tokens);
+        if (sharded) {
+            // Reduce the routed partial sums only. The shared expert is
+            // replicated and is added afterwards, so it is counted once.
+            routed_out = ds4_cluster_allreduce_node(ctx, routed_out, *shard->rt);
+        }
     }
 
     return ggml_add(ctx, shared_out, routed_out);
@@ -9672,9 +9706,30 @@ struct DsparkDraftCache {
     // HC scales are immutable weights: read from the backend once.
     std::vector<std::array<float, 3>> s_attn, s_ffn;
     float s_out = 0.0f;
+    // Expert-sharded draft (opt-in): masks and the runtime the graph was
+    // built for, so a change of either rebuilds rather than reuses.
+    ggml_tensor * moe_remap_lut = nullptr;
+    ggml_tensor * moe_valid_lut = nullptr;
+    const void * shard_rt = nullptr;
 };
 
 thread_local DsparkDraftCache g_dspark_draft_cache;
+
+// Cluster runtime for the DSpark draft graph. A file static rather than a
+// parameter because the three draft entry points are public API and DS4 runs
+// one stream per process -- the same assumption g_dspark_draft_cache makes.
+static Ds4ClusterRuntime * g_draft_cluster_rt = nullptr;
+
+// DFLASH_CLUSTER_SHARD_DRAFTER=1 splits the drafter's routed experts across
+// the ranks. Opt-in: every rank already runs the draft forward in lockstep and
+// discards its own tokens for rank 0's broadcast, so this needs no protocol
+// change -- but it does change the drafter's arithmetic, and the acceptance
+// rate it feeds is worth more than the milliseconds it saves. Measure both.
+static Ds4ClusterRuntime * ds4_draft_shard_runtime() {
+    static const bool enabled = ds4_env_flag("DFLASH_CLUSTER_SHARD_DRAFTER");
+    if (!enabled || !g_draft_cluster_rt) return nullptr;
+    return g_draft_cluster_rt->size() > 1 ? g_draft_cluster_rt : nullptr;
+}
 
 }  // namespace
 
@@ -9739,6 +9794,7 @@ static bool deepseek4_dspark_draft_forward_impl(
 
     DsparkDraftCache & C = g_dspark_draft_cache;
     const bool DS4_DBG = std::getenv("DFLASH_DS4_DSPARK_DEBUG") != nullptr;
+    Ds4ClusterRuntime * const draft_rt = ds4_draft_shard_runtime();
 
     // Context reuse is deliberately strict: never submit a graph with an
     // uninitialized or differently-shaped context tensor.  The normal warm
@@ -9748,6 +9804,7 @@ static bool deepseek4_dspark_draft_forward_impl(
          C.valid_ctx_len != valid_ctx_len || C.block != block ||
          C.fixed_context != fixed_context ||
          C.context_kv_cache != context_kv_cache ||
+         C.shard_rt != (const void *) draft_rt ||
          C.drafter != (const void *) &d || C.backend != backend)) {
         return false;
     }
@@ -9768,6 +9825,7 @@ static bool deepseek4_dspark_draft_forward_impl(
     if (!C.ctx || C.ctx_len != graph_ctx_len || C.block != block ||
         C.fixed_context != fixed_context ||
         C.context_kv_cache != context_kv_cache ||
+        C.shard_rt != (const void *) draft_rt ||
         C.drafter != (const void *) &d || C.backend != backend) {
         // ── (Re)build the graph ─────────────────────────────────────────
         if (C.backend != backend && C.alloc) {
@@ -9822,6 +9880,28 @@ static bool deepseek4_dspark_draft_forward_impl(
         C.attn_mask = ggml_new_tensor_1d(
             ctx, GGML_TYPE_F32, graph_ctx_len + block);
         ggml_set_input(C.attn_mask);
+
+        // Owner masks for the sharded draft. Marked as outputs as well so the
+        // allocator keeps them alive from graph start: they are read late, in
+        // every layer's FFN, and activation scratch must not reuse them.
+        C.moe_remap_lut = nullptr;
+        C.moe_valid_lut = nullptr;
+        if (draft_rt && w.n_expert > 0) {
+            C.moe_remap_lut = ggml_new_tensor_4d(
+                ctx, GGML_TYPE_I32, 1, w.n_expert, block, 1);
+            ggml_set_input(C.moe_remap_lut);
+            ggml_set_output(C.moe_remap_lut);
+            C.moe_valid_lut = ggml_new_tensor_4d(
+                ctx, GGML_TYPE_F32, 1, w.n_expert, block, 1);
+            ggml_set_input(C.moe_valid_lut);
+            ggml_set_output(C.moe_valid_lut);
+        }
+        Ds4MoeShardSpec draft_shard;
+        draft_shard.rt = draft_rt;
+        draft_shard.remap_lut = C.moe_remap_lut;
+        draft_shard.valid_lut = C.moe_valid_lut;
+        const Ds4MoeShardSpec * draft_shard_p =
+            (draft_rt && C.moe_remap_lut) ? &draft_shard : nullptr;
 
         // main_x = main_norm(main_proj(ctx_features)).  Shared across layers.
         ggml_tensor * main_x = nullptr;
@@ -9911,7 +9991,8 @@ static bool deepseek4_dspark_draft_forward_impl(
             ggml_tensor * ffn_in = fwork[0];
             for (int p = 1; p < block; p++) ffn_in = ggml_concat(ctx, ffn_in, fwork[p], 1);
             ggml_tensor * ffn_normed = build_rms_norm(ctx, ffn_in, L.ffn_norm, w.rms_eps);
-            ggml_tensor * ffn_out = build_moe_ffn(ctx, ffn_normed, w, L, il, block);
+            ggml_tensor * ffn_out = build_moe_ffn(ctx, ffn_normed, w, L, il, block,
+                                                  draft_shard_p);
             if (!ffn_out) { ggml_free(C.ctx); C.ctx = nullptr; C.gf = nullptr; return false; }
             dbg_tap(std::string("ffn_L") + std::to_string(il), ffn_out);
             // ── HC post (FFN) ───────────────────────────────────────────
@@ -9972,9 +10053,31 @@ static bool deepseek4_dspark_draft_forward_impl(
         C.context_kv_cache = context_kv_cache;
         C.drafter = (const void *) &d;
         C.backend = backend;
+        C.shard_rt = (const void *) draft_rt;
     }
 
     // ── Set inputs + compute (cached graph) ─────────────────────────────
+    if (C.moe_remap_lut && C.moe_valid_lut && draft_rt) {
+        // Uniform ownership, e % size. The drafter's placement is its own: it
+        // has three layers against the target's 43 and shares no expert ids
+        // with it, so borrowing the target's map would only couple them.
+        const int ne = w.n_expert;
+        const int rank = draft_rt->rank();
+        const int size = draft_rt->size();
+        std::vector<int32_t> remap((size_t) ne * block);
+        std::vector<float>   valid((size_t) ne * block);
+        for (int t = 0; t < block; ++t) {
+            for (int e = 0; e < ne; ++e) {
+                const bool own = (e % size) == rank;
+                remap[(size_t) t * ne + e] = own ? e : -1;
+                valid[(size_t) t * ne + e] = own ? 1.0f : 0.0f;
+            }
+        }
+        ggml_backend_tensor_set(C.moe_remap_lut, remap.data(), 0,
+                                remap.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(C.moe_valid_lut, valid.data(), 0,
+                                valid.size() * sizeof(float));
+    }
     ggml_backend_tensor_set(C.inp_noise, noise_embed, 0, sizeof(float) * (size_t) n_embd * block);
     if (upload_context) {
         if (graph_ctx_len > 0) {
@@ -10092,6 +10195,10 @@ static bool deepseek4_dspark_draft_forward_impl(
     }
 
     return true;
+}
+
+void ds4_set_draft_cluster_runtime(Ds4ClusterRuntime * rt) {
+    g_draft_cluster_rt = rt;
 }
 
 bool deepseek4_dspark_draft_forward(ggml_backend_t backend,

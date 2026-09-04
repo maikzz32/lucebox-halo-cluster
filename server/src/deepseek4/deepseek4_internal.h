@@ -465,6 +465,13 @@ bool build_deepseek4_moe_hybrid_storage_from_file_with_mmap(
 
 // Attach each compact GPU owner tensor to the learned decode-table rows for
 // the global experts stored in that tensor.
+// Hand the DSpark draft graph this process's cluster runtime, so the drafter's
+// routed experts can be split across ranks (opt-in via
+// DFLASH_CLUSTER_SHARD_DRAFTER). Pass nullptr to detach. Defined in
+// deepseek4_graph.cpp next to the draft graph cache it belongs to.
+struct Ds4ClusterRuntime;
+void ds4_set_draft_cluster_runtime(Ds4ClusterRuntime * rt);
+
 bool register_deepseek4_moe_hybrid_mix_tables(
     const std::string &         path,
     const DeepSeek4Weights &    w,
