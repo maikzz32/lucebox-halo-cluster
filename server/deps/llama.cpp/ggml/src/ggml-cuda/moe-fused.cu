@@ -648,6 +648,27 @@ static void ggml_cuda_op_ds4_moe_owner_split(
         down_scale);
 }
 
+// One pass over both operands, one store. The stream loop is n_hc long -- four
+// on this architecture -- so it is unrolled by the compiler and the whole thing
+// is a strided gather that never materialises the gated block.
+__global__ void hc_collapse_f32(const float * __restrict__ a,
+                                const float * __restrict__ b,
+                                float * __restrict__ dst,
+                                int n_embd, int n_hc, int nt, float scale) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_embd) return;
+    const int t = blockIdx.y;
+    if (t >= nt) return;
+
+    const size_t base = (size_t) t * (size_t) n_hc * (size_t) n_embd + (size_t) i;
+    float acc = 0.0f;
+    for (int c = 0; c < n_hc; ++c) {
+        const size_t o = base + (size_t) c * (size_t) n_embd;
+        acc = fmaf(a[o], b[o], acc);
+    }
+    dst[(size_t) t * (size_t) n_embd + (size_t) i] = acc * scale;
+}
+
 void ggml_cuda_op_moe_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int mode = ggml_get_op_params_i32(dst, 0);
     if (mode == GGML_MOE_FUSED_BALANCED_OWNER_IDS) {
@@ -708,6 +729,29 @@ void ggml_cuda_op_moe_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             (int) ids->ne[1],
             (int) (ids->nb[1] / sizeof(int32_t)),
             (int) (dst->nb[1] / sizeof(int32_t)));
+        return;
+    }
+    if (mode == GGML_MOE_FUSED_HC_COLLAPSE) {
+        const ggml_tensor * a = dst->src[0];
+        const ggml_tensor * b = dst->src[1];
+        GGML_ASSERT(a && b);
+        GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32);
+        GGML_ASSERT(dst->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(b));
+        GGML_ASSERT(ggml_is_contiguous(dst));
+
+        const int n_embd = ggml_get_op_params_i32(dst, 1);
+        const int n_hc   = ggml_get_op_params_i32(dst, 2);
+        const int64_t nt = a->ne[1];
+        GGML_ASSERT((int64_t) n_embd * n_hc == a->ne[0]);
+        GGML_ASSERT(dst->ne[0] == n_embd && dst->ne[1] == nt);
+
+        constexpr int kBlock = 256;
+        const dim3 grid((n_embd + kBlock - 1) / kBlock, (unsigned) nt, 1);
+        hipLaunchKernelGGL(hc_collapse_f32, grid, dim3(kBlock), 0, ctx.stream(),
+                           (const float *) a->data, (const float *) b->data,
+                           (float *) dst->data, n_embd, n_hc, (int) nt,
+                           1.0f / (float) n_hc);
         return;
     }
     if (mode == GGML_MOE_FUSED_CLUSTER_ALLREDUCE) {

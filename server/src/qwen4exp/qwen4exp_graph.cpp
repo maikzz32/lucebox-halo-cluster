@@ -65,26 +65,43 @@ ggml_tensor * qwen4exp_hc_mix(ggml_context * ctx,
     qwen4exp_probe_add(ctx, gf, "  lo",   -1, lo);
     qwen4exp_probe_add(ctx, gf, "  gate", -1, gate);
 
-    ggml_tensor * gated = ggml_mul(ctx, xn, gate);
-    gated = ggml_reshape_3d(ctx, gated, n_embd, n_hc, nt);
+    // Gate and collapse. Written out this is a multiply, one contiguous copy
+    // per stream, n_hc-1 adds and a scale -- nine kernels, in a path that runs
+    // ninety-six times a token, and those copies alone were 424 of the ~3500
+    // dispatches a decode token costs. DFLASH_QWEN4EXP_FUSE_HC=1 does the same
+    // arithmetic in one kernel. The unfused form stays because it is the
+    // reference the fused one is checked against, and because it runs on
+    // backends the fused op does not.
+    static const bool fuse_hc = []() {
+        const char * e = std::getenv("DFLASH_QWEN4EXP_FUSE_HC");
+        return e && std::atoi(e) == 1;
+    }();
 
-    // Collapse the streams by their mean. Each stream is a strided view of the
-    // gated block; summing views and scaling once avoids materialising a
-    // permutation.
-    const size_t stream_stride = ggml_row_size(gated->type, n_embd);
-    ggml_tensor * mixed = ggml_cont(
-        ctx, ggml_view_2d(ctx, gated, n_embd, nt, stream_stride * n_hc, 0));
-    for (int c = 1; c < n_hc; ++c) {
-        // ggml_cont: the second operand of an add is a strided view here, and
-        // whether every backend honours its row stride is not something to
-        // leave to chance in a path that runs 96 times per token. The copy is
-        // one [n_embd, T] block and the allocator reuses it.
-        ggml_tensor * s = ggml_cont(ctx, ggml_view_2d(ctx, gated, n_embd, nt,
-                                                      stream_stride * n_hc,
-                                                      stream_stride * (size_t) c));
-        mixed = ggml_add(ctx, mixed, s);
+    ggml_tensor * mixed = nullptr;
+    if (fuse_hc) {
+        mixed = ggml_hc_collapse(ctx, xn, gate, n_embd, n_hc);
+    } else {
+        ggml_tensor * gated = ggml_mul(ctx, xn, gate);
+        gated = ggml_reshape_3d(ctx, gated, n_embd, n_hc, nt);
+
+        // Collapse the streams by their mean. Each stream is a strided view of
+        // the gated block; summing views and scaling once avoids materialising
+        // a permutation.
+        const size_t stream_stride = ggml_row_size(gated->type, n_embd);
+        mixed = ggml_cont(
+            ctx, ggml_view_2d(ctx, gated, n_embd, nt, stream_stride * n_hc, 0));
+        for (int c = 1; c < n_hc; ++c) {
+            // ggml_cont: the second operand of an add is a strided view here,
+            // and whether every backend honours its row stride is not
+            // something to leave to chance. The copy is one [n_embd, T] block
+            // and the allocator reuses it.
+            ggml_tensor * s = ggml_cont(ctx, ggml_view_2d(ctx, gated, n_embd, nt,
+                                                          stream_stride * n_hc,
+                                                          stream_stride * (size_t) c));
+            mixed = ggml_add(ctx, mixed, s);
+        }
+        mixed = ggml_scale(ctx, mixed, 1.0f / (float) n_hc);
     }
-    mixed = ggml_scale(ctx, mixed, 1.0f / (float) n_hc);
 
     if (inject_out) {
         *inject_out = w_inject ? ggml_mul_mat(ctx, w_inject, xn) : nullptr;

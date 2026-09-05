@@ -8968,6 +8968,33 @@ struct ggml_tensor * ggml_cluster_allreduce(
     return result;
 }
 
+struct ggml_tensor * ggml_hc_collapse(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        int                   n_embd,
+        int                   n_hc) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(b->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(ggml_is_contiguous(b));
+    GGML_ASSERT(ggml_are_same_shape(a, b));
+    GGML_ASSERT(n_embd > 0 && n_hc > 0);
+    GGML_ASSERT(a->ne[0] == (int64_t) n_embd * n_hc);
+
+    struct ggml_tensor * result =
+        ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, a->ne[1]);
+    result->op = GGML_OP_MOE_FUSED;
+    result->src[0] = a;
+    result->src[1] = b;
+
+    ggml_set_op_params_i32(result, 0, GGML_MOE_FUSED_HC_COLLAPSE);
+    ggml_set_op_params_i32(result, 1, n_embd);
+    ggml_set_op_params_i32(result, 2, n_hc);
+
+    return result;
+}
+
 struct ggml_tensor * ggml_ds4_hc_pre(
         struct ggml_context * ctx,
         struct ggml_tensor  * mix,

@@ -2569,6 +2569,7 @@ extern "C" {
         GGML_MOE_FUSED_ALIGN_IDS          = -5,
         GGML_MOE_FUSED_BALANCED_OWNER_IDS = -6,
         GGML_MOE_FUSED_CLUSTER_ALLREDUCE  = -7,
+        GGML_MOE_FUSED_HC_COLLAPSE        = -8,
     };
 
     // Word offsets in ggml_tensor::op_params for the cluster all-reduce
@@ -2621,6 +2622,24 @@ extern "C" {
             struct ggml_tensor      * a,
             ggml_cluster_allreduce_fn fn,
             void                    * user);
+
+    // Hyper-connection collapse: gate the normalised state and average the
+    // streams, in one kernel.
+    //
+    //   dst[i, t] = (1/n_hc) * sum_c a[c*n_embd + i, t] * b[c*n_embd + i, t]
+    //
+    // Written as ggml ops that is a multiply, one contiguous copy per stream,
+    // n_hc-1 adds and a scale -- nine kernels for four streams, and the mixer
+    // this belongs to runs twice a layer, ninety-six times a token. Those
+    // copies alone were 424 of the ~3500 kernel dispatches a decode token
+    // costs. `a` and `b` are [n_hc*n_embd, T] contiguous F32; the result is
+    // [n_embd, T].
+    GGML_API struct ggml_tensor * ggml_hc_collapse(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            int                   n_embd,
+            int                   n_hc);
 
     GGML_API struct ggml_tensor * ggml_laguna_moe_combine(
             struct ggml_context * ctx,
