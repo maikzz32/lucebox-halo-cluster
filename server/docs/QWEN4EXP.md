@@ -571,3 +571,57 @@ attention path trips `GGML_ASSERT(ggml_n_dims(a) >= 2)` inside
 as well as a quantised one. That path is qwen35's in production, and 342 MB of
 4266 is not worth the risk, so the split is behind
 `DFLASH_QWEN4EXP_SHARD_ATTENTION=1` for whoever picks the crash up.
+
+## The MTP head: where it stands
+
+Speculation is the only lever that addresses a synchronisation bound, so the
+module Qwen3.8-Flash-Next ships for it is loaded, its shapes are checked
+against the target, and its acceptance rate is measured. It is not usable yet.
+
+`DFLASH_QWEN4EXP_MTP=<path>` drafts the token after next at every decode step
+and scores it against what the target produces. Chance against a 248320-token
+vocabulary is 0.0004%, so the rate separates a correct wiring from a wrong one
+without ambiguity, and it costs one small forward with no rollback.
+
+| reading | acceptance |
+|---|---|
+| the first one that ran | 4% |
+| concatenation swapped, hidden before embedding | **0%** |
+| carrier collapsed before the projection, not projected per stream | 4% |
+| `hnorm` reducing over the flat width, not per stream | 7% |
+| the projection added to the carrier instead of replacing it | **0%** |
+| **`enorm` and `hnorm` read as `(1 + w)`** | **8%** |
+
+Two of those are settled. The concatenation is embedding-first, as the
+reference has it, and the projection replaces the carrier rather than adding
+to it -- both alternatives score zero, which at this vocabulary size is not a
+degradation but a refutation.
+
+The useful finding is `(1 + w)`. The target's hyper-connection norms average
+about one because the converter folded the plus-one into them; `enorm` and
+`hnorm` average 0.24 and 0.67 because it did not, and reading them the other
+way doubled the rate.
+
+**8% is not enough.** Speculation wants roughly 60% to pay for itself, and
+what is still wrong is not visible from the shapes: every reading they permit
+has now been tried. Giving the head its own KV history over the context
+changed nothing, and neither did rotating at the target's absolute position.
+
+What would unblock it is a reference for this module, and there is not one to
+be had by reading: upstream llama.cpp implements qwen4exp but not its MTP,
+vLLM ships `qwen3_next_mtp` whose hidden state is a single stream where this
+architecture has four, and the model's own repository publishes no modelling
+code. Without one, the next step is not another reading -- it is the
+weights themselves, comparing what the head produces against the target's own
+next-token distribution layer by layer, which is the same instrument that
+found the two bugs in the target and would find this one.
+
+### A trap worth naming
+
+`TargetWeights` looks like a plain aggregate and owns two memory mappings: its
+`CpuEmbedder`s destroy by `munmap` and `close`. Copying it -- the draft graph
+did, to present the head as a one-layer model -- and letting the copy die
+unmaps the token table and the 36 GiB PLE table the *target* is still reading
+from, and the next target forward dies in `dequantize_row_q4_0`. Six
+eliminations narrowed that to "the target's step after a draft"; a SIGSEGV
+handler borrowing `ggml_print_backtrace` named it in one run.

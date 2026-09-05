@@ -213,6 +213,11 @@ ggml_tensor * build_qwen4exp_mtp_draft(ggml_context * ctx,
     const int64_t nt     = carrier->ne[2];
     const int64_t hc_dim = (int64_t) t.n_hc * t.n_embd;
 
+    static const int variant = []() {
+        const char * v = std::getenv("DFLASH_QWEN4EXP_MTP_VARIANT");
+        return v ? std::atoi(v) : 0;
+    }();
+
     // DFLASH_QWEN4EXP_MTP_UNFOLDED=1 reads enorm and hnorm as (1 + w) rather
     // than as the gamma itself. The target's hyper-connection norms average
     // about one, which is what a converter that folded the plus-one leaves
@@ -233,8 +238,14 @@ ggml_tensor * build_qwen4exp_mtp_draft(ggml_context * ctx,
 
     // The carrier, normalised the way every qwen4exp norm treats it: the
     // reduction runs over one stream and the flat gamma scales all of them.
-    ggml_tensor * h = ggml_rms_norm(ctx, carrier, t.rms_eps);
-    h = gamma(ggml_reshape_2d(ctx, h, hc_dim, nt), w.hnorm);
+    // Variant 3 reduces over the flat n_hc*n_embd instead of over one stream.
+    // The per-stream reading is what the carrier's own norms use, proven from
+    // the weights; hnorm belongs to the head's glue rather than to that
+    // convention, so it does not have to follow it.
+    ggml_tensor * h = variant == 3
+        ? ggml_rms_norm(ctx, ggml_reshape_2d(ctx, carrier, hc_dim, nt), t.rms_eps)
+        : ggml_reshape_2d(ctx, ggml_rms_norm(ctx, carrier, t.rms_eps), hc_dim, nt);
+    h = gamma(h, w.hnorm);
     h = ggml_reshape_3d(ctx, h, t.n_embd, t.n_hc, nt);
 
     // eh_proj is [2*n_embd, n_embd], so it cannot see the whole carrier at
@@ -242,15 +253,11 @@ ggml_tensor * build_qwen4exp_mtp_draft(ggml_context * ctx,
     // output is that stream of the carrier the layer runs on. Broadcasting the
     // embedding across the streams and concatenating on the feature axis does
     // all four in one matmul.
+    // (variant is declared above, next to the norms it also selects between)
     // Which of these is right is decided by the acceptance rate, not by
     // reading: upstream llama.cpp has no qwen4exp MTP and vLLM's Qwen3-Next
     // one has a single-stream hidden state where this has four. All three
     // agree with the shapes; only one agrees with the target.
-    static const int variant = []() {
-        const char * v = std::getenv("DFLASH_QWEN4EXP_MTP_VARIANT");
-        return v ? std::atoi(v) : 0;
-    }();
-
     ggml_tensor * state = nullptr;
     if (variant == 2) {
         // The carrier collapsed to one vector first, the projection applied
@@ -270,6 +277,11 @@ ggml_tensor * build_qwen4exp_mtp_draft(ggml_context * ctx,
         ggml_tensor * eh = variant == 1 ? ggml_concat(ctx, h, e3, 0)
                                         : ggml_concat(ctx, e3, h, 0);
         state = ggml_cont(ctx, ggml_mul_mat(ctx, w.eh_proj, eh));
+        // Variant 4 treats the projection as a residual on the carrier rather
+        // than as a replacement for it.
+        if (variant == 4) {
+            state = ggml_add(ctx, state, carrier);
+        }
     }
 
     // One ordinary qwen4exp block, then this head's own output mixer -- which
