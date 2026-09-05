@@ -219,6 +219,14 @@ bool build_layer_prefn_step(
     ggml_set_name(sg.inp_embed, "inp_embed");
     ggml_set_input(sg.inp_embed);
 
+    // qwen4exp PLE reads its n-gram rows from the host: 36 GiB of table, about
+    // 10 KB touched per token. ple_layer is -1 for every other architecture.
+    if (w.ple_layer >= 0) {
+        sg.ple_embed = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F32, hidden, n_tokens);
+        ggml_set_name(sg.ple_embed, "ple_embed");
+        ggml_set_input(sg.ple_embed);
+    }
+
     const bool is_attn = (((layer_idx + 1) % w.full_attention_interval) == 0);
     if (is_attn) {
         sg.positions = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 4 * n_tokens);
@@ -310,6 +318,14 @@ bool build_hybrid_full_layer_step(
     sg.inp_embed = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, hidden, n_tokens, 1);
     ggml_set_name(sg.inp_embed, "inp_embed");
     ggml_set_input(sg.inp_embed);
+
+    // qwen4exp PLE reads its n-gram rows from the host: 36 GiB of table, about
+    // 10 KB touched per token. ple_layer is -1 for every other architecture.
+    if (w.ple_layer >= 0) {
+        sg.ple_embed = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F32, hidden, n_tokens);
+        ggml_set_name(sg.ple_embed, "ple_embed");
+        ggml_set_input(sg.ple_embed);
+    }
 
     const bool is_attn = (((layer_idx + 1) % w.full_attention_interval) == 0);
     if (is_attn) {
@@ -511,6 +527,14 @@ bool build_target_step(
     ggml_set_name(sg.inp_embed, "inp_embed");
     ggml_set_input(sg.inp_embed);
 
+    // qwen4exp PLE reads its n-gram rows from the host: 36 GiB of table, about
+    // 10 KB touched per token. ple_layer is -1 for every other architecture.
+    if (w.ple_layer >= 0) {
+        sg.ple_embed = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F32, hidden, n_tokens);
+        ggml_set_name(sg.ple_embed, "ple_embed");
+        ggml_set_input(sg.ple_embed);
+    }
+
     sg.positions = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 4 * n_tokens);
     ggml_set_name(sg.positions, "positions");
     ggml_set_input(sg.positions);
@@ -641,6 +665,7 @@ bool build_target_step(
 
     QwenGraphInputs gi{};
     gi.inp_embed                  = sg.inp_embed;
+    gi.ple_embed                  = sg.ple_embed;
     gi.positions                  = sg.positions;
     gi.attn_mask                  = sg.attn_mask;
     gi.n_tokens                   = n_tokens;
@@ -724,6 +749,14 @@ bool build_target_step_tree(
     ggml_set_name(sg.inp_embed, "inp_embed");
     ggml_set_input(sg.inp_embed);
 
+    // qwen4exp PLE reads its n-gram rows from the host: 36 GiB of table, about
+    // 10 KB touched per token. ple_layer is -1 for every other architecture.
+    if (w.ple_layer >= 0) {
+        sg.ple_embed = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F32, hidden, n_tokens);
+        ggml_set_name(sg.ple_embed, "ple_embed");
+        ggml_set_input(sg.ple_embed);
+    }
+
     sg.positions = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 4 * n_tokens);
     ggml_set_name(sg.positions, "positions");
     ggml_set_input(sg.positions);
@@ -766,6 +799,7 @@ bool build_target_step_tree(
 
     QwenGraphInputs gi{};
     gi.inp_embed                  = sg.inp_embed;
+    gi.ple_embed                  = sg.ple_embed;
     gi.positions                  = sg.positions;
     gi.attn_mask                  = sg.attn_mask;
     gi.n_tokens                   = n_tokens;
@@ -922,6 +956,7 @@ bool build_target_step_paged_tree(
     sg.gf = ggml_new_graph_custom(sg.ctx, graph_capacity, false);
     QwenGraphInputs gi{};
     gi.inp_embed = sg.inp_embed;
+    gi.ple_embed = sg.ple_embed;
     gi.positions = sg.positions;
     gi.n_tokens = n_tokens;
     gi.kv_start = 0;

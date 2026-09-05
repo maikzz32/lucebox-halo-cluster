@@ -268,6 +268,16 @@ bool create_target_cache_partial(const TargetWeights & w,
             }
         }
 
+        // qwen4exp PLE: one convolution history for the single layer that has
+        // one. ple_layer is -1 everywhere else, so nothing is allocated.
+        if (w.ple_layer >= 0 && w.ple_conv_kernel > 1 && w.ple_ngram_size > 0) {
+            const int64_t hist = (int64_t) (w.ple_conv_kernel - 1) * w.ple_ngram_size;
+            out.ple_conv_state = ggml_new_tensor_3d(
+                out.base_ctx, GGML_TYPE_F32,
+                hist, (int64_t) w.n_hc * w.n_embd, n_seq_slots);
+            ggml_set_name(out.ple_conv_state, "ple_conv_state");
+        }
+
         constexpr int TARGET_FEAT_CAP_DEFAULT = 4096;
         out.target_feat_cap = std::min(max_ctx, TARGET_FEAT_CAP_DEFAULT);
         if (allocate_target_feat) {
@@ -2376,6 +2386,19 @@ QwenGraphOutputs build_qwen35_graph(
 
     for (int il = 0; il < w.n_layer; il++) {
         if (hyper_connected) {
+            // PLE sits before the layer proper, on the one layer that carries
+            // it. Without its gathered embedding there is nothing to retrieve,
+            // so it is skipped rather than fed zeros -- a silently wrong
+            // retrieval is worse than an absent one.
+            if (il == w.ple_layer && in.ple_embed && cache.ple_conv_state) {
+                hc_state = qwen4exp_ple(
+                    ctx, gf, hc_state, in.ple_embed,
+                    w.layers[il].ple_key, w.layers[il].ple_value,
+                    w.layers[il].ple_norm_key, w.layers[il].ple_norm_query,
+                    w.layers[il].ple_norm_conv, w.layers[il].ple_conv1d,
+                    cache.ple_conv_state, w.n_embd, w.n_hc,
+                    w.ple_conv_kernel, w.ple_ngram_size, w.rms_eps);
+            }
             build_qwen4exp_layer(ctx, gf, w, cache, il, &hc_state,
                                  in.positions, in.attn_mask, in.kv_start,
                                  n_tokens, in.fa_window, in.kv_write_rows,

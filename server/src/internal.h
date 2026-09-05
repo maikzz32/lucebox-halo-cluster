@@ -540,6 +540,10 @@ struct TargetCache {
     // is the contiguous slab at index s of the trailing axis.
     std::vector<ggml_tensor *> ssm_state;    // size = n_delta_layers (48)
     std::vector<ggml_tensor *> conv_state;
+    // qwen4exp PLE keeps its own convolution history, one slab for the single
+    // layer that carries it: [(conv_kernel-1)*ngram_size, n_hc*n_embd, slots].
+    // Null for every architecture without PLE.
+    ggml_tensor * ple_conv_state = nullptr;
 
     // Snapshot buffers for speculative decoding rollback. Sized identically
     // to ssm_state/conv_state above. Populated by snapshot_ssm_state() and
@@ -877,6 +881,10 @@ struct QwenPrefillSegment {
 
 struct QwenGraphInputs {
     ggml_tensor * inp_embed;      // [hidden, n_tokens, 1] f32 — pre-embedded by the caller
+    // qwen4exp PLE: [hidden, n_tokens] f32, the n-gram table rows gathered on
+    // the host. Null for every other architecture, and null here means the PLE
+    // layer degrades to a plain pass-through rather than reading nothing.
+    ggml_tensor * ple_embed = nullptr;
     ggml_tensor * positions;      // [4 * n_tokens] i32 (M-RoPE needs 4 per token)
     ggml_tensor * attn_mask;      // optional [kv_len, n_tokens_padded] f32 (causal); nullptr for n_tokens==1
     int           n_tokens;       // number of new tokens in this forward
