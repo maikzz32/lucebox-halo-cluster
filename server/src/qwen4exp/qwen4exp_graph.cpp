@@ -224,6 +224,24 @@ ggml_tensor * qwen4exp_hc_combine(ggml_context * ctx,
         case 3:  // no 1/n_hc: the scale is the only free constant in the formula
             w = ggml_scale(ctx, ggml_sigmoid(ctx, inject), 2.0f);
             break;
+        case 4:  // 1/sqrt(n_hc*n_embd): the projection's own width
+        case 5: {
+            // Divide by the square root of the contracted width instead of by
+            // n_hc. The injection is a dot product over 10240 dimensions and
+            // comes out near -19, which drives the gate to 0.02 and leaves the
+            // blocks contributing nothing. Scaling by sqrt of that width puts
+            // it at -0.19 and the gate near 0.9, which is the range a trained
+            // depth connection is initialised in. Variant 1 reached a gate of
+            // one too, but by discarding the per-stream variation with it --
+            // the streams stayed identical and the carrier stopped being wide
+            // at all. This keeps the variation and only changes the scale.
+            const float d = variant == 4
+                ? (float) ((int64_t) n_hc * n_embd)
+                : (float) n_embd;
+            w = ggml_scale(
+                ctx, ggml_sigmoid(ctx, ggml_scale(ctx, inject, 1.0f / sqrtf(d))), 2.0f);
+            break;
+        }
         default:
             w = ggml_scale(
                 ctx, ggml_sigmoid(ctx, ggml_scale(ctx, inject, 1.0f / (float) n_hc)), 2.0f);

@@ -1,5 +1,6 @@
 #include "qwen4exp/qwen4exp_internal.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -596,6 +597,49 @@ bool load_qwen4exp_gguf(const std::string & path,
                     sum / (double) nc2, std::sqrt(sq / (double) nc2),
                     rp[0], rp[1], rp[2]);
             }
+        }
+    }
+
+    // File integrity: what do the quantised weights actually contain?
+    //
+    // This checkpoint is a third-party quantisation into ggml types that only
+    // this tree understands, and nothing has ever run it. A tensor family that
+    // dequantises to zeros, or to values orders away from its neighbours,
+    // would explain a model that runs and says nothing -- and no amount of
+    // work on the graph would fix it. One layer of each kind is enough to see
+    // it; the first 65536 values of each tensor are enough for the statistic.
+    if (std::getenv("DFLASH_QWEN4EXP_RMS")) {
+        std::vector<float> buf(65536);
+        for (const Binding & bd : bindings) {
+            const char * nm = ggml_get_name(bd.dst);
+            const std::string n(nm ? nm : "");
+            if (n.rfind("blk.0.", 0) != 0 && n.rfind("blk.3.", 0) != 0 &&
+                n.rfind("output", 0) != 0) {
+                continue;
+            }
+            const ggml_type st = bd.src.meta->type;
+            const ggml_type_traits * tr = ggml_get_type_traits(st);
+            if (!tr || !tr->to_float) continue;
+            const int64_t nc = bd.src.meta->ne[0];
+            const int64_t rows = std::min<int64_t>(
+                ggml_nelements(bd.src.meta) / nc, (int64_t) buf.size() / nc);
+            if (rows < 1) continue;
+            const size_t srow = ggml_row_size(st, nc);
+            double sq = 0.0;
+            int64_t zeros = 0;
+            for (int64_t r = 0; r < rows; ++r) {
+                tr->to_float(static_cast<const char *>(bd.src.data) + (size_t) r * srow,
+                             buf.data(), nc);
+                for (int64_t k = 0; k < nc; ++k) {
+                    sq += (double) buf[(size_t) k] * buf[(size_t) k];
+                    zeros += buf[(size_t) k] == 0.0f;
+                }
+            }
+            const int64_t seen = rows * nc;
+            std::fprintf(stderr, "[q4e-file] %-34s %-18s rms=%.5f zeros=%.1f%%\n",
+                         n.c_str(), ggml_type_name(st),
+                         std::sqrt(sq / (double) seen),
+                         100.0 * (double) zeros / (double) seen);
         }
     }
 
