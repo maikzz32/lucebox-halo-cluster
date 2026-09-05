@@ -66,9 +66,13 @@ ggml_tensor * qwen4exp_hc_mix(ggml_context * ctx,
     ggml_tensor * mixed = ggml_cont(
         ctx, ggml_view_2d(ctx, gated, n_embd, nt, stream_stride * n_hc, 0));
     for (int c = 1; c < n_hc; ++c) {
-        ggml_tensor * s = ggml_view_2d(ctx, gated, n_embd, nt,
-                                       stream_stride * n_hc,
-                                       stream_stride * (size_t) c);
+        // ggml_cont: the second operand of an add is a strided view here, and
+        // whether every backend honours its row stride is not something to
+        // leave to chance in a path that runs 96 times per token. The copy is
+        // one [n_embd, T] block and the allocator reuses it.
+        ggml_tensor * s = ggml_cont(ctx, ggml_view_2d(ctx, gated, n_embd, nt,
+                                                      stream_stride * n_hc,
+                                                      stream_stride * (size_t) c));
         mixed = ggml_add(ctx, mixed, s);
     }
     mixed = ggml_scale(ctx, mixed, 1.0f / (float) n_hc);
@@ -247,7 +251,12 @@ ggml_tensor * qwen4exp_hc_combine(ggml_context * ctx,
                 ctx, ggml_sigmoid(ctx, ggml_scale(ctx, inject, 1.0f / (float) n_hc)), 2.0f);
             break;
     }
-    w = ggml_reshape_3d(ctx, w, 1, n_hc, nt);
+    // Both operands are materialised to the carrier's shape rather than left
+    // to broadcasting. The scatter weight would otherwise broadcast along
+    // ne[0], the fastest axis, from one to n_embd -- legal, but the rarest
+    // shape of broadcast there is, and this is not the place to depend on it.
+    w = ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, w, 1, n_hc, nt),
+                       n_embd, n_hc, nt, 1);
 
     ggml_tensor * b = ggml_reshape_3d(ctx, block_out, n_embd, 1, nt);
     b = ggml_repeat_4d(ctx, b, n_embd, n_hc, nt, 1);
