@@ -345,3 +345,87 @@ Checked against the file's own constants:
 The loader refuses the model if the three constant arrays have the wrong
 lengths, because a short array would make the hash index past its own
 constants rather than fail.
+
+## Bring-up log: what has been measured
+
+The model loads, runs at 22 tok/s on one node, and produces fluent nonsense.
+This section records what has been ruled out, because on an architecture with
+no reference to run against, the eliminations are the work.
+
+### Instruments
+
+Two were built first, and both changed conclusions rather than confirming them.
+
+`test/gguf_embed_tie.cpp` compares `token_embd[v]` against `output.weight[v]`.
+The self-similarity on this checkpoint (+0.022) is barely above the
+cross-similarity (0.013), which reads as "the two tables are not in the same
+basis". Running it against DeepSeek V4 Flash -- which generates correctly in
+this tree -- gives +0.007 against 0.013, which is worse. Input and output
+embeddings simply are not correlated in this family, so the finding was
+worthless and so was the bisection built on it.
+
+`scripts/cluster/q4e_forced_score.py` scores ten continuations that are forced
+rather than knowledgeable. Its first matcher was a prefix test, which scored
+DeepSeek 4/10 by rejecting "The capital of France is **Paris**." Matching on
+word boundaries anywhere in the reply, DeepSeek scores 8/10 and misses two
+probes for real. **8/10 is the bar. qwen4exp scores 0/10.**
+
+`DFLASH_QWEN4EXP_RMS=1` prints the RMS *and the mean* of the carrier, both
+block inputs and outputs, and the injection, per sublayer. The mean is not
+decoration: the write-back gate is `2*sigmoid(inject / n_hc)`, which past a
+few times n_hc is decided by the sign alone.
+
+### Ruled out by measurement
+
+| Suspect | How it was settled |
+|---|---|
+| Hyperparameters | All eleven shape equations pass; the banner prints every value and each matches the tensor shapes and the official conversion's metadata exactly |
+| The checkpoint's tensors | Every family dequantises to rms 0.009-0.11 with 10-30% zeros; none is zeroed or an outlier |
+| The ROCmFP4 decoder | DeepSeek V4's own `output.weight` is `q4_0_rocmfp4_fast` and that model is byte-exact |
+| Quantised matmul on the 4-row injection | Dequantising `hc_*_inject` to F32 moves it from 18.4743 to 18.4786 |
+| Tokenizer | 19 tokens for a sentence, 13 for a letter, both with the template |
+| KV cache precision | f16 scores 0/10 as well as q4_0 |
+| Embedding, unembedding | see `gguf_embed_tie` above |
+| MoE over 512 experts | routed 0.0117 against shared 0.0254, and ten weights normalised to sum to one predict shared/sqrt(10) |
+| The decode graph path | four probe reports for a four-token generation, one over 15 tokens and three over one |
+| Recurrent state carry | the *first* generated token is already wrong |
+| PLE row hashing and head layout | character-identical to the reference, and the official metadata confirms heads_per_ngram 8, so 16 heads of 160 |
+| The stream layout | see below |
+
+### The stream layout, settled from the weights
+
+The flat `[n_hc*n_embd]` hyper-connection weights can be read stream-major
+(stream c at `c*n_embd + i`) or interleaved (`i*n_hc + c`). Both accept the
+same tensor shapes, so the file's metadata does not distinguish them.
+
+The weights do. Grouped stream-major, the four blocks of each hc norm have
+clearly different statistics -- `output_hc_norm` means 2.45, 3.62, 4.98, 3.96;
+`blk.20.hc_attn_norm` 1.76, 1.37, 0.76, 0.93 -- which is what four separately
+trained per-stream gammas look like. Grouped by stride `n_hc` they come out
+identical to three decimals, the signature of four distinct blocks averaged
+together. Stream-major it is.
+
+### Six readings of the write-back, all 0/10
+
+`DFLASH_QWEN4EXP_HC_VARIANT` selects: the reference formula (0), the gate
+pinned to one (1), the injection centred across streams (2), the `1/n_hc`
+dropped (3), and the injection scaled by the square root of the projection
+width (4) or of `n_embd` (5). Variants 4 and 5 exist because the measured
+injections sit near -19 where the weights and activations predict -0.5, which
+saturates every gate shut; scaling them puts the gate near 0.9 while keeping
+the per-stream variation that pinning it to one destroys. The carrier grows to
+1.80 instead of 0.65 and the output does not change.
+
+That is the stop criterion this document set for the stage. With the layout
+already settled from the weights, it points away from the hyper-connections.
+
+### What is left
+
+The checkpoint in use is a third-party abliterated repack. Its metadata
+matches the official llama.cpp conversion in every architectural key, but
+differs in one substantive place: `attention.compress_ratios` is zeroed where
+the official file has 4 on every full-attention layer. That is proof the
+repackager edited the file, and abliteration edits weights. The official
+Q3_K_M conversion is therefore the next control: if it also scores 0/10 the
+fault is in this tree and the search continues with a canonical file; if it
+does not, the file was never going to work.
