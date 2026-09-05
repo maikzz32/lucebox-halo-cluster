@@ -68,6 +68,15 @@ struct Qwen4ExpClusterRuntime {
     // would multiply it by the rank count.
     bool attn_sharded = false;
 
+    // Whether the delta-net layers hold a slice. Normally they do, and that is
+    // where most of the sharded bytes are -- but the split also divides
+    // dt_rank, the head count the fused recurrence loops over, and a kernel
+    // that is already small does not get faster by being made smaller. The
+    // same reduction rule applies as for attention: a block every rank
+    // computed whole must not be reduced, or it is multiplied by the rank
+    // count.
+    bool ssm_sharded = true;
+
     int rank() const { return cfg ? cfg->rank : 0; }
     int size() const { return cfg ? cfg->size : 1; }
     bool sharded() const { return cfg && cfg->enabled() && cfg->size > 1; }

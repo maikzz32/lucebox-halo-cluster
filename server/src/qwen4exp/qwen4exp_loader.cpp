@@ -500,6 +500,24 @@ bool load_qwen4exp_gguf(const std::string & path,
                      out.n_head, out.n_head_kv, cluster_n);
     }
 
+    // Splitting the delta net removes bytes and adds nothing to the wire, so it
+    // looks free -- but it also divides dt_rank, the number of value heads the
+    // fused recurrence loops over, from 48 to 24 at two ranks and 12 at four.
+    // A kernel that is already small at 48 heads does not get faster at 12, it
+    // gets latency-bound, and there are 36 of them per token.
+    // DFLASH_QWEN4EXP_NO_SHARD_SSM=1 keeps the delta net whole so the two can
+    // be compared. It costs residency, which on 124 GB nodes is not the
+    // constraint, and it removes 36 reductions per token with the bytes.
+    static const bool ssm_whole = []() {
+        const char * e = std::getenv("DFLASH_QWEN4EXP_NO_SHARD_SSM");
+        return e && std::atoi(e) == 1;
+    }();
+    if (ssm_whole && cluster && cluster->sharded()) {
+        const_cast<Qwen4ExpClusterRuntime *>(cluster)->ssm_sharded = false;
+        std::fprintf(stderr,
+                     "[qwen4exp-cluster] delta net stays whole by request\n");
+    }
+
     for (int il = 0; il < out.n_layer && b.ok; ++il) {
         TargetLayer & L = out.layers[(size_t) il];
         const bool full_attn = ((il + 1) % out.full_attention_interval) == 0;
@@ -558,22 +576,24 @@ bool load_qwen4exp_gguf(const std::string & path,
             // by head_v_dim, which does not change, so it stays whole.
             const int qkv_segs = qwen4exp_qkv_segments(out);
             const int val_segs = qwen4exp_value_segments(out);
-            L.wqkv        = b.take_shard(blk(il, "attn_qkv.weight"), ShardAxis::Rows,
+            const ShardAxis ssm_rows = ssm_whole ? ShardAxis::None : ShardAxis::Rows;
+            const ShardAxis ssm_cols = ssm_whole ? ShardAxis::None : ShardAxis::Cols;
+            L.wqkv        = b.take_shard(blk(il, "attn_qkv.weight"), ssm_rows,
                                          out.ssm_d_state, true, qkv_segs);
-            L.wqkv_gate   = b.take_shard(blk(il, "attn_gate.weight"), ShardAxis::Rows,
+            L.wqkv_gate   = b.take_shard(blk(il, "attn_gate.weight"), ssm_rows,
                                          out.ssm_d_state, true, val_segs);
-            L.ssm_conv1d  = b.take_shard(blk(il, "ssm_conv1d.weight"), ShardAxis::Rows,
+            L.ssm_conv1d  = b.take_shard(blk(il, "ssm_conv1d.weight"), ssm_rows,
                                          out.ssm_d_state, true, qkv_segs);
-            L.ssm_alpha   = b.take_shard(blk(il, "ssm_alpha.weight"), ShardAxis::Rows,
+            L.ssm_alpha   = b.take_shard(blk(il, "ssm_alpha.weight"), ssm_rows,
                                          1, true, val_segs);
-            L.ssm_beta    = b.take_shard(blk(il, "ssm_beta.weight"), ShardAxis::Rows,
+            L.ssm_beta    = b.take_shard(blk(il, "ssm_beta.weight"), ssm_rows,
                                          1, true, val_segs);
-            L.ssm_a       = b.take_shard(blk(il, "ssm_a"), ShardAxis::Cols,
+            L.ssm_a       = b.take_shard(blk(il, "ssm_a"), ssm_cols,
                                          1, true, val_segs);
-            L.ssm_dt_bias = b.take_shard(blk(il, "ssm_dt.bias"), ShardAxis::Cols,
+            L.ssm_dt_bias = b.take_shard(blk(il, "ssm_dt.bias"), ssm_cols,
                                          1, true, val_segs);
             L.ssm_norm    = b.take(blk(il, "ssm_norm.weight"),   true);
-            L.ssm_out     = b.take_shard(blk(il, "ssm_out.weight"), ShardAxis::Cols,
+            L.ssm_out     = b.take_shard(blk(il, "ssm_out.weight"), ssm_cols,
                                          out.ssm_d_state, true, val_segs);
         }
 
@@ -701,7 +721,7 @@ bool load_qwen4exp_gguf(const std::string & path,
     // counts the fused kernels loop over -- so halving them here is the whole
     // of what the graph needs to know about the split. d_state is per head and
     // does not move, which keeps head_v_dim = d_inner / dt_rank unchanged.
-    if (cluster && cluster->sharded()) {
+    if (cluster && cluster->sharded() && !ssm_whole) {
         const int n = cluster->size();
         if (out.ssm_d_inner % n == 0 && out.ssm_n_group % n == 0 &&
             out.ssm_dt_rank % n == 0) {

@@ -2868,7 +2868,7 @@ static ggml_tensor * build_single_layer_hc(
     // always splits when the model is sharded; attention is opt-in and may
     // decline, and summing a block every rank computed whole would multiply it
     // by the rank count.
-    if (w.cluster && (!is_attn || w.cluster->attn_sharded)) {
+    if (w.cluster && (is_attn ? w.cluster->attn_sharded : w.cluster->ssm_sharded)) {
         cur = qwen4exp_cluster_allreduce_node(ctx, ggml_cont(ctx, cur), *w.cluster);
     }
     *hc_state = qwen4exp_hc_combine(ctx, *hc_state, cur, inject, w.n_embd, n_hc);

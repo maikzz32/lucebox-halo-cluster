@@ -2322,6 +2322,19 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
     // two look identical from the outside.
     static const bool kSpecForceReject =
         std::getenv("DFLASH_QWEN4EXP_SPEC_FORCE_REJECT") != nullptr;
+    // DFLASH_QWEN4EXP_STEP_TIMING=1: where a decode step's time goes, split
+    // between building the graph (host) and running it (device). Speculation
+    // widens the batch, and the two halves answer very differently to that.
+    static const bool kStepTiming =
+        std::getenv("DFLASH_QWEN4EXP_STEP_TIMING") != nullptr;
+    // Cost probe, not a mode: run the wide pass without asking for the per-token
+    // states and without undoing anything. The output drifts, and that is the
+    // point -- it is the only way to price the capture separately from the
+    // second token's own ten routed experts, which are the other candidate for
+    // the difference between a one-token and a two-token pass.
+    static const bool kSpecNoCapture =
+        std::getenv("DFLASH_QWEN4EXP_SPEC_NO_CAPTURE") != nullptr;
+    uint64_t t_build_us = 0, t_compute_us = 0, t_steps = 0, t_wide = 0;
     // Constructed for rollback_to() alone. That method owns the one genuinely
     // hard part of this -- restoring 36 layers of recurrent state to the middle
     // of a batch -- and it needs nothing from the spec-decode loop it usually
@@ -2348,11 +2361,13 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         // step-invariant set_rows write; the FA span clamps to the pool.
         const bool pool = kvflash_active();
         const bool paged = cfg_.paged_attention;
+        const int64_t t_b0 = kStepTiming ? ggml_time_us() : 0;
         if (!build_target_step(sg_, w_, cache_, target_backend_,
                                /*kv_start=*/committed, /*n_tokens=*/n_step,
                                /*with_mask=*/pool || w_.is_bailingmoe3 || n_step > 1,
                                /*capture=*/false,
-                               /*capture_delta_intermediate=*/n_step > 1,
+                               /*capture_delta_intermediate=*/n_step > 1 &&
+                                                             !kSpecNoCapture,
                                /*fa_window=*/0,
                                /*logits_tail_rows=*/0,
                                cfg_.kq_stride_pad,
@@ -2361,6 +2376,11 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                                /*capture_qk=*/pool && kvflash_qk_policy_,
                                /*paged_attention=*/paged)) {
             return false;
+        }
+        if (kStepTiming) {
+            t_build_us += (uint64_t) (ggml_time_us() - t_b0);
+            t_steps++;
+            t_wide += (n_step > 1) ? 1 : 0;
         }
 
         // After the build, not before it. The build is what fixes this step's
@@ -2415,7 +2435,20 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                 sg_.attn_mask, committed, n_step, cfg_.kq_stride_pad);
         }
 
+        const int64_t t_c0 = kStepTiming ? ggml_time_us() : 0;
         auto st = ggml_backend_graph_compute(target_backend_, sg_.gf);
+        if (kStepTiming) {
+            t_compute_us += (uint64_t) (ggml_time_us() - t_c0);
+            if (t_steps % 32 == 0) {
+                std::fprintf(stderr,
+                             "[qwen4exp-step] %llu steps (%llu wide)  "
+                             "build %.2f ms  compute %.2f ms\n",
+                             (unsigned long long) t_steps,
+                             (unsigned long long) t_wide,
+                             1e-3 * (double) t_build_us / (double) t_steps,
+                             1e-3 * (double) t_compute_us / (double) t_steps);
+            }
+        }
         qwen4exp_probe_report();
         if (st != GGML_STATUS_SUCCESS) return false;
 
@@ -2516,7 +2549,9 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                 // step continues from a state that saw a token the sequence
                 // never contained -- which does not fail, it drifts.
                 cache_.cur_pos = committed + n_step;
-                if (!spec_rollback.rollback_to(committed, 1)) {
+                if (kSpecNoCapture) {
+                    cache_.cur_pos = committed + 1;
+                } else if (!spec_rollback.rollback_to(committed, 1)) {
                     std::fprintf(stderr,
                                  "[qwen4exp-spec] rollback failed at %d\n",
                                  committed);
