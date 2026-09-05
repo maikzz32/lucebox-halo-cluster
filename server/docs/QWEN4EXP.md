@@ -751,8 +751,16 @@ them:
 | two nodes | 70.5% | 51.6 ms | 30.6 (28.1-31.7) | 32 |
 | four nodes | 55-69% | 55.6 ms | 25.7 | 50 |
 
-Forced-continuation 8/10 throughout; the unspeculated default path is unchanged
-at 25.0 tok/s.
+The unspeculated default path is unchanged at 25.0 tok/s and 8/10.
+
+On the score itself: one node reads 8/10 at the script's default budget of
+eight tokens, two nodes 7/10 -- and at sixteen tokens two nodes read **9/10**,
+with only the `straw` probe missing because the model refuses the premise
+("The word is already complete"). The difference is the budget cutting off a
+verbose answer before it arrives, not quality: "Finish the phrase: Once upon a"
+answered "The most common completion for this phrase is" and ran out. Worth
+remembering when comparing runs -- the eight-token default was tuned so
+DeepSeek reads 8/10, and it turns verbosity into a miss.
 
 **The throughput is reached, on one node.** 33.2 tok/s is above the 32 the two-
 node target asks for -- but adding a second node costs 8% and a fourth costs
