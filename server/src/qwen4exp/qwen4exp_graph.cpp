@@ -45,8 +45,13 @@ ggml_tensor * qwen4exp_hc_mix(ggml_context * ctx,
     // 4.98, 3.96), which is what four separately trained per-stream gammas
     // look like. Grouped by stride n_hc they come out identical to three
     // decimals -- the signature of four distinct blocks averaged together.
-    ggml_tensor * xn = ggml_reshape_2d(ctx, xn3, hc_dim, nt);
-    xn = ggml_mul(ctx, xn, w_norm);
+    // Gamma applied to the 3-D norm, not to a reshape of it. Same value --
+    // element (i, c, t) takes gamma[c*n_embd + i] either way -- but ggml-cuda
+    // fuses {RMS_NORM, MUL} only when the two are adjacent in the node list,
+    // and a reshape sits between them as a node even though it costs no kernel.
+    ggml_tensor * xn = ggml_mul(
+        ctx, xn3, ggml_reshape_3d(ctx, w_norm, n_embd, n_hc, 1));
+    xn = ggml_reshape_2d(ctx, xn, hc_dim, nt);
 
     // Low-rank gate over the whole flattened state. The 1/n_hc before the silu
     // keeps the pre-activation in the range the weights were trained for.
