@@ -705,13 +705,60 @@ streams, each handled as its own op, and the mixer runs twice a layer -- 96
 times a token. `quantize_q8_1` is one per quantised matvec and is not
 reducible without changing how the matvecs work; the rest is.
 
-ggml-cuda already has the machinery (`ggml_cuda_can_fuse`, used for
-RMS_NORM+MUL and the SCALE/UNARY/SCALE softcap). What is missing is a fused
-mixer: one kernel for the per-stream norm, scale and add that currently costs
-around thirty dispatches a layer. Halving the non-matvec quarter takes a
-one-node step from 38.9 ms to about 33.8, and the two-node speculative pass
-with it -- which is the first thing measured in this document that would put
-two nodes over 32 tok/s.
+### The fused mixer, built and measured
+
+`ggml_hc_collapse(a, b, n_embd, n_hc)` -- `DFLASH_QWEN4EXP_FUSE_HC=1`, a
+`GGML_MOE_FUSED` sub-op following `ggml_cluster_allreduce`'s pattern so no new
+op type enters ggml:
+
+    dst[i, t] = (1/n_hc) * sum_c a[c*n_embd + i, t] * b[c*n_embd + i, t]
+
+Nine kernels become one, ninety-six times a token.
+
+| | step | decode |
+|---|---|---|
+| one node, AR | 38.5 -> **36.6 ms** | 25.0 -> **26.5 tok/s** |
+| one node, speculation | 50.7 -> **48.6 ms** | ~+4.6% at equal acceptance |
+| two nodes, everything | 53.6 -> **51.7 ms** | 27.9 -> **30.5 tok/s** |
+
+**Verified, not assumed.** Swapping it in changed the model's output from the
+fourth token on, which is not something to wave through as rounding, so
+`server/test/hc_collapse_check.cpp` builds both formulations on the same inputs
+and compares: **2.4e-07** against the unfused graph and **2.5e-07** against a
+host double reference. Float epsilon. The early divergence is a near-tie
+flipping and propagating through forty-eight layers, the same class of
+difference the speculative path already has. The forced-continuation score is
+unchanged at 8/10.
+
+One thing the check caught: `fmaf` is the wrong instruction. It rounds once
+where the unfused graph rounds twice -- more accurate, and therefore a
+different function. Matching the reference exactly is what makes this a fusion
+rather than a change of model.
+
+Applying gamma before the reshape rather than after was measured neutral, but
+is kept: ggml-cuda fuses {RMS_NORM, MUL} only when the two are adjacent, and a
+reshape between them is a node that costs no kernel and still breaks the
+pattern.
+
+### What is left between here and 32 tok/s on two nodes
+
+A pass is 51.7 ms of step and 3.47 ms of drafting, and returns 1.684 tokens:
+**30.5 tok/s** against a target of 32. Reaching it needs the pass at 52.6 ms --
+2.6 ms, or 4.7%. Three things, each measured or measurable, add up to it:
+
+  - **the head's lm_head, split across ranks.** 3.47 ms of drafting is almost
+    all one 248320-row projection. Sliced two ways with a two-float reduction
+    to pick the global argmax, it is about 1.9 ms. Worth ~1.6 ms.
+  - **the rest of the mixer.** `scale`+`silu` and the standalone `sigmoid` are
+    another 192 dispatches a token, ~0.5 ms at the 2.4 us a dispatch measured
+    for the collapse.
+  - **acceptance.** The head's own KV history was worth six points when it was
+    measured, and was dropped because it forced a graph rebuild per token. A
+    fixed-shape graph with a mask input keeps both.
+
+Four nodes remain a dead end: 25.7 tok/s with everything on, below two nodes,
+for the reason the whole document gives -- the reductions get dearer with rank
+count while the bytes they buy get cheaper.
 
 ## The MTP head: it works, and it speculates
 
