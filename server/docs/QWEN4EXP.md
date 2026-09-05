@@ -687,10 +687,31 @@ ceiling**. They are fine. What the step loses is that they are only 74% of its
 GPU time -- the other quarter is **about 3500 kernel dispatches per token**,
 none of them moving weights, 214084 of them in this run.
 
-So the lever is fusion, not faster arithmetic: halving the non-matvec quarter
-would take a one-node step from 38.9 ms to about 33.8, and the two-node
-speculative pass with it. That is where the remaining factor lives, and nothing
-in this document has touched it.
+So the lever is fusion, not faster arithmetic. The dispatches, per decode
+token, are where to start:
+
+| kernel | per token | time |
+|---|---|---|
+| `k_bin_bcast` (elementwise) | ~1018 | 74.0 ms |
+| `quantize_q8_1` | ~519 | 37.8 ms |
+| `__amd_rocclr_copyBuffer` | ~424 | 34.8 ms |
+| `scale_f32` | ~387 | 19.5 ms |
+| `unary_op` | ~279 | 15.5 ms |
+| `rms_norm_f32` | ~160 | 16.1 ms |
+
+Twenty-one elementwise operations and eight scalings per layer, across
+forty-eight layers. That is the shape of the hyper-connection mixer: four
+streams, each handled as its own op, and the mixer runs twice a layer -- 96
+times a token. `quantize_q8_1` is one per quantised matvec and is not
+reducible without changing how the matvecs work; the rest is.
+
+ggml-cuda already has the machinery (`ggml_cuda_can_fuse`, used for
+RMS_NORM+MUL and the SCALE/UNARY/SCALE softcap). What is missing is a fused
+mixer: one kernel for the per-stream norm, scale and add that currently costs
+around thirty dispatches a layer. Halving the non-matvec quarter takes a
+one-node step from 38.9 ms to about 33.8, and the two-node speculative pass
+with it -- which is the first thing measured in this document that would put
+two nodes over 32 tok/s.
 
 ## The MTP head: it works, and it speculates
 
