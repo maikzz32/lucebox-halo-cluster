@@ -269,11 +269,26 @@ struct TargetWeights {
     int ple_layer               = -1;   // ple.layers[0]; -1 when absent
     int ple_ngram_size          = 0;
     int ple_conv_kernel         = 0;
+    int ple_heads_per_ngram     = 0;
+    int ple_n_heads             = 0;   // (ngram_size - 1) * heads_per_ngram
+    int32_t ple_eos_token_id    = -1;
+    int32_t ple_image_token_id  = -1;
+    // Hash constants. Exact 64-bit values: the row index is
+    //   mixed % head_vocab_sizes[h] + head_offsets[h]
+    // so a truncated multiplier silently selects the wrong row rather than
+    // failing, which is why these are read as u64 and kept as u64.
+    std::vector<uint64_t> ple_layer_multipliers;   // ngram_size entries
+    std::vector<uint64_t> ple_head_offsets;        // ple_n_heads entries
+    std::vector<uint64_t> ple_head_vocab_sizes;    // ple_n_heads entries
     int n_embd_per_layer_input  = 0;
     int n_indexer_head          = 0;
     int indexer_key_length      = 0;
     int indexer_top_k           = 0;
     ggml_tensor * per_layer_token_embd = nullptr;  // [n_embd_per_layer_input, huge]
+    // The PLE table is ~36 GiB and is read 16 rows of 160 values per token, so
+    // it is mapped and gathered on the host rather than uploaded. Same trade
+    // CpuEmbedder already makes for token_embd, for a much larger table.
+    CpuEmbedder ple_table;
     ggml_tensor * output_hc_norm       = nullptr;  // [n_hc * hidden]
     ggml_tensor * output_hc_down       = nullptr;  // [n_hc * hidden, low_rank]
     ggml_tensor * output_hc_up         = nullptr;  // [low_rank, n_hc * hidden]

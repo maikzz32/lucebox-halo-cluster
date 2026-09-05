@@ -39,6 +39,11 @@ struct GgufShardTensor {
     const void * data  = nullptr;   // into that shard's mapping; valid while the set is open
     size_t       size  = 0;         // bytes
     ggml_tensor * meta = nullptr;   // shape/type, owned by that shard's meta context
+    // Where the bytes are on disk, for a caller that wants its own mapping of
+    // them rather than this set's -- a table too large to copy and too large to
+    // keep on the device, say, whose lifetime must outlive the set.
+    std::string  path;
+    size_t       file_offset = 0;   // absolute byte offset within `path`
 };
 
 class GgufShardSet {

@@ -182,6 +182,41 @@ bool read_qwen4exp_hparams(const GgufShardSet & shards,
         if (kv_i64_opt(g, "qwen4exp.ple.conv_kernel", t))  out.ple_conv_kernel = (int) t;
         if (kv_i64_opt(g, "qwen4exp.embedding_length_per_layer_input", t))
             out.n_embd_per_layer_input = (int) t;
+        if (kv_i64_opt(g, "qwen4exp.ple.heads_per_ngram", t))
+            out.ple_heads_per_ngram = (int) t;
+        if (kv_i64_opt(g, "qwen4exp.ple.eos_token_id", t))
+            out.ple_eos_token_id = (int32_t) t;
+        if (kv_i64_opt(g, "qwen4exp.ple.image_token_id", t))
+            out.ple_image_token_id = (int32_t) t;
+
+        // ple_n_heads is derived, not stored, and the two head arrays must
+        // carry exactly that many entries -- a mismatch means the hash would
+        // index past its own constants.
+        out.ple_n_heads = (out.ple_ngram_size - 1) * out.ple_heads_per_ngram;
+
+        std::vector<int64_t> mult, offs, vocabs;
+        std::string e;
+        if (!kv_i32_array(g, "qwen4exp.ple.layer_multipliers", mult, e) ||
+            !kv_i32_array(g, "qwen4exp.ple.head_offsets", offs, e) ||
+            !kv_i32_array(g, "qwen4exp.ple.head_vocab_sizes", vocabs, e)) {
+            err = "qwen4exp: PLE is declared on layer " + std::to_string(out.ple_layer) +
+                  " but its hash constants are missing: " + e;
+            return false;
+        }
+        if ((int) mult.size() != out.ple_ngram_size ||
+            (int) offs.size() != out.ple_n_heads ||
+            (int) vocabs.size() != out.ple_n_heads) {
+            err = "qwen4exp: PLE hash constants have the wrong lengths -- "
+                  "layer_multipliers " + std::to_string(mult.size()) + " (want " +
+                  std::to_string(out.ple_ngram_size) + "), head_offsets " +
+                  std::to_string(offs.size()) + " and head_vocab_sizes " +
+                  std::to_string(vocabs.size()) + " (want " +
+                  std::to_string(out.ple_n_heads) + " each)";
+            return false;
+        }
+        out.ple_layer_multipliers.assign(mult.begin(), mult.end());
+        out.ple_head_offsets.assign(offs.begin(), offs.end());
+        out.ple_head_vocab_sizes.assign(vocabs.begin(), vocabs.end());
     }
 
     // ── verify against the weights ────────────────────────────────────────
@@ -438,6 +473,36 @@ bool load_qwen4exp_gguf(const std::string & path,
         out.per_layer_token_embd = ggml_dup_tensor(out.ctx, ple_tab.meta);
         if (out.per_layer_token_embd)
             ggml_set_name(out.per_layer_token_embd, "per_layer_token_embd.weight");
+
+        // Its own mapping of the same shard, kept alive by the embedder. A
+        // second mapping of one file costs nothing beyond the descriptor --
+        // the pages are shared -- and it avoids both a 36 GiB copy and 36 GiB
+        // of device memory this box does not have to spare.
+        GgufMmap table_map;
+        std::string map_err;
+        if (!table_map.open(ple_tab.path, map_err)) {
+            std::fprintf(stderr, "[qwen4exp] PLE table: %s\n", map_err.c_str());
+        } else {
+            GgufMmap::OwnedRegion r = table_map.release();
+            out.ple_table.mmap_addr = const_cast<void *>(r.data);
+            out.ple_table.mmap_len  = r.size;
+#if !defined(_WIN32)
+            out.ple_table.mmap_fd   = r.fd;
+#endif
+            out.ple_table.tok_embd_bytes =
+                static_cast<const uint8_t *>(r.data) + ple_tab.file_offset;
+            out.ple_table.tok_embd_type = ple_tab.meta->type;
+            out.ple_table.n_embd  = ple_tab.meta->ne[0];
+            out.ple_table.n_vocab = ple_tab.meta->ne[1];
+            out.ple_table.row_bytes =
+                ple_tab.size / (size_t) out.ple_table.n_vocab;
+            std::fprintf(stderr,
+                "[qwen4exp] PLE table mapped: %lld rows of %lld, %.1f GiB, "
+                "%zu bytes/row\n",
+                (long long) out.ple_table.n_vocab, (long long) out.ple_table.n_embd,
+                (double) ple_tab.size / (1024.0*1024.0*1024.0),
+                out.ple_table.row_bytes);
+        }
     }
 
     // ── one buffer, one pass ──────────────────────────────────────────────

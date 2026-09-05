@@ -32,6 +32,7 @@
 #include "internal.h"
 
 #include <string>
+#include <vector>
 
 namespace dflash::common {
 
@@ -48,6 +49,20 @@ namespace dflash::common {
 bool read_qwen4exp_hparams(const GgufShardSet & shards,
                            TargetWeights & out,
                            std::string & err);
+
+// Row indices into per_layer_token_embd for one batch: ple_n_heads entries per
+// token, head-minor. `prev` carries ngram_size-1 predecessors per token, oldest
+// first, negative where the sequence does not reach that far back.
+//
+// This is host-side on purpose. The table is ~36 GiB and the gather reads
+// ple_n_heads rows of 160 values per token -- about 10 KB -- so mapping it and
+// gathering here keeps 36 GiB off a device that has no room for it, at no
+// measurable bandwidth cost.
+void qwen4exp_ple_rows(const TargetWeights & w,
+                       const int32_t * tokens,
+                       const int32_t * prev,
+                       int n_tokens,
+                       std::vector<int32_t> & out);
 
 // Load a qwen4exp model from a (possibly split) GGUF into `out`.
 bool load_qwen4exp_gguf(const std::string & path,

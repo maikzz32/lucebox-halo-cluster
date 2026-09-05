@@ -20,9 +20,10 @@ Every derived scalar reproduces a real tensor's `ne`. Nine equations, nine passe
 | `embedding_length_per_layer_input` == `per_layer_token_embd.ne[0]` | 160 |
 
 `sum(ple.head_vocab_sizes)` is 320,001,446 against `per_layer_token_embd.ne[1]`
-of 320,001,536 -- a 90-row difference to resolve in the loader, most likely
-padding or an off-by-one in the head-offset table. Not blocking; noted so it is
-checked rather than assumed.
+of 320,001,536. **Resolved:** the 16 head vocabularies tile the table with no
+gaps -- `head_offsets[i] + head_vocab_sizes[i] == head_offsets[i+1]` holds for
+every i -- so the last addressable row is 320,001,445 and the remaining 90 rows
+are padding the hash never reaches.
 
 ## Layer structure
 
@@ -249,9 +250,6 @@ and a recorded quality baseline belong with it rather than after it.
 
 Two open items:
 
-- The 90-row difference between `sum(ple.head_vocab_sizes)` (320,001,446) and
-  `per_layer_token_embd.ne[1]` (320,001,536) is unexplained. It does not block
-  loading, but PLE cannot be called correct until it is understood.
 - 60 tensors are quant type 100, which `mmq.cu` has no case for: `attn_qkv`,
   `attn_k` and `attn_v`. The experts are all type 101 and keep MMQ, so this
   costs prefill speed on the attention projections only.
@@ -325,3 +323,25 @@ But the gather reads 16 rows of 160 values per token -- about 10 KB -- so
 doing it on the host and uploading the result as a graph input keeps 35.8 GiB
 off the device and costs nothing in bandwidth. That is the same trade the
 `CpuEmbedder` already makes for `token_embd`.
+
+
+### Stage 4a: the hash, implemented and checked
+
+`qwen4exp_ple_rows()` in `qwen4exp_ple.cpp`, and the table mapped rather than
+copied: `[qwen4exp] PLE table mapped: 320001536 rows of 160, 35.8 GiB,
+120 bytes/row`. A second mapping of a shard costs nothing beyond a descriptor
+-- the pages are shared with the loader's -- and it keeps 35.8 GiB off both
+the device and the heap.
+
+Checked against the file's own constants:
+
+| | |
+|---|---|
+| `(ngram_size-1) * heads_per_ngram` == array lengths | 2*8 = 16 = len(head_offsets) = len(head_vocab_sizes) |
+| head vocabularies tile the table with no gaps | `off[i] + vs[i] == off[i+1]` for all i |
+| every row index lands inside its own head's range, and inside the table | 0 violations over 20 distinct inputs |
+| context actually changes the result | `prev=[5,7]` and `prev=[-1,-1]` give different rows |
+
+The loader refuses the model if the three constant arrays have the wrong
+lengths, because a short array would make the hash index past its own
+constants rather than fail.

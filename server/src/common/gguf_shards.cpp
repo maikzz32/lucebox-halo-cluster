@@ -239,6 +239,8 @@ bool GgufShardSet::find(const char * name, GgufShardTensor & out, std::string & 
     out.shard = shard_idx;
     out.index = tid;
     out.size  = size;
+    out.path  = s.path;
+    out.file_offset = s.data_off + rel;
     out.data  = static_cast<const uint8_t *>(s.map.data()) + s.data_off + rel;
     out.meta  = ggml_get_tensor(s.meta_ctx, name);
     return true;

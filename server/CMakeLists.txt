@@ -536,6 +536,7 @@ add_library(dflash_common STATIC
     src/qwen4exp/qwen4exp_loader.cpp
     src/qwen4exp/qwen4exp_backend.cpp
     src/qwen4exp/qwen4exp_graph.cpp
+    src/qwen4exp/qwen4exp_ple.cpp
     src/common/dynamic_backend.cpp
     src/common/domino_head.cpp
     src/common/dspark_head.cpp
