@@ -173,10 +173,12 @@ void qwen4exp_mtp_draft_step(Qwen4ExpMtpRuntime & rt,
         const char * e = std::getenv("DFLASH_QWEN4EXP_MTP_NO_HISTORY");
         return e && std::atoi(e) == 1;
     }();
-    // Out of window: start the history over rather than stop drafting. The
-    // head loses its context for one step and rebuilds it; stopping would cost
-    // every remaining token of the request.
-    if (rt.pos >= rt.max_ctx) rt.pos = 0;
+    // The window is a ring, not a limit. Once it is full every row holds a
+    // recent draft, so the write cycles and the mask opens the whole window
+    // rather than a prefix of it. Resetting the position instead would point
+    // the mask at row zero while row zero still held a draft from a window ago.
+    const int slot = rt.pos % rt.max_ctx;
+    const bool window_full = rt.pos >= rt.max_ctx;
     if (!rt.ctx) {
         mark("build");
         const int64_t t_build0 = ggml_time_us();
@@ -218,10 +220,8 @@ void qwen4exp_mtp_draft_step(Qwen4ExpMtpRuntime & rt,
             rt.ctx = nullptr;
             return;
         }
-        if (rt.pos == 0) {
-            std::fprintf(stderr, "[qwen4exp-mtp] draft graph: %d nodes\n",
-                         ggml_graph_n_nodes(rt.gf));
-        }
+        std::fprintf(stderr, "[qwen4exp-mtp] draft graph: %d nodes, window %d\n",
+                     ggml_graph_n_nodes(rt.gf), rt.max_ctx);
         rt.build_us += (uint64_t) (ggml_time_us() - t_build0);
     }
 
@@ -238,15 +238,16 @@ void qwen4exp_mtp_draft_step(Qwen4ExpMtpRuntime & rt,
     ggml_backend_tensor_set(rt.in_pos, pos4, 0, sizeof(pos4));
 
     if (rt.in_mask && rt.in_kv_rows) {
-        // Everything the head has drafted from so far is readable, and nothing
-        // past it -- the rest of the cache is there but masked off.
+        // Readable: the whole window once it has filled, otherwise the rows
+        // written so far. The rest of the cache is there and masked off.
         std::vector<uint16_t> mask;
-        build_causal_mask(mask, rt.max_ctx, /*n_tokens=*/1, /*kv_start=*/rt.pos,
+        build_causal_mask(mask, rt.max_ctx, /*n_tokens=*/1,
+                          /*kv_start=*/window_full ? rt.max_ctx - 1 : slot,
                           /*kq_stride_pad=*/256, /*win_start=*/0,
                           /*kv_pad_override=*/rt.kv_pad);
         ggml_backend_tensor_set(rt.in_mask, mask.data(), 0,
                                 sizeof(uint16_t) * mask.size());
-        std::vector<int64_t> rows((size_t) t.n_head_kv, (int64_t) rt.pos);
+        std::vector<int64_t> rows((size_t) t.n_head_kv, (int64_t) slot);
         ggml_backend_tensor_set(rt.in_kv_rows, rows.data(), 0,
                                 sizeof(int64_t) * rows.size());
     }
