@@ -1,4 +1,5 @@
 #include "qwen35_backend.h"
+#include "qwen4exp/qwen4exp_internal.h"
 #include "concurrency/qwen35_seq_engine.h"
 #include "common/chain_rollback_policy.h"
 #include "common/draft_block_size.h"
@@ -279,6 +280,50 @@ KvFlashAutoBudget Qwen35Backend::make_kvflash_budget(const TargetWeights & w,
 }
 
 // ── init() ──────────────────────────────────────────────────────────────
+
+bool Qwen35Backend::fill_ple_embed(const int32_t * toks, int n) {
+    if (!sg_.ple_embed || w_.ple_layer < 0 || n <= 0) return true;
+    if (!w_.ple_table.tok_embd_bytes) {
+        std::fprintf(stderr, "[qwen4exp] PLE table is not mapped\n");
+        return false;
+    }
+    const int n_prev  = w_.ple_ngram_size - 1;
+    const int n_heads = w_.ple_n_heads;
+
+    // ext = history ++ batch, so a predecessor lookup is one index either side
+    // of the boundary rather than two cases.
+    std::vector<int32_t> ext;
+    ext.reserve(ple_hist_.size() + (size_t) n);
+    ext.insert(ext.end(), ple_hist_.begin(), ple_hist_.end());
+    ext.insert(ext.end(), toks, toks + n);
+    const int h = (int) ple_hist_.size();
+
+    std::vector<int32_t> prev((size_t) n_prev * n, -1);
+    for (int i = 0; i < n; ++i) {
+        for (int s = 1; s <= n_prev; ++s) {
+            const int j = h + i - s;
+            // oldest-first within a token, as qwen4exp_ple_rows expects
+            prev[(size_t) i * n_prev + (n_prev - s)] = (j >= 0) ? ext[(size_t) j] : -1;
+        }
+    }
+
+    std::vector<int32_t> rows;
+    qwen4exp_ple_rows(w_, toks, prev.data(), n, rows);
+
+    // embed() writes [160, rows] and the heads of one token are consecutive,
+    // so the buffer is already [n_heads*160, n] = [n_embd, n].
+    std::vector<float> buf((size_t) w_.ple_table.n_embd * rows.size());
+    if (!w_.ple_table.embed(rows.data(), (int) rows.size(), buf.data())) {
+        std::fprintf(stderr, "[qwen4exp] PLE row gather failed\n");
+        return false;
+    }
+    ggml_backend_tensor_set(sg_.ple_embed, buf.data(), 0, sizeof(float) * buf.size());
+
+    // Keep only what the next batch needs.
+    ple_hist_.assign(ext.end() - std::min<size_t>((size_t) n_prev, ext.size()), ext.end());
+    (void) n_heads;
+    return true;
+}
 
 bool Qwen35Backend::init() {
     configure_concurrent_hipblaslt_default(cfg_);
@@ -1854,6 +1899,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         if (!w_.embedder.embed(tokens.data() + start, n_tokens, embed_buf.data())) {
             return -1;
         }
+        if (!fill_ple_embed(tokens.data() + start, n_tokens)) return -1;
         ggml_backend_tensor_set(sg_.inp_embed, embed_buf.data(), 0,
                                 sizeof(float) * (size_t)hidden * n_tokens);
 
@@ -2246,6 +2292,7 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         int32_t tok = out_tokens.back();
 
         if (!w_.embedder.embed(&tok, 1, embed_buf)) return false;
+        if (!fill_ple_embed(&tok, 1)) return false;
         ggml_backend_tensor_set(sg_.inp_embed, embed_buf, 0, sizeof(float) * hidden);
         int32_t pos4[4] = {committed, committed, committed, 0};
         ggml_backend_tensor_set(sg_.positions, pos4, 0, sizeof(int32_t) * 4);

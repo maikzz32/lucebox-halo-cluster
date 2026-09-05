@@ -162,6 +162,18 @@ public:
     void release_scratch() override;
 
 protected:
+    // qwen4exp PLE needs the ngram_size-1 tokens preceding the current batch,
+    // and they cross both chunk boundaries during prefill and the boundary
+    // into decode -- out_tokens holds only generated tokens, so it cannot
+    // supply them. This rolling window follows the KV cache: whatever the
+    // model has consumed, in order, truncated to what the hash needs.
+    std::vector<int32_t> ple_hist_;
+
+    // Compute the PLE row indices for `n` tokens, gather them from the mapped
+    // table, upload to sg_.ple_embed, and advance ple_hist_. No-op unless the
+    // model has a PLE layer and the step graph carries the input.
+    bool fill_ple_embed(const int32_t * toks, int n);
+
     virtual bool load_target_model(ggml_backend_t backend, TargetWeights & out);
     virtual bool run_ar_decode_path(int committed, int n_gen,
                                     std::vector<int32_t> & out_tokens,
