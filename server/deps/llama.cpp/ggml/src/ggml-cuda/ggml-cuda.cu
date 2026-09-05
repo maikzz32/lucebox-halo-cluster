@@ -3917,6 +3917,28 @@ static void ggml_cuda_graph_refused(const char * why) {
     }
 }
 
+// DFLASH_CLUSTER_SEGMENTED_GRAPH=1: capture the forward in segments cut at
+// every cluster collective, instead of refusing to capture it at all.
+//
+// The measurement this exists for, two nodes, qwen4exp, one decode step:
+// eager with a real collective 40.2 ms; captured whole with an empty
+// collective 32.4 ms; captured whole with a real one ~42 ms. So the graph is
+// worth 7.8 ms and an RCCL collective inside it costs about 10 -- but eagerly
+// that same collective is nearly free. Segmenting takes both: the kernels
+// replay, the collective does not.
+static bool ggml_cuda_graph_segmented() {
+    static const bool on = [] {
+        const char * v = getenv("DFLASH_CLUSTER_SEGMENTED_GRAPH");
+        return v && v[0] && strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+
+static bool ggml_cuda_is_capture_break(const ggml_tensor * node) {
+    return node->op == GGML_OP_MOE_FUSED &&
+           ggml_get_op_params_i32(node, 0) == GGML_MOE_FUSED_CLUSTER_ALLREDUCE;
+}
+
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
@@ -3952,7 +3974,8 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         // exists in the first place.
         if (node->op == GGML_OP_MOE_FUSED &&
             ggml_get_op_params_i32(node, 0) == GGML_MOE_FUSED_CLUSTER_ALLREDUCE &&
-            !ggml_cuda_cluster_capture_allowed()) {
+            !ggml_cuda_cluster_capture_allowed() &&
+            !ggml_cuda_graph_segmented()) {
             use_cuda_graph = false;
             ggml_cuda_graph_refused("site 2");
 #ifndef NDEBUG
@@ -4645,6 +4668,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
 
+#ifdef USE_CUDA_GRAPH
+    ggml_cuda_graph * seg_graph = cuda_ctx->cuda_graph(graph_key);
+    // Segmenting only while capturing, and never alongside multi-stream
+    // regions: ending a capture that has forked streams open is not something
+    // this path can put back together.
+    const bool segmenting = use_cuda_graph && cuda_graph_update_required &&
+                            ggml_cuda_graph_segmented() &&
+                            cuda_ctx->stream_context().concurrent_events.empty();
+    if (segmenting) {
+        seg_graph->free_segments();
+    }
+#endif  // USE_CUDA_GRAPH
+
     ggml_cuda_stream_context & stream_ctx = cuda_ctx->stream_context();
     bool                         is_concurrent_event_active = false;
     ggml_cuda_concurrent_event * concurrent_event           = nullptr;
@@ -5180,6 +5216,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+#ifdef USE_CUDA_GRAPH
+                if (segmenting && ggml_cuda_is_capture_break(node)) {
+                    // Close the segment before the collective and leave the
+                    // collective out of it. Nothing has run yet -- a capture
+                    // records, it does not execute -- so the collective is
+                    // launched later, in its place, between the segment
+                    // launches below.
+                    cudaGraph_t seg = nullptr;
+                    CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &seg));
+                    seg_graph->seg_graphs.push_back(seg);
+                    CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(),
+                                                      cudaStreamCaptureModeRelaxed));
+                    continue;
+                }
+#endif  // USE_CUDA_GRAPH
+
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
@@ -5219,6 +5271,38 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
         if (cuda_graph_update_required) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+        }
+        if (!graph->seg_graphs.empty()) {
+            // The earlier segments are re-instantiated rather than updated.
+            // A recapture happens a handful of times in a few hundred steps,
+            // so what this costs is not on the path that matters, and an
+            // update that silently failed here would be a wrong forward.
+            if (graph->seg_instances.size() != graph->seg_graphs.size()) {
+                for (cudaGraphExec_t e : graph->seg_instances) {
+                    if (e) CUDA_CHECK(cudaGraphExecDestroy(e));
+                }
+                graph->seg_instances.assign(graph->seg_graphs.size(), nullptr);
+                for (size_t s = 0; s < graph->seg_graphs.size(); ++s) {
+                    CUDA_CHECK(cudaGraphInstantiate(&graph->seg_instances[s],
+                                                    graph->seg_graphs[s], NULL, NULL, 0));
+                }
+            }
+            // The break nodes are read from the graph being run, not
+            // remembered: the ggml graph is rebuilt every step, so any pointer
+            // kept from the capture would be to a tensor that no longer exists.
+            std::vector<ggml_tensor *> breaks;
+            breaks.reserve(graph->seg_instances.size());
+            for (int i = 0; i < cgraph->n_nodes; i++) {
+                if (ggml_cuda_is_capture_break(cgraph->nodes[i])) {
+                    breaks.push_back(cgraph->nodes[i]);
+                }
+            }
+            GGML_ASSERT(breaks.size() == graph->seg_instances.size());
+            for (size_t s = 0; s < graph->seg_instances.size(); ++s) {
+                CUDA_CHECK(cudaGraphLaunch(graph->seg_instances[s], cuda_ctx->stream()));
+                const bool ok = ggml_cuda_compute_forward(*cuda_ctx, breaks[s]);
+                GGML_ASSERT(ok);
+            }
         }
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));

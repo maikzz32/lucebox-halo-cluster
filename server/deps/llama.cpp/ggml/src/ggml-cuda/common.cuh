@@ -1233,6 +1233,7 @@ struct ggml_tensor_extra_gpu {
 struct ggml_cuda_graph {
 #ifdef USE_CUDA_GRAPH
     ~ggml_cuda_graph() {
+        free_segments();
         if (instance != nullptr) {
             CUDA_CHECK(cudaGraphExecDestroy(instance));
         }
@@ -1242,6 +1243,25 @@ struct ggml_cuda_graph {
     }
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t instance = nullptr;
+    // Segmented capture. A node that must not be captured -- a cluster
+    // collective, which measures about seven times more expensive inside a
+    // replayed graph than launched eagerly -- cuts the capture in two. The
+    // kernels around it still replay; only the collective is launched by hand,
+    // between two graph launches on the same stream, so the ordering the
+    // stream gives is unchanged. `graph`/`instance` hold the LAST segment.
+    std::vector<cudaGraph_t>     seg_graphs;
+    std::vector<cudaGraphExec_t> seg_instances;
+
+    void free_segments() {
+        for (cudaGraphExec_t e : seg_instances) {
+            if (e) CUDA_CHECK(cudaGraphExecDestroy(e));
+        }
+        for (cudaGraph_t g : seg_graphs) {
+            if (g) CUDA_CHECK(cudaGraphDestroy(g));
+        }
+        seg_instances.clear();
+        seg_graphs.clear();
+    }
     size_t num_nodes = 0;
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;

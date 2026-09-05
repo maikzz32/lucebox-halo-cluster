@@ -512,6 +512,20 @@ bool load_qwen4exp_gguf(const std::string & path,
         const char * e = std::getenv("DFLASH_QWEN4EXP_NO_SHARD_SSM");
         return e && std::atoi(e) == 1;
     }();
+    // The routed experts are the most reduction-heavy axis there is: one
+    // collective per layer, 48 per token, for the bytes of the ten experts a
+    // token actually reads. DFLASH_QWEN4EXP_NO_SHARD_EXPERTS=1 keeps them
+    // whole -- every rank holds every expert, which costs residency and buys
+    // back 48 synchronisation points.
+    static const bool experts_whole = []() {
+        const char * e = std::getenv("DFLASH_QWEN4EXP_NO_SHARD_EXPERTS");
+        return e && std::atoi(e) == 1;
+    }();
+    if (experts_whole && cluster && cluster->sharded()) {
+        const_cast<Qwen4ExpClusterRuntime *>(cluster)->experts_sharded = false;
+        std::fprintf(stderr,
+                     "[qwen4exp-cluster] routed experts stay whole by request\n");
+    }
     if (ssm_whole && cluster && cluster->sharded()) {
         const_cast<Qwen4ExpClusterRuntime *>(cluster)->ssm_sharded = false;
         std::fprintf(stderr,
@@ -606,12 +620,14 @@ bool load_qwen4exp_gguf(const std::string & path,
         // the same experts and holds a slice of each one's width, so the
         // routed and shared outputs are partial sums that one all-reduce per
         // layer completes.
+        const ShardAxis exp_rows = experts_whole ? ShardAxis::None : ShardAxis::Rows;
+        const ShardAxis exp_cols = experts_whole ? ShardAxis::None : ShardAxis::Cols;
         L.ffn_gate_exps      = b.take_shard(blk(il, "ffn_gate_exps.weight"),
-                                            ShardAxis::Rows, kFfnShardGran, true);
+                                            exp_rows, kFfnShardGran, true);
         L.ffn_up_exps        = b.take_shard(blk(il, "ffn_up_exps.weight"),
-                                            ShardAxis::Rows, kFfnShardGran, true);
+                                            exp_rows, kFfnShardGran, true);
         L.ffn_down_exps      = b.take_shard(blk(il, "ffn_down_exps.weight"),
-                                            ShardAxis::Cols, kFfnShardGran, true);
+                                            exp_cols, kFfnShardGran, true);
         L.ffn_gate_shexp     = b.take_shard(blk(il, "ffn_gate_shexp.weight"),
                                             ShardAxis::Rows, kFfnShardGran, false);
         L.ffn_up_shexp       = b.take_shard(blk(il, "ffn_up_shexp.weight"),

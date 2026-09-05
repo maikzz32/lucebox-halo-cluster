@@ -77,6 +77,12 @@ struct Qwen4ExpClusterRuntime {
     // count.
     bool ssm_sharded = true;
 
+    // Whether the routed experts hold a slice. Sharding them is what expert
+    // parallelism is, but it is also the most expensive axis in reductions:
+    // 48 of them for the bytes of ten experts. Whether that trades well is a
+    // measurement, not a given.
+    bool experts_sharded = true;
+
     int rank() const { return cfg ? cfg->rank : 0; }
     int size() const { return cfg ? cfg->size : 1; }
     bool sharded() const { return cfg && cfg->enabled() && cfg->size > 1; }

@@ -2887,7 +2887,9 @@ static ggml_tensor * build_single_layer_hc(
     // one alike, since both were cut the same way. One reduction per layer
     // makes it whole again before it is written into the carrier.
     if (w.cluster) {
-        ffn = qwen4exp_cluster_allreduce_node(ctx, ggml_cont(ctx, ffn), *w.cluster);
+        if (w.cluster->experts_sharded) {
+            ffn = qwen4exp_cluster_allreduce_node(ctx, ggml_cont(ctx, ffn), *w.cluster);
+        }
     }
     if (skip_blocks) ffn = ggml_scale(ctx, ffn, 0.0f);
     qwen4exp_probe_add(ctx, gf, "ffn_mix", layer_idx, ffn_in);
