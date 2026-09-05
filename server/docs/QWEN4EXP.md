@@ -566,22 +566,33 @@ through a pinned flag between a kernel and a host thread is **0.79 us**
 2765 MB per rank puts a two-node step near 30 ms and a four-node step near 20,
 which is where the 32 and 50 tok/s targets live.
 
-### The lean reduction, as far as it has got
+### The lean reduction: built, correct, and level with the collective
 
-`DFLASH_CLUSTER_FAST_REDUCE=1`, opt-in and **not usable yet**. Each rank writes
-its partial straight into every peer's pre-registered buffer and adds what
-arrives: one RDMA write plus an inline flag per peer, no algorithm selection and
-no proxy handshake.
+`DFLASH_CLUSTER_FAST_REDUCE=1`, opt-in. Each rank writes its partial straight
+into every peer's pre-registered buffer and adds what arrives: one RDMA write
+plus an inline flag per peer, no algorithm selection and no proxy handshake.
 
 What makes it possible here is unified memory. On Strix Halo a pinned host
-buffer *is* GPU memory, so the NIC writes into it and a kernel reads it without
-a copy and without GPUDirect. It has to be pinned rather than managed: gfx1151
-reports XNACK disabled, so the GPU cannot take a page fault, and a managed page
-the CPU has touched faults the moment a kernel reads it.
+buffer *is* GPU memory, so the NIC writes into it and the reduction reads it
+without a copy and without GPUDirect. It has to be pinned rather than managed:
+gfx1151 reports XNACK disabled, so the GPU cannot take a page fault, and a
+managed page the CPU has touched faults the moment a kernel reads it.
 
-It connects and it reduces correctly -- 1800 consecutive reductions, zero
-timeouts, sequence numbers in step on both ranks. Four things had to be right
-for that, and each presented as a hang:
+**The flags cannot be raised by a kernel.** That is the finding worth keeping.
+Raising a flag the host will see needs a system-scope release, which writes the
+L2 back; spinning on one the host raised needs a system-scope acquire, which
+invalidates it. Either way the weights the next layer is about to read are gone.
+Measured, that cost 34 ms per reduction against RCCL's 117 us -- 250 times
+worse -- while the same path with the flags removed and both copies kept ran
+the step in 32.5 ms against 29.6 for the GPU work alone. Weakening every
+ordering to the least that could still be correct did not help: relaxed is
+cheap and the host then does not see the flag at all.
+
+`hipStreamWriteValue32` and `hipStreamWaitValue32` are handled by the command
+processor, so the shader cores and their caches are not involved. That is what
+this needs and what a kernel cannot be.
+
+Four more things had to be right, each of which presented as a hang:
 
   - **one memory key per region.** Payload and flags are separate regions, so a
     remote write carries a different key for each. One key for both is not a
@@ -589,100 +600,43 @@ for that, and each presented as a hang:
     and the peer waits.
   - **the grid, not a thread.** A flag raised by one block while others were
     still copying hands the peer a half-written buffer.
-    `__threadfence_system` orders one thread's own writes; only a kernel
-    boundary or `__syncthreads` orders the grid's.
-  - **the NIC must not write a flag the GPU polls.** A DMA write into system
-    memory is coherent with a CPU read, but nothing invalidates the GPU's
-    caches for it. The host carries arrivals across with an ordinary store --
-    which is exactly what a general collective's proxy thread is for.
-  - **acquire at system scope**, not `volatile`. A volatile load on gfx11 can
-    still be answered from the GPU's own L2.
+  - **the slot ring needs its guard in the stream form too.** The kernel form
+    waited; `hipStreamWriteValue32` does not, so the GPU lapped the ring and
+    overwrote payloads that had not been sent -- and the threshold is
+    `seq - slots`, not `seq - slots + 2`, which nothing can ever satisfy.
+  - **payload lengths cannot share that ring.** They are written when the host
+    *enqueues* a reduction, and the host enqueues a step ahead.
 
 And a trap worth naming twice: without `--ulimit memlock=-1` the pinned pages
 fail to map and every kernel touching them dies with "Memory in use", which
 reads like a hardware limit and is not one.
 
-**Where it stops.** 34 ms per reduction against RCCL's 117 us. Moving the
-payload by kernel and by copy engine cost the same, and a dry run -- every local
-operation kept, the waiting and the wire removed -- does not complete a decode
-step either. So the cost is local, and it is the added operations themselves.
-At that magnitude the candidate is `hipMemcpyAsync` between device and pinned
-host memory blocking, and a block inside an eager decode loop drains the whole
-pipeline.
+**What it is worth.** Level with the collective, not eight times cheaper as the
+latency arithmetic suggested:
 
-**What to try next.** Do not stage through host memory at all. RCCL's own log
-reports `GPU Direct RDMA Enabled for HCA 0` on this fabric, so the NIC can be
-pointed at device memory through a dmabuf-registered MR: no copies, and the
-flags stay where they already work.
+| two nodes | step | decode |
+|---|---|---|
+| RCCL, AR | 40.2 ms | 24.5 tok/s |
+| lean, AR | 37.7 ms | 25.2 tok/s |
+| RCCL + speculation | 54.0 ms | 27.3 tok/s |
+| lean + speculation | 53.8 ms | 27.5 tok/s |
 
-### The cluster is not bandwidth-bound, and that is the whole story
+A caution about the AR row: the lean path only reaches 37.7 ms when the GPU is
+allowed to run far ahead of the reductions, and an early version reached an
+apparent 31.4 tok/s with speculation only because its ring had lapped -- it was
+not synchronising at all. With the ring deep enough to be correct the number is
+27.5.
 
-Every axis was measured on its own, five samples inside one server instance
-(the spread there is 0.1 tok/s; between restarts it is much larger, so
-comparisons must stay inside one instance):
+So the conclusion the sharding trade-off already pointed at is now supported by
+an implementation rather than by inference: **what a reduction costs on this
+fabric is the synchronisation point itself**, the stream draining to the wait
+and refilling after it, and that is the same whoever issues it. The wire is
+13.65 us and the flag round trip is 0.79 us; neither is what the 117 us is made
+of.
 
-| | 2 nodes |
-|---|---|
-| MoE + delta net | 25.2 |
-| + vocabulary | 25.3 |
-| + attention heads | 25.4 |
-| one node, nothing split | 23.6 |
-
-Splitting three quarters of the bytes buys 7%. That is not what a
-bandwidth-bound run looks like, and the effective rate says the same: one node
-sustains 100 GB/s of weight reads, the two-node cluster 74.
-
-`GGML_CUDA_GRAPH_WHY=1` names the reason. On one node no rule refuses the
-CUDA graph. In a cluster exactly one does -- the cluster all-reduce node --
-and it costs the *whole* forward its graph, so every kernel of a 48-layer step
-is launched eagerly. The sharding does remove bytes; the launches it cannot
-remove are what the step is waiting on.
-
-`DFLASH_CLUSTER_GRAPH_CAPTURE=1` lifts that rule, and the instrumentation
-confirms the graph is then captured with the collective inside -- and it gets
-slower, 23.8 tok/s with RCCL's LL protocol and 24.4 with its default. The same
-flag also counts captures against replays: 3 captures in 128 steps, so it is
-not rebuilding the graph every step. A captured RCCL collective is simply
-worse than an eager one on this fabric.
-
-The clearest evidence that the bytes are not the constraint is that the number
-of collectives does not matter either: 84 of them give 25.2 tok/s, 85 give
-25.3 and 97 give 25.4. What costs is losing the graph, and one collective
-loses it as thoroughly as ninety-seven.
-
-So the cost is not the bytes on the wire and not the launch of the collective
-alone: it is that a collective is a synchronisation point the graph cannot
-absorb, ninety-six times per token. Two things address that, and both are what
-vLLM does on the same class of hardware:
-
-  - **a capturable all-reduce.** vLLM does not use NCCL for small decode-path
-    reductions; it uses a custom one-shot kernel over pre-registered peer
-    buffers, which is an ordinary kernel and captures like any other. That
-    removes the rule and the synchronisation together.
-  - **more tokens per forward.** Speculative decoding amortises every
-    synchronisation point over q tokens and makes each matmul q times larger,
-    which is the same lever that takes deepseek4 from 32 to 50 tok/s in this
-    tree. Qwen3.8-Flash-Next ships an MTP module for it;
-    `mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf` is 2.8 GB and now on strix1.
-
-vLLM's mp-executor, by contrast, is a launcher: it replaces Ray's
-orchestration with `--nnodes/--node-rank/--headless` and leaves the
-tensor-parallel math on NCCL. It removes Ray's per-step scheduling overhead,
-which this tree never had.
-
-### Not split: attention
-
-Query and key heads must move together -- grouped-query attention maps query
-head h to key head h / (n_head / n_head_kv) from this rank's local numbering,
-so splitting the query heads alone sends every rank to key head 0. They do
-split cleanly at two ranks (12 query heads over 1 key head) and cannot at four.
-
-Even done correctly it crashes: with one key head per rank the shared
-attention path trips `GGML_ASSERT(ggml_n_dims(a) >= 2)` inside
-`ggml_turbo_wht`, the rotation guarding a quantised V cache, with an f16 cache
-as well as a quantised one. That path is qwen35's in production, and 342 MB of
-4266 is not worth the risk, so the split is behind
-`DFLASH_QWEN4EXP_SHARD_ATTENTION=1` for whoever picks the crash up.
+The remaining lever is therefore not a faster reduction but fewer of them per
+token -- which is what speculation is, and why it is the only thing in this
+document that moved the number.
 
 ## The MTP head: it works, and it speculates
 
