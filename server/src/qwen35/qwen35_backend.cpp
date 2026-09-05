@@ -2461,7 +2461,7 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                                         sizeof(float) * n * (rows - 1),
                                         sizeof(float) * n);
                 if (!capture_only) {
-                    qwen4exp_mtp_draft_step(mtp_, w_, carrier.data(), next_tok);
+                    qwen4exp_mtp_draft_step(mtp_, w_, carrier.data(), next_tok, committed);
                 }
             }
         }

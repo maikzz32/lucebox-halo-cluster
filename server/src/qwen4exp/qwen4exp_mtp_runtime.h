@@ -15,28 +15,29 @@
 // agrees at chance, and against a 248320-token vocabulary chance rounds to
 // never -- so a single run separates the two without ambiguity.
 //
-// KNOWN FAILURE. Enabling this crashes, and six runs have narrowed where:
+// WHERE IT STANDS. The measurement runs; the head is not yet good enough to
+// speculate with. Acceptance on free prose:
 //
-//   - the draft graph is not wrong. qwen4exp_mtp_probe builds and computes the
-//     same 156-node graph standalone, on the CPU and on HIP, and it produces a
-//     token both times.
-//   - the draft is not what crashes. A checkpoint after its compute prints,
-//     so the whole of qwen4exp_mtp_draft_step runs to completion.
-//   - exposing the carrier is not it. CAPTURE_ONLY=1 asks the target's graph
-//     for hc_final and reads it every step without drafting, and that runs.
-//   - the backend is not it. The head crashes on a HIP context of its own and
-//     on the CPU alike, so it is not the target's pool, stream or context.
-//   - the CUDA graph cache is not it. GGML_CUDA_DISABLE_GRAPHS=1 does not help.
+//   4%   the first reading that ran
+//   0%   with the two halves of the concatenation swapped -- so the
+//        reference's order, embedding first, is confirmed
+//   4%   with the carrier collapsed to one vector before the projection
+//        instead of projected per stream, so that choice is not what matters
+//   8%   reading enorm and hnorm as (1 + w) rather than as w
 //
-// What is left is the target's own step AFTER a draft has run: the draft
-// completes, the loop commits the token, and the next target forward dies.
-// The draft touches nothing the target owns -- its own context, its own
-// buffers, a read-only view of the weights -- so what it disturbs is not
-// visible from here. That needs a stack trace, which needs a debug build; a
-// segfault in a release container leaves nothing to go on.
+// Chance against a 248320-token vocabulary is 0.0004%, so even the first
+// reading was four orders of magnitude better than noise: the head is doing
+// something real and something is still wrong. Speculation needs roughly 60%
+// to pay for itself.
 //
-// The default path is unaffected: without DFLASH_QWEN4EXP_MTP nothing here
-// runs, and the model still scores 8/10 at 24-25 tok/s on one node.
+// The (1 + w) finding is the useful one. The target's hyper-connection norms
+// average about one, which is what a converter that folded the plus-one leaves
+// behind; enorm and hnorm average 0.24 and 0.67, which is what it leaves when
+// it did not, and reading them the other way doubled the rate.
+//
+// Giving the head its own KV history over the context changed nothing, and
+// neither did rotating at the target's absolute position rather than its own
+// -- expected in hindsight, since attention only sees the differences.
 //
 // The block runs against a one-token KV cache that is reset every step, which
 // is not what a served drafter would do. It costs the head its own attention
@@ -74,6 +75,12 @@ struct Qwen4ExpMtpRuntime {
     ggml_context * ctx   = nullptr;
     ggml_cgraph *  gf    = nullptr;
     ggml_gallocr_t alloc = nullptr;
+    // The head's own position in its own KV cache. It attends to everything it
+    // has drafted from, which is what a next-token predictor needs; with a
+    // single visible token the head still beats chance by four orders of
+    // magnitude but only reaches 3-5%.
+    int            pos   = 0;
+    int            max_ctx = 0;
     ggml_tensor *  in_carrier = nullptr;
     ggml_tensor *  in_embed   = nullptr;
     ggml_tensor *  in_pos     = nullptr;
@@ -105,7 +112,8 @@ bool qwen4exp_mtp_open(const TargetWeights & target,
 void qwen4exp_mtp_draft_step(Qwen4ExpMtpRuntime & rt,
                              const TargetWeights & target,
                              const float * carrier,   // [n_embd * n_hc]
-                             int32_t next_token);
+                             int32_t next_token,
+                             int abs_pos);            // the target's position
 
 // Score the pending draft against what the target actually produced.
 void qwen4exp_mtp_score(Qwen4ExpMtpRuntime & rt, int32_t actual_token);

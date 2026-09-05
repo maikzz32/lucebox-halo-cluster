@@ -213,13 +213,28 @@ ggml_tensor * build_qwen4exp_mtp_draft(ggml_context * ctx,
     const int64_t nt     = carrier->ne[2];
     const int64_t hc_dim = (int64_t) t.n_hc * t.n_embd;
 
+    // DFLASH_QWEN4EXP_MTP_UNFOLDED=1 reads enorm and hnorm as (1 + w) rather
+    // than as the gamma itself. The target's hyper-connection norms average
+    // about one, which is what a converter that folded the plus-one leaves
+    // behind; these two average 0.24 and 0.67, which is what it leaves behind
+    // when it did not. Getting this wrong scales the projection's input by a
+    // factor of five, and the acceptance rate is what says which it is.
+    static const bool unfolded = []() {
+        const char * v = std::getenv("DFLASH_QWEN4EXP_MTP_UNFOLDED");
+        return v && std::atoi(v) == 1;
+    }();
+    auto gamma = [&](ggml_tensor * x, ggml_tensor * g) {
+        return unfolded ? ggml_add(ctx, x, ggml_mul(ctx, x, g))
+                        : ggml_mul(ctx, x, g);
+    };
+
     // The token that was just sampled, normalised on its own.
-    ggml_tensor * e = ggml_mul(ctx, ggml_rms_norm(ctx, embed_next, t.rms_eps), w.enorm);
+    ggml_tensor * e = gamma(ggml_rms_norm(ctx, embed_next, t.rms_eps), w.enorm);
 
     // The carrier, normalised the way every qwen4exp norm treats it: the
     // reduction runs over one stream and the flat gamma scales all of them.
     ggml_tensor * h = ggml_rms_norm(ctx, carrier, t.rms_eps);
-    h = ggml_mul(ctx, ggml_reshape_2d(ctx, h, hc_dim, nt), w.hnorm);
+    h = gamma(ggml_reshape_2d(ctx, h, hc_dim, nt), w.hnorm);
     h = ggml_reshape_3d(ctx, h, t.n_embd, t.n_hc, nt);
 
     // eh_proj is [2*n_embd, n_embd], so it cannot see the whole carrier at
@@ -227,11 +242,35 @@ ggml_tensor * build_qwen4exp_mtp_draft(ggml_context * ctx,
     // output is that stream of the carrier the layer runs on. Broadcasting the
     // embedding across the streams and concatenating on the feature axis does
     // all four in one matmul.
-    ggml_tensor * e3 = ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, e, t.n_embd, 1, nt),
-                                      t.n_embd, t.n_hc, nt, 1);
-    ggml_tensor * eh = ggml_concat(ctx, e3, h, 0);          // [2*n_embd, n_hc, T]
-    ggml_tensor * state = ggml_mul_mat(ctx, w.eh_proj, eh); // [n_embd, n_hc, T]
-    state = ggml_cont(ctx, state);
+    // Which of these is right is decided by the acceptance rate, not by
+    // reading: upstream llama.cpp has no qwen4exp MTP and vLLM's Qwen3-Next
+    // one has a single-stream hidden state where this has four. All three
+    // agree with the shapes; only one agrees with the target.
+    static const int variant = []() {
+        const char * v = std::getenv("DFLASH_QWEN4EXP_MTP_VARIANT");
+        return v ? std::atoi(v) : 0;
+    }();
+
+    ggml_tensor * state = nullptr;
+    if (variant == 2) {
+        // The carrier collapsed to one vector first, the projection applied
+        // once, and the result seeded across the streams -- the reading in
+        // which eh_proj really is the reference's fc over one hidden state.
+        ggml_tensor * hm = ggml_cont(ctx, ggml_mean(ctx, ggml_cont(ctx,
+            ggml_permute(ctx, h, 1, 0, 2, 3))));            // [1, n_embd, T]
+        hm = ggml_reshape_2d(ctx, hm, t.n_embd, nt);
+        ggml_tensor * eh = ggml_concat(ctx, e, hm, 0);      // [2*n_embd, T]
+        ggml_tensor * z  = ggml_cont(ctx, ggml_mul_mat(ctx, w.eh_proj, eh));
+        state = qwen4exp_hc_init(ctx, z, t.n_embd, t.n_hc);
+    } else {
+        ggml_tensor * e3 = ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, e, t.n_embd, 1, nt),
+                                          t.n_embd, t.n_hc, nt, 1);
+        // variant 1 swaps the halves: the reference concatenates the embedding
+        // first, but the reference is a different architecture's module.
+        ggml_tensor * eh = variant == 1 ? ggml_concat(ctx, h, e3, 0)
+                                        : ggml_concat(ctx, e3, h, 0);
+        state = ggml_cont(ctx, ggml_mul_mat(ctx, w.eh_proj, eh));
+    }
 
     // One ordinary qwen4exp block, then this head's own output mixer -- which
     // stands in the same place output_hc_* does for the target.
@@ -241,6 +280,18 @@ ggml_tensor * build_qwen4exp_mtp_draft(ggml_context * ctx,
     // this module's single block, and a full-attention interval of one so that
     // block is treated as an attention layer, which is what it is.
     TargetWeights mw = t;
+
+    // TargetWeights carries two CpuEmbedders, and their destructor calls
+    // munmap and close. Copying the struct copies those handles, so when this
+    // copy goes out of scope it unmaps the token table and the 36 GiB PLE
+    // table that the TARGET is still reading from -- and the next target step
+    // dies in dequantize_row_q4_0 on memory that is no longer there. Which is
+    // exactly what it did. Drop the copy's claim on both; assignment
+    // overwrites the handles rather than releasing them, which is what is
+    // wanted here because the original still owns them.
+    mw.embedder  = CpuEmbedder{};
+    mw.ple_table = CpuEmbedder{};
+
     mw.layers.assign(1, w.layer);
     mw.n_layer = 1;
     mw.full_attention_interval = 1;
