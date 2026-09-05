@@ -504,8 +504,13 @@ bool FastReduce::init(const Config & cfg, std::string * err) {
                 fw.num_sge = 1;
                 fw.opcode = IBV_WR_RDMA_WRITE;
                 fw.send_flags = IBV_SEND_INLINE | IBV_SEND_SIGNALED;
+                // Straight at the word the peer's stream is waiting on. When
+                // a shader was the waiter this had to go through the host: a
+                // DMA write into system memory is coherent with a CPU read but
+                // nothing invalidates the GPU's caches for it. The command
+                // processor is not behind those caches, so the hop is gone.
                 fw.wr.rdma.remote_addr = pe.flag_addr +
-                    s.arrival_off(slot, s.cfg.rank) * sizeof(uint32_t);
+                    s.visible_off(slot, s.cfg.rank) * sizeof(uint32_t);
                 fw.wr.rdma.rkey = pe.rkey_flag;
 
                 w.next = &fw;
@@ -534,39 +539,8 @@ bool FastReduce::init(const Config & cfg, std::string * err) {
                 }
             } while (done > 0);
 
-            // Hand the arrivals to the GPU. This is the hop that makes the
-            // design work at all: the kernel is spinning on a word only a CPU
-            // store reaches.
-            for (int r = 0; r < s.cfg.size; ++r) {
-                if (r == s.cfg.rank) continue;
-                volatile uint32_t * arr = s.arrival_flag(slot, r);
-                uint64_t aspins = 0;
-                while (*arr != (uint32_t) next) {
-                    if (s.stop.load(std::memory_order_relaxed)) return;
-                    // Keep draining while waiting: a rejected write reports
-                    // here, and without this the thread waits out its whole
-                    // timeout on an error it was already told about.
-                    const int nw = ibv_poll_cq(s.cq, (int) wc.size(), wc.data());
-                    for (int i = 0; i < nw; ++i) {
-                        if (wc[(size_t) i].status != IBV_WC_SUCCESS) {
-                            std::fprintf(stderr,
-                                         "[fast-reduce] write failed: %s (seq %llu)\n",
-                                         ibv_wc_status_str(wc[(size_t) i].status),
-                                         (unsigned long long) wc[(size_t) i].wr_id);
-                            s.stop.store(true);
-                            return;
-                        }
-                    }
-                    if (++aspins > 400000000ull) {
-                        std::fprintf(stderr,
-                                     "[fast-reduce] no payload from rank %d at seq %llu\n",
-                                     r, (unsigned long long) next);
-                        s.stop.store(true);
-                        return;
-                    }
-                }
-                *(volatile uint32_t *) s.visible_flag(slot, r) = (uint32_t) next;
-            }
+            // Nothing to carry across any more: the peer's own stream is
+            // waiting on the word this rank's NIC wrote.
             if (next <= 3 || next % 4096 == 0) {
                 std::fprintf(stderr,
                              "[fast-reduce] seq %llu delivered (%d floats), "
@@ -618,27 +592,63 @@ bool FastReduce::submit(float * data, size_t n, void * stream) {
     // slow" and "the operations themselves are".
     static const bool dry = std::getenv("DFLASH_CLUSTER_FAST_REDUCE_DRYRUN") != nullptr;
 
+    // Publish and wait are stream operations, not kernels.
+    //
+    // A kernel cannot do this cheaply on gfx1151. Raising a flag the host will
+    // see needs a system-scope release, which writes the L2 back; spinning on
+    // one the host raised needs a system-scope acquire, which invalidates it.
+    // Either way the weights the next layer is about to read are gone, and
+    // measured that cost 34 ms per reduction -- while the same path with the
+    // flags removed ran the step in 32.5 ms. Weakening the ordering does not
+    // help: relaxed is cheap and the host then does not see the flag at all.
+    //
+    // hipStreamWriteValue32 and hipStreamWaitValue32 are handled by the
+    // command processor instead, so the shader cores and their caches are not
+    // involved at all -- which is what this needs and what a kernel cannot be.
+    // DFLASH_CLUSTER_FAST_REDUCE_KERNEL_FLAGS=1 restores the kernel form for
+    // comparison.
+    static const bool kernel_flags =
+        std::getenv("DFLASH_CLUSTER_FAST_REDUCE_KERNEL_FLAGS") != nullptr;
+
     // Publish: the copy engine moves the partial into the pinned staging
-    // buffer, then one thread raises the flag. Both are on the stream, so the
-    // flag cannot precede the data it announces.
+    // buffer, then the flag is written. Both are on the stream, so the flag
+    // cannot precede the data it announces.
     if (hipMemcpyAsync(s.data_host + (size_t) slot * s.slot_stride() +
                            (size_t) s.cfg.rank * s.cfg.max_elems,
                        data, n * sizeof(float), hipMemcpyDefault, stm) != hipSuccess) {
         return false;
     }
-    fast_reduce_launch_set_flag(s.flag_dev + s.pub_off(slot),
-                                s.flag_dev + s.done_off(slot),
-                                s.progress_dev, (uint32_t) seq,
-                                (uint32_t) (s.cfg.slots - 2), kSpin, stm);
+    if (!dry) {
+        if (kernel_flags) {
+            fast_reduce_launch_set_flag(s.flag_dev + s.pub_off(slot),
+                                        s.flag_dev + s.done_off(slot),
+                                        s.progress_dev, (uint32_t) seq,
+                                        (uint32_t) (s.cfg.slots - 2), kSpin, stm);
+        } else if (hipStreamWriteValue32(stm, s.flag_dev + s.pub_off(slot),
+                                         (uint32_t) seq, 0) != hipSuccess) {
+            return false;
+        }
+    }
 
     // Wait for the peers, then bring their partials into device memory before
     // touching them: the staging buffers are uncached for the GPU, and adding
     // straight out of them is what made the first version 250 times slower
     // than the collective it replaces.
     if (!dry) {
-        fast_reduce_launch_wait_flags(s.peer_flags_dev + (size_t) slot * (size_t) n_peers,
-                                      s.timed_out_dev, s.progress_dev,
-                                      (uint32_t) seq, n_peers, kSpin, stm);
+        if (kernel_flags) {
+            fast_reduce_launch_wait_flags(s.peer_flags_dev + (size_t) slot * (size_t) n_peers,
+                                          s.timed_out_dev, s.progress_dev,
+                                          (uint32_t) seq, n_peers, kSpin, stm);
+        } else {
+            for (int r = 0; r < s.cfg.size; ++r) {
+                if (r == s.cfg.rank) continue;
+                if (hipStreamWaitValue32(stm, s.flag_dev + s.visible_off(slot, r),
+                                         (uint32_t) seq, hipStreamWaitValueEq,
+                                         0xffffffffu) != hipSuccess) {
+                    return false;
+                }
+            }
+        }
     }
     float * scratch_row = s.scratch +
         ((size_t) slot * (size_t) n_peers) * (size_t) s.cfg.max_elems;
@@ -654,8 +664,14 @@ bool FastReduce::submit(float * data, size_t n, void * stream) {
         ++k;
     }
     fast_reduce_launch_add(data, scratch_row, n_peers, (int) n, s.cfg.max_elems,
-                           s.flag_dev + s.done_off(slot), s.progress_dev,
-                           (uint32_t) seq, stm);
+                           (dry || !kernel_flags) ? nullptr
+                                                  : s.flag_dev + s.done_off(slot),
+                           s.progress_dev, (uint32_t) seq, stm);
+    if (!dry && !kernel_flags &&
+        hipStreamWriteValue32(stm, s.flag_dev + s.done_off(slot),
+                              (uint32_t) seq, 0) != hipSuccess) {
+        return false;
+    }
     return true;
 }
 

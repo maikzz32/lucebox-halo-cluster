@@ -35,18 +35,42 @@ namespace dflash::cluster {
 namespace {
 constexpr int kBlock = 256;
 
-// `volatile` is not enough on gfx11. It keeps the compiler from caching the
-// value in a register, but the load it emits can still be answered from the
-// GPU's own L2, and nothing invalidates that line when the host writes through
-// its own caches. Acquire at system scope is what forces the invalidate; the
-// symptom of getting it wrong is not a fault but a kernel that spins out its
-// timeout on a flag the host set microseconds ago.
-__device__ __forceinline__ uint32_t sys_load(const uint32_t * p) {
-    return __hip_atomic_load(p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+// Ordering costs cache, and on this part it costs all of it. A system-scope
+// release writes the L2 back and a system-scope acquire invalidates it, so a
+// flag raised or spun on with the strong form evicts the weights the next layer
+// is about to read. Four of them per reduction, ninety-seven reductions per
+// step: measured, that alone was 34 ms per reduction against RCCL's 117 us,
+// while the same path with the announcements removed ran the step in 32.5 ms.
+//
+// So each flag gets the weakest ordering that is still correct:
+//
+//   relaxed system    for anything the host reads or writes. The payload is
+//                     ordered by the stream -- the copy is a separate
+//                     operation that completes before the kernel starts -- so
+//                     no release is needed to publish it.
+//   one acquire       after a spin succeeds, not once per iteration. The
+//                     invalidate has to happen; it does not have to happen a
+//                     million times.
+//   agent scope       for slot_done, which only this GPU's own later kernels
+//                     read. Telling the whole system about it buys nothing.
+__device__ __forceinline__ uint32_t sys_load_relaxed(const uint32_t * p) {
+    return __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
-__device__ __forceinline__ void sys_store(uint32_t * p, uint32_t v) {
-    __hip_atomic_store(p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+__device__ __forceinline__ void sys_store_relaxed(uint32_t * p, uint32_t v) {
+    __hip_atomic_store(p, v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+__device__ __forceinline__ void sys_acquire(const uint32_t * p) {
+    (void) __hip_atomic_load(p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+__device__ __forceinline__ uint32_t dev_load(const uint32_t * p) {
+    return __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+}
+
+__device__ __forceinline__ void dev_store(uint32_t * p, uint32_t v) {
+    __hip_atomic_store(p, v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 }  // namespace
 
@@ -62,12 +86,12 @@ __global__ void fast_reduce_set_flag_kernel(uint32_t * pub_flag,
     // rather than assumed wide enough.
     if (seq > slot_span) {
         uint64_t spins = 0;
-        while (sys_load(slot_done) + slot_span < seq) {
+        while (dev_load(slot_done) + slot_span < seq) {
             if (++spins > spin_limit) break;
         }
     }
-    sys_store(progress, seq * 4u + 1u);
-    sys_store(pub_flag, seq);
+    sys_store_relaxed(progress, seq * 4u + 1u);
+    sys_store_relaxed(pub_flag, seq);
 }
 
 __global__ void fast_reduce_wait_flags_kernel(uint32_t * const * __restrict__ peer_flags,
@@ -77,16 +101,19 @@ __global__ void fast_reduce_wait_flags_kernel(uint32_t * const * __restrict__ pe
                                               int n_peers,
                                               uint64_t spin_limit) {
     if (threadIdx.x || blockIdx.x) return;
-    sys_store(progress, seq * 4u + 2u);
+    sys_store_relaxed(progress, seq * 4u + 2u);
     for (int p = 0; p < n_peers; ++p) {
         uint64_t spins = 0;
-        while (sys_load(peer_flags[p]) != seq) {
+        while (sys_load_relaxed(peer_flags[p]) != seq) {
             if (++spins > spin_limit) {
-                sys_store(timed_out, seq);
+                sys_store_relaxed(timed_out, seq);
                 return;
             }
         }
     }
+    // One invalidate, now that every peer has arrived, so the copies queued
+    // behind this read what the NIC wrote and not a cached line.
+    sys_acquire(peer_flags[0]);
 }
 
 // The peers' partials are in device memory by now -- the copy engine moved them
@@ -111,9 +138,13 @@ __global__ void fast_reduce_add_kernel(float * __restrict__ dst,
     // Saying so from one thread is safe only because the whole grid's writes
     // are complete at the kernel boundary -- which is why the flag is raised
     // here and not by a fence inside the loop.
-    if (i == 0) {
-        sys_store(slot_done, seq);
-        sys_store(progress, seq * 4u + 3u);
+    //
+    // A null slot_done means the caller wants the arithmetic without the
+    // announcement: a system-scope release writes the L2 back, and the probe
+    // needs to price that separately from the copies.
+    if (i == 0 && slot_done) {
+        dev_store(slot_done, seq);
+        sys_store_relaxed(progress, seq * 4u + 3u);
     }
 }
 
