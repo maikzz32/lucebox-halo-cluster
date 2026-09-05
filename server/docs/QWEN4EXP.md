@@ -524,12 +524,48 @@ would remove more bytes has now been tried and does not help:
   - attention sharding was worth 0.1 tok/s when it was built;
   - and the number of collectives does not matter either, 84 against 97.
 
-What does change with rank count is the latency of the ninety-seven
-reductions a token waits on. A ring all-reduce over four ranks is three ring
-steps where two ranks is one, and 97 x ~40 us of that is the 3.8 ms by which
-four ranks lose to two. The bytes the fourth rank removes are worth less than
-the hops it adds, and there is no arrangement of this model's axes that
-changes the count: two reductions per layer is what expert parallelism costs.
+What does change with rank count is the reductions. They have now been priced
+directly, which needed a way to keep the CUDA graph while leaving the
+collective out of it -- `DFLASH_CLUSTER_SEGMENTED_GRAPH=1`, which cuts the
+capture at every collective so the kernels around it still replay. Two nodes,
+decode-step compute:
+
+| | step |
+|---|---|
+| GPU work alone (segmented capture, collective emptied) | **29.6 ms** |
+| + the 97 reductions, launched eagerly | 41.0 ms |
+| + the 97 reductions, captured into the graph | 43.4 ms |
+| eager throughout (the default) | 40.2 ms |
+
+**The reductions cost 11.4 ms of a 41 ms step: 117 us each, for 10 KiB.** The
+self-test measures 41.8 us for the same payload back to back and RCCL's LL
+protocol about 10. The gap is not bytes and not the launch: it is what a
+barrier costs in situ, ninety-seven times, and it is the same whether the
+collective is issued eagerly or replayed from a graph.
+
+That single number explains every negative result above. Sharding an axis
+trades bytes against reductions at about 11.9 MB per reduction, and every axis
+this model has sits near that line:
+
+| axis, two ranks | bytes saved | reductions added | verdict |
+|---|---|---|---|
+| vocabulary | 260 MB | 1 | pays, and is invisible (0.4 tok/s) |
+| attention | 186 MB | 12 | roughly level |
+| delta net | 657 MB | 36 | pays (26.0 -> 27.2 without it) |
+| routed experts | 584 MB | 48 | level -- expert parallelism itself breaks even |
+
+So there is no arrangement that wins: every combination measured lands between
+40 and 42 ms. Four ranks lose to two because the barrier gets dearer while the
+bytes it buys get cheaper.
+
+What would change it is a reduction that costs ten microseconds in situ rather
+than a hundred and seventeen. On this fabric that means not calling a
+general-purpose collective for a 10 KiB decode-path reduction at all, but
+writing straight into a peer's pre-registered buffer and adding locally --
+which is what vLLM does for exactly this case, inside a node. With the
+reductions at 10 us the same 2765 MB per rank would put a two-node step near
+30 ms and a four-node step near 20, which is where the 32 and 50 tok/s targets
+live. Everything above is the evidence that nothing short of that gets there.
 
 ### The cluster is not bandwidth-bound, and that is the whole story
 
