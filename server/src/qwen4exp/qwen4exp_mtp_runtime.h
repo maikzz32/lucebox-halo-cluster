@@ -15,21 +15,28 @@
 // agrees at chance, and against a 248320-token vocabulary chance rounds to
 // never -- so a single run separates the two without ambiguity.
 //
-// KNOWN FAILURE, and where it is not. Enabling this crashes inside
-// ggml_backend_graph_compute on the draft graph. What that is NOT, each ruled
-// out by a run rather than by reading:
+// KNOWN FAILURE. Enabling this crashes, and six runs have narrowed where:
 //
-//   - the block. DFLASH_QWEN4EXP_MTP_NO_BLOCK=1 leaves it out, reducing the
-//     graph to the glue plus a mixer and a head, and it still crashes.
-//   - the CUDA graph cache. GGML_CUDA_DISABLE_GRAPHS=1 does not help, so it is
-//     not the target's cached graph objecting to a foreign one mid-loop.
-//   - everything before the compute. Checkpoints under
-//     DFLASH_QWEN4EXP_MTP_TRACE=1 reach "compute" every time.
+//   - the draft graph is not wrong. qwen4exp_mtp_probe builds and computes the
+//     same 156-node graph standalone, on the CPU and on HIP, and it produces a
+//     token both times.
+//   - the draft is not what crashes. A checkpoint after its compute prints,
+//     so the whole of qwen4exp_mtp_draft_step runs to completion.
+//   - exposing the carrier is not it. CAPTURE_ONLY=1 asks the target's graph
+//     for hc_final and reads it every step without drafting, and that runs.
+//   - the backend is not it. The head crashes on a HIP context of its own and
+//     on the CPU alike, so it is not the target's pool, stream or context.
+//   - the CUDA graph cache is not it. GGML_CUDA_DISABLE_GRAPHS=1 does not help.
 //
-// What it needs next is a stack trace, which needs a debug build; a segfault
-// inside a release container leaves nothing to go on. The default path is
-// unaffected -- without DFLASH_QWEN4EXP_MTP nothing here runs, and the model
-// still scores 8/10 at 24-25 tok/s on one node.
+// What is left is the target's own step AFTER a draft has run: the draft
+// completes, the loop commits the token, and the next target forward dies.
+// The draft touches nothing the target owns -- its own context, its own
+// buffers, a read-only view of the weights -- so what it disturbs is not
+// visible from here. That needs a stack trace, which needs a debug build; a
+// segfault in a release container leaves nothing to go on.
+//
+// The default path is unaffected: without DFLASH_QWEN4EXP_MTP nothing here
+// runs, and the model still scores 8/10 at 24-25 tok/s on one node.
 //
 // The block runs against a one-token KV cache that is reset every step, which
 // is not what a served drafter would do. It costs the head its own attention
@@ -58,6 +65,19 @@ struct Qwen4ExpMtpRuntime {
     Qwen4ExpMtpWeights   w;
     TargetCache          cache;          // one attention block's worth
     ggml_backend_t       backend = nullptr;
+    bool                 owns_backend = false;
+
+    // Graph, allocator and inputs, built once and reused. Everything else in
+    // this tree keeps its StepGraph and its gallocr alive across steps; a
+    // fresh allocator per step means a backend buffer created and freed inside
+    // the decode loop, next to the target's live one.
+    ggml_context * ctx   = nullptr;
+    ggml_cgraph *  gf    = nullptr;
+    ggml_gallocr_t alloc = nullptr;
+    ggml_tensor *  in_carrier = nullptr;
+    ggml_tensor *  in_embed   = nullptr;
+    ggml_tensor *  in_pos     = nullptr;
+    ggml_tensor *  out_draft  = nullptr;
 
     // The draft made at the previous step, waiting to be compared against the
     // token the target produces next. -1 when there is none.

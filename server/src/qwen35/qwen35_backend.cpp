@@ -2447,6 +2447,10 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         // one after next from the carrier this step produced. Measurement only:
         // nothing here changes what the target does, so a wiring mistake shows
         // up as a low rate rather than as wrong output.
+        // DFLASH_QWEN4EXP_MTP_CAPTURE_ONLY=1 reads the carrier and stops there,
+        // which separates reading it from drafting on it.
+        static const bool capture_only =
+            std::getenv("DFLASH_QWEN4EXP_MTP_CAPTURE_ONLY") != nullptr;
         if (mtp_.ready()) {
             qwen4exp_mtp_score(mtp_, next_tok);
             if (sg_.hc_final) {
@@ -2456,7 +2460,9 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                 ggml_backend_tensor_get(sg_.hc_final, carrier.data(),
                                         sizeof(float) * n * (rows - 1),
                                         sizeof(float) * n);
-                qwen4exp_mtp_draft_step(mtp_, w_, carrier.data(), next_tok);
+                if (!capture_only) {
+                    qwen4exp_mtp_draft_step(mtp_, w_, carrier.data(), next_tok);
+                }
             }
         }
 

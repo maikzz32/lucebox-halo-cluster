@@ -2,6 +2,9 @@
 
 #include "qwen4exp/qwen4exp_graph.h"
 
+#include "ggml-cpu.h"
+#include "ggml-cuda.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -53,14 +56,37 @@ bool qwen4exp_mtp_open(const TargetWeights & target,
         std::fprintf(stderr, "[qwen4exp-mtp] the target is not hyper-connected\n");
         return false;
     }
-    if (!load_qwen4exp_mtp(path, target, backend, rt.w)) {
+    // Its own backend, not the target's.
+    //
+    // The same draft graph computes standalone on both CPU and HIP and dies
+    // inside the server, which leaves the target's backend state -- its
+    // context, its memory pool, its stream -- as the difference. A second
+    // context removes all three at once, and the head only ever needs the
+    // carrier, which crosses through host memory anyway.
+    // DFLASH_QWEN4EXP_MTP_CPU=1 puts it on the CPU instead. That is slow --
+    // one block and a 248320-row head per token -- and it is the right trade
+    // for what this stage is: the acceptance rate over a hundred tokens takes
+    // seconds either way, and the CPU path is the one that demonstrably
+    // computes this graph. A head that has to earn its place in the decode
+    // loop can move to the GPU once the number says it is worth the move.
+    const char * cpu_env = std::getenv("DFLASH_QWEN4EXP_MTP_CPU");
+    const bool on_cpu = cpu_env && std::atoi(cpu_env) == 1;
+    ggml_backend_t own = on_cpu ? ggml_backend_cpu_init() : ggml_backend_cuda_init(0);
+    if (!own) {
+        std::fprintf(stderr, "[qwen4exp-mtp] could not open a backend of its own\n");
         return false;
     }
-    if (!alloc_one_token_cache(target, backend, rt.cache)) {
+    if (!load_qwen4exp_mtp(path, target, own, rt.w)) {
+        ggml_backend_free(own);
+        return false;
+    }
+    if (!alloc_one_token_cache(target, own, rt.cache)) {
         std::fprintf(stderr, "[qwen4exp-mtp] cache allocation failed\n");
+        ggml_backend_free(own);
         return false;
     }
-    rt.backend = backend;
+    rt.backend = own;
+    rt.owns_backend = true;
     std::fprintf(stderr,
                  "[qwen4exp-mtp] measuring acceptance; the head drafts the token "
                  "after next and the next step scores it\n");
@@ -83,58 +109,55 @@ void qwen4exp_mtp_draft_step(Qwen4ExpMtpRuntime & rt,
     const int64_t n_embd = t.n_embd;
     const int64_t n_hc   = t.n_hc;
 
-    // A graph per step. The head is one block, so building it costs far less
-    // than the target step it rides along with, and a measurement that
-    // rebuilds is easier to trust than one that caches.
-    const size_t mem = (size_t) 64 * 1024 * 1024;
-    struct ggml_init_params ip = { mem, nullptr, true };
-    ggml_context * ctx = ggml_init(ip);
-    if (!ctx) return;
-    mark("graph");
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 8192, false);
-
-    ggml_tensor * carrier_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_hc, 1);
-    ggml_tensor * embed_t   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 1);
-    ggml_tensor * pos_t     = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4);
-    ggml_set_input(carrier_t);
-    ggml_set_input(embed_t);
-    ggml_set_input(pos_t);
-
-    mark("build");
-    ggml_tensor * draft = build_qwen4exp_mtp_draft(ctx, gf, rt.w, t, carrier_t,
-                                                   embed_t, pos_t,
-                                                   /*attn_mask=*/nullptr,
-                                                   /*kv_start=*/0, rt.cache);
-    if (!draft) { ggml_free(ctx); return; }
-
-    mark("alloc");
-    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(rt.backend));
-    if (!alloc || !ggml_gallocr_alloc_graph(alloc, gf)) {
-        if (alloc) ggml_gallocr_free(alloc);
-        ggml_free(ctx);
-        return;
+    // Built once. The shape never changes -- one token, one carrier -- so
+    // there is nothing to rebuild, and reusing the allocator keeps the decode
+    // loop from creating and freeing a backend buffer beside the target's.
+    if (!rt.ctx) {
+        mark("first build");
+        struct ggml_init_params ip = { (size_t) 64 * 1024 * 1024, nullptr, true };
+        rt.ctx = ggml_init(ip);
+        if (!rt.ctx) return;
+        rt.gf = ggml_new_graph_custom(rt.ctx, 16384, false);
+        rt.in_carrier = ggml_new_tensor_3d(rt.ctx, GGML_TYPE_F32, n_embd, n_hc, 1);
+        rt.in_embed   = ggml_new_tensor_2d(rt.ctx, GGML_TYPE_F32, n_embd, 1);
+        rt.in_pos     = ggml_new_tensor_1d(rt.ctx, GGML_TYPE_I32, 4);
+        ggml_set_input(rt.in_carrier);
+        ggml_set_input(rt.in_embed);
+        ggml_set_input(rt.in_pos);
+        rt.out_draft = build_qwen4exp_mtp_draft(rt.ctx, rt.gf, rt.w, t,
+                                                rt.in_carrier, rt.in_embed, rt.in_pos,
+                                                /*attn_mask=*/nullptr, /*kv_start=*/0,
+                                                rt.cache);
+        if (!rt.out_draft) { ggml_free(rt.ctx); rt.ctx = nullptr; return; }
+        rt.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(rt.backend));
+        if (!rt.alloc || !ggml_gallocr_alloc_graph(rt.alloc, rt.gf)) {
+            std::fprintf(stderr, "[qwen4exp-mtp] draft graph allocation failed\n");
+            if (rt.alloc) ggml_gallocr_free(rt.alloc);
+            rt.alloc = nullptr;
+            ggml_free(rt.ctx);
+            rt.ctx = nullptr;
+            return;
+        }
+        std::fprintf(stderr, "[qwen4exp-mtp] draft graph: %d nodes\n",
+                     ggml_graph_n_nodes(rt.gf));
     }
 
     mark("embed");
     std::vector<float> embed((size_t) n_embd);
-    if (!rt.w.embedder.embed(&next_token, 1, embed.data())) {
-        ggml_gallocr_free(alloc);
-        ggml_free(ctx);
-        return;
-    }
-    ggml_backend_tensor_set(carrier_t, carrier, 0, sizeof(float) * (size_t) (n_embd * n_hc));
-    ggml_backend_tensor_set(embed_t, embed.data(), 0, sizeof(float) * (size_t) n_embd);
+    if (!rt.w.embedder.embed(&next_token, 1, embed.data())) return;
+    ggml_backend_tensor_set(rt.in_carrier, carrier, 0,
+                            sizeof(float) * (size_t) (n_embd * n_hc));
+    ggml_backend_tensor_set(rt.in_embed, embed.data(), 0, sizeof(float) * (size_t) n_embd);
     const int32_t pos4[4] = { 0, 0, 0, 0 };
-    ggml_backend_tensor_set(pos_t, pos4, 0, sizeof(pos4));
+    ggml_backend_tensor_set(rt.in_pos, pos4, 0, sizeof(pos4));
 
     mark("compute");
-    if (ggml_backend_graph_compute(rt.backend, gf) == GGML_STATUS_SUCCESS) {
+    if (ggml_backend_graph_compute(rt.backend, rt.gf) == GGML_STATUS_SUCCESS) {
         int32_t id = -1;
-        ggml_backend_tensor_get(draft, &id, 0, sizeof(int32_t));
+        ggml_backend_tensor_get(rt.out_draft, &id, 0, sizeof(int32_t));
         rt.pending = id;
     }
-    ggml_gallocr_free(alloc);
-    ggml_free(ctx);
+    mark("done");
 }
 
 void qwen4exp_mtp_score(Qwen4ExpMtpRuntime & rt, int32_t actual_token) {
