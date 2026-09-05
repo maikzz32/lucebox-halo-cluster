@@ -2,6 +2,7 @@
 
 #include "common/gguf_shards.h"
 #include "qwen4exp/qwen4exp_graph.h"
+#include "qwen4exp/qwen4exp_probe.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -323,11 +324,23 @@ ggml_tensor * build_qwen4exp_mtp_draft(ggml_context * ctx,
                              /*parent_ids=*/nullptr);
     }
 
+    // The same probe that found both bugs in the target, pointed at the head.
+    // What matters is not the values but the magnitudes: the target's own
+    // carrier runs at an rms near 0.65 after its last layer and its mixer
+    // output near 2.5, so a head whose state lands orders away from that is
+    // wrong somewhere the shapes cannot show.
+    qwen4exp_probe_add(ctx, gf, "  mtp_carrier", -1, carrier);
+    qwen4exp_probe_add(ctx, gf, "  mtp_e",     -1, e);
+    qwen4exp_probe_add(ctx, gf, "  mtp_h",     -1, h);
+    qwen4exp_probe_add(ctx, gf, "  mtp_state", -1, state);
+
     ggml_tensor * mixed = qwen4exp_hc_mix(ctx, gf, /*cluster=*/nullptr, state,
                                           w.head_norm, w.head_down, w.head_up,
                                           /*w_inject=*/nullptr, /*inject_out=*/nullptr,
                                           t.n_embd, t.n_hc, t.rms_eps);
+    qwen4exp_probe_add(ctx, gf, "  mtp_mixed", -1, mixed);
     ggml_tensor * logits = ggml_mul_mat(ctx, w.output, mixed);
+    qwen4exp_probe_add(ctx, gf, "  mtp_logits", -1, logits);
     ggml_tensor * draft  = ggml_argmax(ctx, logits);
     ggml_set_output(draft);
     ggml_build_forward_expand(gf, draft);

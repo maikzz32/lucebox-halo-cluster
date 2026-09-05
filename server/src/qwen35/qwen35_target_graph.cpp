@@ -2678,9 +2678,15 @@ QwenGraphOutputs build_qwen35_graph(
         return s && std::atoi(s) == 1;
     }();
     if (hyper_connected && in.capture_hc_final) {
-        ggml_set_output(hc_state);
-        ggml_build_forward_expand(gf, hc_state);
-        og_early.hc_final = hc_state;
+        // A copy, not the carrier itself. Marking the carrier as an output was
+        // not enough to keep its storage: what came back read as a sigmoid
+        // gate -- mean 0.744 against a carrier's 0.009 -- because the mixer
+        // built below shares the buffer. A tensor nothing else can alias
+        // costs one [n_embd, n_hc, T] block and removes the whole question.
+        og_early.hc_final = ggml_cont(ctx, hc_state);
+        ggml_set_name(og_early.hc_final, "hc_final");
+        ggml_set_output(og_early.hc_final);
+        ggml_build_forward_expand(gf, og_early.hc_final);
     }
 
     ggml_tensor * out = nullptr;

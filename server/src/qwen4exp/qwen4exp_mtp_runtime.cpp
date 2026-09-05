@@ -1,6 +1,7 @@
 #include "qwen4exp/qwen4exp_mtp_runtime.h"
 
 #include "qwen4exp/qwen4exp_graph.h"
+#include "qwen4exp/qwen4exp_probe.h"
 
 #include "ggml-cpu.h"
 #include "ggml-cuda.h"
@@ -201,6 +202,7 @@ void qwen4exp_mtp_draft_step(Qwen4ExpMtpRuntime & rt,
         ggml_backend_tensor_get(rt.out_draft, &id, 0, sizeof(int32_t));
         rt.pending = id;
     }
+    qwen4exp_probe_report();
     rt.pos++;
     mark("done");
 }
