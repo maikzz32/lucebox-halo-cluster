@@ -14,18 +14,24 @@ still passes most of them.
 
     q4e_forced_score.py [--url URL] [--max-tokens N] [-v]
 
-Exit status is 0 when every probe passes, 1 otherwise.
-"""
-import argparse, json, sys, urllib.request
+DeepSeek V4 Flash, which generates correctly in this tree, scores 8/10 here:
+it misses the counting probe and answers "2 + 2 =" with 5. That is the bar --
+not 10 -- and a model near 0 is not merely worse, it is not running.
 
-# (prompt, accepted continuations). The match is a case-folded prefix test on
-# the stripped reply, so " Paris." and "Paris" both count.
+Exit status is 0 when the score reaches --pass (default 6), 1 otherwise.
+"""
+import argparse, json, re, sys, urllib.request
+
+# (prompt, accepted continuations). The match is a case-folded search for the
+# word anywhere in the reply. A prefix test looked stricter and was simply
+# wrong: DeepSeek answers "The capital of France is **Paris**." and scored a
+# miss for it, which would have made every comparison against it meaningless.
 PROBES = [
     ("Continue exactly: 1 2 3 4 5 6 7 8 9",            ["10"]),
     ("Continue exactly: a a a a a a a a a",            ["a"]),
     ("Continue exactly: Monday Tuesday Wednesday",     ["thursday"]),
     ("Continue exactly: A B C D E F",                  ["g"]),
-    ("Complete the word: straw",                       ["berry", "straw"]),
+    ("Complete the word: straw",                       ["strawberry"]),
     ("The capital of France is",                       ["paris"]),
     ("Finish the phrase: Once upon a",                 ["time"]),
     ("2 + 2 =",                                        ["4", "four"]),
@@ -52,6 +58,7 @@ def main():
     ap.add_argument("--url", default="http://127.0.0.1:8017")
     ap.add_argument("--max-tokens", type=int, default=8)
     ap.add_argument("--timeout", type=float, default=300.0)
+    ap.add_argument("--pass", dest="pass_at", type=int, default=6)
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()
 
@@ -63,13 +70,15 @@ def main():
             print("  ERROR %-42s %s" % (prompt[:42], e))
             continue
         flat = reply.strip().lower()
-        ok = any(flat.startswith(w) or w in flat.split() for w in wanted)
+        # Word boundaries, so "4" does not match "14" and "g" does not match
+        # "great", while "Paris**." still counts.
+        ok = any(re.search(r"\b" + re.escape(w) + r"\b", flat) for w in wanted)
         hits += ok
         if a.verbose or not ok:
             print("  %s %-42s -> %r" % ("ok  " if ok else "MISS", prompt[:42], reply[:60]))
 
     print("forced-continuation score: %d/%d" % (hits, len(PROBES)))
-    return 0 if hits == len(PROBES) else 1
+    return 0 if hits >= a.pass_at else 1
 
 
 if __name__ == "__main__":
