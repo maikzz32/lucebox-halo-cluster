@@ -498,10 +498,38 @@ DFLASH_CLUSTER_ALLREDUCE_NOOP=1.
 
 | | 1 node | 2 nodes | 4 nodes |
 |---|---|---|---|
-| decode | 23.6 tok/s | **29.9** | 29.5 |
+| decode, AR | 25.1 tok/s | 24.5 | 29.5 |
+| decode, with the MTP verify loop | **30.7** | 27.2 | 26.4 |
 | weights per rank | 62.3 GiB | 31.5 | 16.2 |
 | forced-continuation | 8/10 | 8/10 | 8/10 |
 | target | | 32 | 50 |
+
+The best number this model reaches in this tree is on **one** node. Adding
+ranks removes bytes and does not make a step cheaper -- measured, one
+instance per row, decode-step compute:
+
+| | one token | two tokens (verify) |
+|---|---|---|
+| 1 node | 38.9 ms | 49.8 ms |
+| 2 nodes | 40.2 ms | 54.0 ms |
+| 4 nodes | -- | 57.8 ms |
+
+Four ranks are slower than two while moving fewer bytes, and everything that
+would remove more bytes has now been tried and does not help:
+
+  - the vocabulary split (521 MB, `DFLASH_QWEN4EXP_SPLIT_VOCAB=1`) is neutral
+    to within 0.4 tok/s at two ranks and to within 0.1 at four;
+  - keeping the delta net whole (`DFLASH_QWEN4EXP_NO_SHARD_SSM=1`) is *worse*,
+    26.0 against 27.2, so its split is earning its reduction;
+  - attention sharding was worth 0.1 tok/s when it was built;
+  - and the number of collectives does not matter either, 84 against 97.
+
+What does change with rank count is the latency of the ninety-seven
+reductions a token waits on. A ring all-reduce over four ranks is three ring
+steps where two ranks is one, and 97 x ~40 us of that is the 3.8 ms by which
+four ranks lose to two. The bytes the fourth rank removes are worth less than
+the hops it adds, and there is no arrangement of this model's axes that
+changes the count: two reductions per layer is what expert parallelism costs.
 
 ### The cluster is not bandwidth-bound, and that is the whole story
 
