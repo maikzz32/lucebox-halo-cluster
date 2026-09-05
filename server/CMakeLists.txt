@@ -539,6 +539,7 @@ add_library(dflash_common STATIC
     src/qwen4exp/qwen4exp_ple.cpp
     src/qwen4exp/qwen4exp_probe.cpp
     src/qwen4exp/qwen4exp_cluster.cpp
+    src/qwen4exp/qwen4exp_mtp.cpp
     src/common/dynamic_backend.cpp
     src/common/domino_head.cpp
     src/common/dspark_head.cpp
@@ -939,6 +940,15 @@ endif()
 # PFlash phase-split harness
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/pflash_daemon.cpp")
+    add_executable(qwen4exp_mtp_probe test/qwen4exp_mtp_probe.cpp)
+    target_include_directories(qwen4exp_mtp_probe PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+    target_link_libraries(qwen4exp_mtp_probe PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+    if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+        target_link_libraries(qwen4exp_mtp_probe PRIVATE CUDA::cudart)
+    else()
+        target_link_libraries(qwen4exp_mtp_probe PRIVATE hip::host)
+    endif()
+
     add_executable(gguf_tensor_cmp test/gguf_tensor_cmp.cpp)
     target_include_directories(gguf_tensor_cmp PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
     target_link_libraries(gguf_tensor_cmp PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
