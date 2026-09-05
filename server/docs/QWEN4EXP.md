@@ -559,13 +559,61 @@ So there is no arrangement that wins: every combination measured lands between
 bytes it buys get cheaper.
 
 What would change it is a reduction that costs ten microseconds in situ rather
-than a hundred and seventeen. On this fabric that means not calling a
-general-purpose collective for a 10 KiB decode-path reduction at all, but
-writing straight into a peer's pre-registered buffer and adding locally --
-which is what vLLM does for exactly this case, inside a node. With the
-reductions at 10 us the same 2765 MB per rank would put a two-node step near
-30 ms and a four-node step near 20, which is where the 32 and 50 tok/s targets
-live. Everything above is the evidence that nothing short of that gets there.
+than a hundred and seventeen. Two measurements say that is not wishful:
+`ib_write_lat` puts 10 KiB on this fabric at **13.65 us**, and the round trip
+through a pinned flag between a kernel and a host thread is **0.79 us**
+(`server/test/cluster_flag_latency.cu`). With the reductions at ~14 us the same
+2765 MB per rank puts a two-node step near 30 ms and a four-node step near 20,
+which is where the 32 and 50 tok/s targets live.
+
+### The lean reduction, as far as it has got
+
+`DFLASH_CLUSTER_FAST_REDUCE=1`, opt-in and **not usable yet**. Each rank writes
+its partial straight into every peer's pre-registered buffer and adds what
+arrives: one RDMA write plus an inline flag per peer, no algorithm selection and
+no proxy handshake.
+
+What makes it possible here is unified memory. On Strix Halo a pinned host
+buffer *is* GPU memory, so the NIC writes into it and a kernel reads it without
+a copy and without GPUDirect. It has to be pinned rather than managed: gfx1151
+reports XNACK disabled, so the GPU cannot take a page fault, and a managed page
+the CPU has touched faults the moment a kernel reads it.
+
+It connects and it reduces correctly -- 1800 consecutive reductions, zero
+timeouts, sequence numbers in step on both ranks. Four things had to be right
+for that, and each presented as a hang:
+
+  - **one memory key per region.** Payload and flags are separate regions, so a
+    remote write carries a different key for each. One key for both is not a
+    mismatch the sender notices: the receiver drops it as an access violation
+    and the peer waits.
+  - **the grid, not a thread.** A flag raised by one block while others were
+    still copying hands the peer a half-written buffer.
+    `__threadfence_system` orders one thread's own writes; only a kernel
+    boundary or `__syncthreads` orders the grid's.
+  - **the NIC must not write a flag the GPU polls.** A DMA write into system
+    memory is coherent with a CPU read, but nothing invalidates the GPU's
+    caches for it. The host carries arrivals across with an ordinary store --
+    which is exactly what a general collective's proxy thread is for.
+  - **acquire at system scope**, not `volatile`. A volatile load on gfx11 can
+    still be answered from the GPU's own L2.
+
+And a trap worth naming twice: without `--ulimit memlock=-1` the pinned pages
+fail to map and every kernel touching them dies with "Memory in use", which
+reads like a hardware limit and is not one.
+
+**Where it stops.** 34 ms per reduction against RCCL's 117 us. Moving the
+payload by kernel and by copy engine cost the same, and a dry run -- every local
+operation kept, the waiting and the wire removed -- does not complete a decode
+step either. So the cost is local, and it is the added operations themselves.
+At that magnitude the candidate is `hipMemcpyAsync` between device and pinned
+host memory blocking, and a block inside an eager decode loop drains the whole
+pipeline.
+
+**What to try next.** Do not stage through host memory at all. RCCL's own log
+reports `GPU Direct RDMA Enabled for HCA 0` on this fabric, so the NIC can be
+pointed at device memory through a dmabuf-registered MR: no copies, and the
+flags stay where they already work.
 
 ### The cluster is not bandwidth-bound, and that is the whole story
 
