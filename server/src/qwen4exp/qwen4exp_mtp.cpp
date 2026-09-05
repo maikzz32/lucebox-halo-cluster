@@ -210,7 +210,8 @@ ggml_tensor * build_qwen4exp_mtp_draft(ggml_context * ctx,
                                        ggml_tensor * positions,
                                        ggml_tensor * attn_mask,
                                        int           kv_start,
-                                       TargetCache & cache) {
+                                       TargetCache & cache,
+                                       ggml_tensor * kv_write_rows) {
     const int64_t nt     = carrier->ne[2];
     const int64_t hc_dim = (int64_t) t.n_hc * t.n_embd;
 
@@ -320,7 +321,7 @@ ggml_tensor * build_qwen4exp_mtp_draft(ggml_context * ctx,
     if (with_block) {
         build_qwen4exp_layer(ctx, gf, mw, cache, /*layer_idx=*/0, &state,
                              positions, attn_mask, kv_start, (int) nt,
-                             /*fa_window=*/0, /*kv_write_rows=*/nullptr,
+                             /*fa_window=*/0, kv_write_rows,
                              /*parent_ids=*/nullptr);
     }
 

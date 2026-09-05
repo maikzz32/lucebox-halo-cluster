@@ -3,9 +3,12 @@
 #include "qwen4exp/qwen4exp_graph.h"
 #include "qwen4exp/qwen4exp_probe.h"
 
+#include "attn_masks.h"
+
 #include "ggml-cpu.h"
 #include "ggml-cuda.h"
 
+#include <algorithm>
 #include <csignal>
 #include <cstdio>
 #include <unistd.h>
@@ -110,7 +113,18 @@ bool qwen4exp_mtp_open(const TargetWeights & target,
         ggml_backend_free(own);
         return false;
     }
-    rt.max_ctx = max_ctx > 0 ? max_ctx : 4096;
+    // A window, not the whole context. The step-invariant attention spans the
+    // entire cache -- that is what makes the graph shape-stable -- so the cache
+    // size is what the head pays per draft, not how far it has got. Over the
+    // full 4096 that doubled the draft to 7.4 ms and ate the five points of
+    // acceptance the history buys. A few hundred recent drafts carry almost all
+    // of the benefit at a fraction of the span.
+    static const int window = [] {
+        const char * e = std::getenv("DFLASH_QWEN4EXP_MTP_WINDOW");
+        const int v = e ? std::atoi(e) : 512;
+        return v > 0 ? v : 512;
+    }();
+    rt.max_ctx = std::min(max_ctx > 0 ? max_ctx : 4096, window);
     if (!alloc_cache(target, own, rt.max_ctx, rt.cache)) {
         std::fprintf(stderr, "[qwen4exp-mtp] cache allocation failed\n");
         ggml_backend_free(own);
@@ -146,19 +160,23 @@ void qwen4exp_mtp_draft_step(Qwen4ExpMtpRuntime & rt,
     // kv_start is baked into the graph, so a write position that moves means a
     // fresh context, a fresh graph and a fresh allocation every single token --
     // and that is what a draft costing more than the target step it is meant to
-    // accelerate is made of. The head's own KV history was measured to be worth
-    // nothing (see the header), so pinning it to one row buys a graph that is
-    // built once. DFLASH_QWEN4EXP_MTP_GROWING_KV=1 restores the old behaviour
-    // for anyone re-testing that finding.
-    static const bool growing_kv = [] {
-        const char * e = std::getenv("DFLASH_QWEN4EXP_MTP_GROWING_KV");
+    // accelerate is made of.
+    //
+    // The head keeps its history anyway, without paying for it. A set_rows KV
+    // write paired with an explicit mask makes the attention span the whole
+    // cache and lets the mask say how much of it is real -- so the write row
+    // and the mask are step inputs and the graph never changes shape. The
+    // history was worth six points of acceptance when it was first measured,
+    // and was dropped only because kv_start was baked into the graph.
+    // DFLASH_QWEN4EXP_MTP_NO_HISTORY=1 pins it back to one row.
+    static const bool no_history = [] {
+        const char * e = std::getenv("DFLASH_QWEN4EXP_MTP_NO_HISTORY");
         return e && std::atoi(e) == 1;
     }();
-    if (growing_kv && rt.pos >= rt.max_ctx) return;   // out of its own cache
-    if (rt.ctx && growing_kv) {            // kv_start is baked in; rebuild for it
-        ggml_free(rt.ctx);
-        rt.ctx = nullptr;
-    }
+    // Out of window: start the history over rather than stop drafting. The
+    // head loses its context for one step and rebuilds it; stopping would cost
+    // every remaining token of the request.
+    if (rt.pos >= rt.max_ctx) rt.pos = 0;
     if (!rt.ctx) {
         mark("build");
         const int64_t t_build0 = ggml_time_us();
@@ -172,11 +190,22 @@ void qwen4exp_mtp_draft_step(Qwen4ExpMtpRuntime & rt,
         ggml_set_input(rt.in_carrier);
         ggml_set_input(rt.in_embed);
         ggml_set_input(rt.in_pos);
+        if (!no_history) {
+            // The span is the whole cache when this pair is present, so the
+            // mask has to cover it. 256 is the flash-attention stride the
+            // step-invariant path uses.
+            rt.kv_pad = ((rt.max_ctx + 255) / 256) * 256;
+            rt.in_mask = ggml_new_tensor_2d(rt.ctx, GGML_TYPE_F16, rt.kv_pad,
+                                            KQ_MASK_PAD);
+            rt.in_kv_rows = ggml_new_tensor_2d(rt.ctx, GGML_TYPE_I64, 1,
+                                               t.n_head_kv);
+            ggml_set_input(rt.in_mask);
+            ggml_set_input(rt.in_kv_rows);
+        }
         rt.out_draft = build_qwen4exp_mtp_draft(rt.ctx, rt.gf, rt.w, t,
                                                 rt.in_carrier, rt.in_embed, rt.in_pos,
-                                                /*attn_mask=*/nullptr,
-                                                growing_kv ? rt.pos : 0,
-                                                rt.cache);
+                                                rt.in_mask, /*kv_start=*/0,
+                                                rt.cache, rt.in_kv_rows);
         if (!rt.out_draft) { ggml_free(rt.ctx); rt.ctx = nullptr; return; }
         if (!rt.alloc) {
             rt.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(rt.backend));
@@ -207,6 +236,20 @@ void qwen4exp_mtp_draft_step(Qwen4ExpMtpRuntime & rt,
     // every rotary phase and quietly degrades its attention.
     const int32_t pos4[4] = { abs_pos, abs_pos, abs_pos, 0 };
     ggml_backend_tensor_set(rt.in_pos, pos4, 0, sizeof(pos4));
+
+    if (rt.in_mask && rt.in_kv_rows) {
+        // Everything the head has drafted from so far is readable, and nothing
+        // past it -- the rest of the cache is there but masked off.
+        std::vector<uint16_t> mask;
+        build_causal_mask(mask, rt.max_ctx, /*n_tokens=*/1, /*kv_start=*/rt.pos,
+                          /*kq_stride_pad=*/256, /*win_start=*/0,
+                          /*kv_pad_override=*/rt.kv_pad);
+        ggml_backend_tensor_set(rt.in_mask, mask.data(), 0,
+                                sizeof(uint16_t) * mask.size());
+        std::vector<int64_t> rows((size_t) t.n_head_kv, (int64_t) rt.pos);
+        ggml_backend_tensor_set(rt.in_kv_rows, rows.data(), 0,
+                                sizeof(int64_t) * rows.size());
+    }
 
     mark("compute");
     const int64_t t_compute0 = ggml_time_us();

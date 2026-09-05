@@ -93,6 +93,13 @@ ggml_tensor * build_qwen4exp_mtp_draft(ggml_context * ctx,
                                        ggml_tensor * positions,   // m-RoPE, 4 per token
                                        ggml_tensor * attn_mask,   // causal, or null at T=1
                                        int           kv_start,
-                                       TargetCache & cache);
+                                       TargetCache & cache,
+                                       // Non-null pairs with attn_mask to make
+                                       // the graph step-invariant: the block
+                                       // then spans the whole cache and the
+                                       // mask says what is readable, so the
+                                       // head can keep a growing history
+                                       // without kv_start changing shape.
+                                       ggml_tensor * kv_write_rows = nullptr);
 
 }  // namespace dflash::common

@@ -84,6 +84,12 @@ struct Qwen4ExpMtpRuntime {
     ggml_tensor *  in_carrier = nullptr;
     ggml_tensor *  in_embed   = nullptr;
     ggml_tensor *  in_pos     = nullptr;
+    // The two inputs that let the head keep a history without the graph
+    // changing shape: the block spans the whole cache, the mask says how much
+    // of it is real, and the write goes to the row named here.
+    ggml_tensor *  in_mask    = nullptr;
+    ggml_tensor *  in_kv_rows = nullptr;
+    int            kv_pad     = 0;
     ggml_tensor *  out_draft  = nullptr;
 
     // The draft made at the previous step, waiting to be compared against the
