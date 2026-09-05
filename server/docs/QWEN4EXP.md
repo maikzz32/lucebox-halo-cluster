@@ -740,25 +740,34 @@ is kept: ggml-cuda fuses {RMS_NORM, MUL} only when the two are adjacent, and a
 reshape between them is a node that costs no kernel and still breaks the
 pattern.
 
-### What is left between here and 32 tok/s on two nodes
+### Where this lands
 
-A pass is 51.7 ms of step and 3.47 ms of drafting, and returns 1.684 tokens:
-**30.5 tok/s** against a target of 32. Reaching it needs the pass at 52.6 ms --
-2.6 ms, or 4.7%. Three things, each measured or measurable, add up to it:
+Nine samples each, median of the warm eight, on machines with nothing else on
+them:
 
-  - **the head's lm_head, split across ranks.** 3.47 ms of drafting is almost
-    all one 248320-row projection. Sliced two ways with a two-float reduction
-    to pick the global argmax, it is about 1.9 ms. Worth ~1.6 ms.
-  - **the rest of the mixer.** `scale`+`silu` and the standalone `sigmoid` are
-    another 192 dispatches a token, ~0.5 ms at the 2.4 us a dispatch measured
-    for the collapse.
-  - **acceptance.** The head's own KV history was worth six points when it was
-    measured, and was dropped because it forced a graph rebuild per token. A
-    fixed-shape graph with a mask input keeps both.
+| | acceptance | step | decode | target |
+|---|---|---|---|---|
+| **one node** | 78.0% | 47.7 ms | **33.2 tok/s** (32.2-33.8) | -- |
+| two nodes | 70.5% | 51.6 ms | 30.6 (28.1-31.7) | 32 |
+| four nodes | 55-69% | 55.6 ms | 25.7 | 50 |
 
-Four nodes remain a dead end: 25.7 tok/s with everything on, below two nodes,
-for the reason the whole document gives -- the reductions get dearer with rank
-count while the bytes they buy get cheaper.
+Forced-continuation 8/10 throughout; the unspeculated default path is unchanged
+at 25.0 tok/s.
+
+**The throughput is reached, on one node.** 33.2 tok/s is above the 32 the two-
+node target asks for -- but adding a second node costs 8% and a fourth costs
+23%, so the number is met by not distributing this model rather than by
+distributing it. Everything above is the evidence for why: what a reduction
+costs here is the synchronisation point itself, ninety-seven of them a token,
+and no sharding arrangement or reduction implementation changes that.
+
+Getting two nodes over 32 needs the cluster's 3.9 ms of extra step time back.
+Nothing measured in this document recovers it.
+
+A caution about the machines: strix3 and strix4 run a vLLM Ray cluster that
+takes ~100 GB. A server started next to it either fails to allocate or gets
+squeezed out mid-run, and the second looks like a throughput result. Measure on
+free nodes.
 
 ## The MTP head: it works, and it speculates
 
