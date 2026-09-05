@@ -638,6 +638,41 @@ The remaining lever is therefore not a faster reduction but fewer of them per
 token -- which is what speculation is, and why it is the only thing in this
 document that moved the number.
 
+### Where this leaves the targets, and what is still on the table
+
+Best measured, this build, one server instance per row:
+
+| | decode | target |
+|---|---|---|
+| 1 node, speculation | **30.7 tok/s** | -- |
+| 2 nodes, lean reduction + speculation | 27.9 | 32 |
+| 4 nodes, speculation | 26.4 | 50 |
+
+The arithmetic that closes the two-node question, with every constant measured:
+a speculative pass costs 43 ms of GPU work, 11 ms of synchronisation and 3.6 ms
+of drafting, and returns 1.59 tokens. Reaching 32 tok/s needs 31.25 ms per
+token, so the pass would have to cost 49.8 ms rather than 57.2 -- and 11 of
+those 57.2 are the ninety-seven synchronisation points. Take them away and the
+same pass gives 34 tok/s; no arrangement of the sharding changes their number,
+and no implementation of the reduction changes their cost.
+
+Two things were tried against that and are worth not trying again: F16 rollback
+checkpoints (`DFLASH_SINGLE_CHAIN_CHECKPOINT_F32=0`) are worth about 1.5% on
+two nodes and nothing on one, and disabling CUDA graphs helps the plain decode
+and hurts the speculative one. Both sit inside the run-to-run spread of the
+acceptance rate, which is +/-3 points and therefore +/-4% of throughput -- so
+anything smaller than that cannot be measured here at all without many more
+samples.
+
+**What has not been tried, and is the largest number in the file.** A decode
+step moves 2765 MB per rank in 29.6 ms: 93 GB/s, against the ~200 GB/s this
+memory can do. One node is no better, 4266 MB in 38.9 ms, 110 GB/s. Half the
+hardware's bandwidth is going somewhere, and at this point that is a bigger
+prize than anything the cluster can give back: at full bandwidth the two-node
+step would be near 15 ms of GPU work and every target in this document falls
+out of it. That is a question about the quantised matmul kernels, not about
+parallelism, and nothing in this document touches it.
+
 ## The MTP head: it works, and it speculates
 
 Speculation is the only lever that addresses a synchronisation bound, so the
