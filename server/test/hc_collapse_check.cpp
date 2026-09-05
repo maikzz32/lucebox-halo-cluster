@@ -44,7 +44,7 @@ int main(int argc, char ** argv) {
     ggml_set_input(b);
 
     // The reference, transcribed from qwen4exp_hc_mix.
-    ggml_tensor * gated = ggml_mul(ctx, a, b);
+    ggml_tensor * gated = ggml_mul(ctx, a, ggml_sigmoid(ctx, b));
     gated = ggml_reshape_3d(ctx, gated, n_embd, n_hc, nt);
     const size_t stream_stride = ggml_row_size(gated->type, n_embd);
     ggml_tensor * ref = ggml_cont(
@@ -59,7 +59,7 @@ int main(int argc, char ** argv) {
     ggml_set_output(ref);
     ggml_build_forward_expand(gf, ref);
 
-    ggml_tensor * fused = ggml_hc_collapse(ctx, a, b, n_embd, n_hc);
+    ggml_tensor * fused = ggml_hc_collapse(ctx, a, b, n_embd, n_hc, true);
     ggml_set_output(fused);
     ggml_build_forward_expand(gf, fused);
 
@@ -96,7 +96,7 @@ int main(int argc, char ** argv) {
             double acc = 0.0;
             for (int c = 0; c < n_hc; ++c) {
                 const size_t o = (size_t) t * hc_dim + (size_t) c * n_embd + (size_t) i;
-                acc += (double) ha[o] * (double) hb[o];
+                acc += (double) ha[o] * (1.0 / (1.0 + std::exp(-(double) hb[o])));
             }
             acc /= (double) n_hc;
             const size_t o = (size_t) t * n_embd + (size_t) i;

@@ -654,7 +654,8 @@ static void ggml_cuda_op_ds4_moe_owner_split(
 __global__ void hc_collapse_f32(const float * __restrict__ a,
                                 const float * __restrict__ b,
                                 float * __restrict__ dst,
-                                int n_embd, int n_hc, int nt, float scale) {
+                                int n_embd, int n_hc, int nt, float scale,
+                                int gate_sigmoid) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_embd) return;
     const int t = blockIdx.y;
@@ -669,7 +670,8 @@ __global__ void hc_collapse_f32(const float * __restrict__ a,
     float acc = 0.0f;
     for (int c = 0; c < n_hc; ++c) {
         const size_t o = base + (size_t) c * (size_t) n_embd;
-        acc += a[o] * b[o];
+        const float g = gate_sigmoid ? (1.0f / (1.0f + expf(-b[o]))) : b[o];
+        acc += a[o] * g;
     }
     dst[(size_t) t * (size_t) n_embd + (size_t) i] = acc * scale;
 }
@@ -747,6 +749,7 @@ void ggml_cuda_op_moe_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
 
         const int n_embd = ggml_get_op_params_i32(dst, 1);
         const int n_hc   = ggml_get_op_params_i32(dst, 2);
+        const int gate_sigmoid = ggml_get_op_params_i32(dst, 3);
         const int64_t nt = a->ne[1];
         GGML_ASSERT((int64_t) n_embd * n_hc == a->ne[0]);
         GGML_ASSERT(dst->ne[0] == n_embd && dst->ne[1] == nt);
@@ -756,7 +759,7 @@ void ggml_cuda_op_moe_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         hipLaunchKernelGGL(hc_collapse_f32, grid, dim3(kBlock), 0, ctx.stream(),
                            (const float *) a->data, (const float *) b->data,
                            (float *) dst->data, n_embd, n_hc, (int) nt,
-                           1.0f / (float) n_hc);
+                           1.0f / (float) n_hc, gate_sigmoid);
         return;
     }
     if (mode == GGML_MOE_FUSED_CLUSTER_ALLREDUCE) {

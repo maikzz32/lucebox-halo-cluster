@@ -64,11 +64,13 @@ ggml_tensor * qwen4exp_hc_mix(ggml_context * ctx,
     if (cluster) {
         up = qwen4exp_cluster_allreduce_node(ctx, ggml_cont(ctx, up), *cluster);
     }
-    ggml_tensor * gate = ggml_sigmoid(ctx, up);
+    // The fused collapse takes the sigmoid itself, so the gate stays as the
+    // raw projection there; the unfused reference still needs it applied.
+    ggml_tensor * gate = up;
 
     qwen4exp_probe_add(ctx, gf, "  xn",   -1, xn);
     qwen4exp_probe_add(ctx, gf, "  lo",   -1, lo);
-    qwen4exp_probe_add(ctx, gf, "  gate", -1, gate);
+    qwen4exp_probe_add(ctx, gf, "  gate_pre", -1, gate);   // pre-sigmoid
 
     // Gate and collapse. Written out this is a multiply, one contiguous copy
     // per stream, n_hc-1 adds and a scale -- nine kernels, in a path that runs
@@ -84,8 +86,9 @@ ggml_tensor * qwen4exp_hc_mix(ggml_context * ctx,
 
     ggml_tensor * mixed = nullptr;
     if (fuse_hc) {
-        mixed = ggml_hc_collapse(ctx, xn, gate, n_embd, n_hc);
+        mixed = ggml_hc_collapse(ctx, xn, gate, n_embd, n_hc, /*gate_sigmoid=*/true);
     } else {
+        gate = ggml_sigmoid(ctx, gate);
         ggml_tensor * gated = ggml_mul(ctx, xn, gate);
         gated = ggml_reshape_3d(ctx, gated, n_embd, n_hc, nt);
 

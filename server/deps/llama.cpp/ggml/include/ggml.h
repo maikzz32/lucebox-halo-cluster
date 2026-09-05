@@ -2626,7 +2626,11 @@ extern "C" {
     // Hyper-connection collapse: gate the normalised state and average the
     // streams, in one kernel.
     //
-    //   dst[i, t] = (1/n_hc) * sum_c a[c*n_embd + i, t] * b[c*n_embd + i, t]
+    //   dst[i, t] = (1/n_hc) * sum_c a[c*n_embd + i, t] * g(b[c*n_embd + i, t])
+    //
+    // with g = sigmoid when `gate_sigmoid` is set and the identity otherwise.
+    // Taking the sigmoid inside costs nothing -- the value is loaded either
+    // way -- and saves a kernel over the whole [n_hc*n_embd, T] block.
     //
     // Written as ggml ops that is a multiply, one contiguous copy per stream,
     // n_hc-1 adds and a scale -- nine kernels for four streams, and the mixer
@@ -2639,7 +2643,8 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b,
             int                   n_embd,
-            int                   n_hc);
+            int                   n_hc,
+            bool                  gate_sigmoid);
 
     GGML_API struct ggml_tensor * ggml_laguna_moe_combine(
             struct ggml_context * ctx,

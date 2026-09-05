@@ -8973,7 +8973,8 @@ struct ggml_tensor * ggml_hc_collapse(
         struct ggml_tensor  * a,
         struct ggml_tensor  * b,
         int                   n_embd,
-        int                   n_hc) {
+        int                   n_hc,
+        bool                  gate_sigmoid) {
     GGML_ASSERT(a->type == GGML_TYPE_F32);
     GGML_ASSERT(b->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(a));
@@ -8991,6 +8992,7 @@ struct ggml_tensor * ggml_hc_collapse(
     ggml_set_op_params_i32(result, 0, GGML_MOE_FUSED_HC_COLLAPSE);
     ggml_set_op_params_i32(result, 1, n_embd);
     ggml_set_op_params_i32(result, 2, n_hc);
+    ggml_set_op_params_i32(result, 3, gate_sigmoid ? 1 : 0);
 
     return result;
 }
