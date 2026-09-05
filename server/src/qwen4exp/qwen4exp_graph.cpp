@@ -205,66 +205,21 @@ ggml_tensor * qwen4exp_hc_combine(ggml_context * ctx,
     // 2*sigmoid centres the scatter weights on 1, so an injection of zero is a
     // plain residual add rather than a halving of the block's contribution.
     //
-    // DFLASH_QWEN4EXP_HC_VARIANT selects a different reading of the same
-    // tensors. It exists because the measured injections are far outside the
-    // range this formula assumes -- around -19 where random alignment predicts
-    // -0.5 -- which saturates every gate to zero and stops the blocks writing
-    // back at all. Variant 1 is the control that matters: with the gate pinned
-    // to 1 the four streams stay identical and the model degenerates to an
-    // ordinary residual network, so coherent text there would say the fault is
-    // in this formula and nowhere else.
-    static const int variant = []() {
-        const char * s = std::getenv("DFLASH_QWEN4EXP_HC_VARIANT");
-        return s ? std::atoi(s) : 0;
-    }();
+    // The injections come out near -15 per stream, which drives the gate
+    // nearly shut, and that looked wrong for a long time: the weights are
+    // zero-mean with rms 0.011, and a random alignment against a unit-rms xn
+    // over 10240 dimensions predicts about -0.5. Six other readings of this
+    // formula were tried against a calibrated score and every one produced
+    // nonsense. Upstream's own trace settles it -- its hc_inject-0 is
+    // [-14.93, -14.93, -8.63, -14.62] against this tree's [-15.90, -16.20,
+    // -9.16, -16.15]. Trained weights are not randomly aligned with their
+    // input, and the formula is right as written.
+    ggml_tensor * w = ggml_scale(
+        ctx, ggml_sigmoid(ctx, ggml_scale(ctx, inject, 1.0f / (float) n_hc)), 2.0f);
 
-    ggml_tensor * w = nullptr;
-    switch (variant) {
-        case 1:  // control: plain residual add into every stream
-            w = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, inject, 0.0f)), 2.0f);
-            break;
-        case 2: {
-            // Centre the injection across the streams before the sigmoid. The
-            // measured offset is nearly the same for all four, so if it is an
-            // artefact rather than a signal, removing it restores a gate that
-            // spans zero to two. (1 + tanh(x) is not a separate variant: it
-            // equals 2*sigmoid(2x), which only saturates harder.)
-            ggml_tensor * mu = ggml_repeat(ctx, ggml_mean(ctx, inject), inject);
-            ggml_tensor * centred = ggml_sub(ctx, inject, mu);
-            w = ggml_scale(
-                ctx, ggml_sigmoid(ctx, ggml_scale(ctx, centred, 1.0f / (float) n_hc)), 2.0f);
-            break;
-        }
-        case 3:  // no 1/n_hc: the scale is the only free constant in the formula
-            w = ggml_scale(ctx, ggml_sigmoid(ctx, inject), 2.0f);
-            break;
-        case 4:  // 1/sqrt(n_hc*n_embd): the projection's own width
-        case 5: {
-            // Divide by the square root of the contracted width instead of by
-            // n_hc. The injection is a dot product over 10240 dimensions and
-            // comes out near -19, which drives the gate to 0.02 and leaves the
-            // blocks contributing nothing. Scaling by sqrt of that width puts
-            // it at -0.19 and the gate near 0.9, which is the range a trained
-            // depth connection is initialised in. Variant 1 reached a gate of
-            // one too, but by discarding the per-stream variation with it --
-            // the streams stayed identical and the carrier stopped being wide
-            // at all. This keeps the variation and only changes the scale.
-            const float d = variant == 4
-                ? (float) ((int64_t) n_hc * n_embd)
-                : (float) n_embd;
-            w = ggml_scale(
-                ctx, ggml_sigmoid(ctx, ggml_scale(ctx, inject, 1.0f / sqrtf(d))), 2.0f);
-            break;
-        }
-        default:
-            w = ggml_scale(
-                ctx, ggml_sigmoid(ctx, ggml_scale(ctx, inject, 1.0f / (float) n_hc)), 2.0f);
-            break;
-    }
-    // Both operands are materialised to the carrier's shape rather than left
-    // to broadcasting. The scatter weight would otherwise broadcast along
-    // ne[0], the fastest axis, from one to n_embd -- legal, but the rarest
-    // shape of broadcast there is, and this is not the place to depend on it.
+    // Materialised to the carrier's shape rather than left to broadcast: the
+    // scatter weight would otherwise broadcast along ne[0], the fastest axis,
+    // from one to n_embd, which is the rarest shape of broadcast there is.
     w = ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, w, 1, n_hc, nt),
                        n_embd, n_hc, nt, 1);
 

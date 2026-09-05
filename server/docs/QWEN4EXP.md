@@ -429,3 +429,52 @@ repackager edited the file, and abliteration edits weights. The official
 Q3_K_M conversion is therefore the next control: if it also scores 0/10 the
 fault is in this tree and the search continues with a canonical file; if it
 does not, the file was never going to work.
+
+## Resolution
+
+Two bugs, found in an hour once there was an oracle, after a night of
+statistics that found neither.
+
+**The delta net's output gate.** qwen4exp gates the normalised GDN output with
+`sigmoid(z)`; Qwen3.5 gates it with `silu(z)`. That is the entire numerical
+difference between the two architectures' gated delta net, nothing in the
+tensor shapes reveals it, and this implementation reached qwen4exp by reusing
+qwen35's block -- so 36 of 48 layers ran the wrong gate. `TargetWeights::
+gdn_sigmoid_output_gate` now selects it, defaulting to Qwen3.5's silu.
+
+**The PLE input, filled before the graph build.** The decode loop wrote its
+inputs and then called `build_target_step`. The first decode step changes the
+graph's token count from the prefill chunk's to one, so that build really
+rebuilds, and a graph-owned input written beforehand is discarded. `inp_embed`
+and `positions` survive because they are persistent; `ple_embed` is not, so
+the first generated token of every request hashed its n-gram embedding out of
+uninitialised memory. One wrong token, then recovery -- which is why it hid
+behind the first bug for so long.
+
+Both files now score **8/10**, the same as DeepSeek V4 Flash, and the two
+misses are the eight-token limit cutting the answer short. One node gives 25.1
+tok/s on the official Q3_K_M and 23.6 on the abliterated ROCmFP4 build.
+DeepSeek's cluster is unaffected: 48.8 tok/s, byte-identical to its reference.
+
+### How the oracle was built
+
+Upstream llama.cpp implements this architecture, and bartowski's official
+conversion is in standard ggml types that it can read, so both implementations
+can run the same file. Two details made the comparison sharp:
+
+- **the same tokens on both sides.** `llama-eval-callback` takes a raw prompt;
+  the server always applies a chat template. Passing an identity template
+  (`--chat-template-file` with `{% for m in messages %}{{ m.content }}{% endfor %}`)
+  made "Hello world" two tokens on both sides.
+- **the same statistic.** eval-callback prints each tensor's `sum`, and this
+  tree's probe prints the mean, so `sum / n_elements` compares directly.
+
+The traces agreed to four or five figures through `hc_init`, `hc_norm`,
+`hc_gate`, `hc_mixed` and `hc_inject`, and diverged at the block output. That
+is a two-minute answer to a question a night of internal statistics could not
+settle -- including the injection magnitude, which the oracle confirms is
+genuinely near -15.
+
+**The lesson worth keeping: build the oracle first.** Every instrument built
+before it produced a confident wrong answer, and each was caught only by
+running it against a model known to work.
