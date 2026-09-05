@@ -2,6 +2,7 @@
 #include "qwen35moe_ffn.h"
 
 #include "qwen35_ops.h"
+#include "qwen4exp/qwen4exp_probe.h"
 
 #include <cstdlib>
 #include <cmath>
@@ -211,6 +212,8 @@ ggml_tensor * build_qwen35moe_ffn(
             shared = ggml_mul(ctx, shared, shared_gate);
         }
 
+        qwen4exp_probe_add(ctx, nullptr, "  moe_routed", -1, routed);
+        qwen4exp_probe_add(ctx, nullptr, "  moe_shared", -1, shared);
         return routed ? ggml_add(ctx, routed, shared) : shared;
     }
 

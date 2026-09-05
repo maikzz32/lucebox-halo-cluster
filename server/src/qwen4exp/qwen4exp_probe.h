@@ -25,8 +25,16 @@ bool qwen4exp_probe_enabled();
 
 // Append a sum-of-squares reduction of `t` to the graph and remember it under
 // `label` (layer index appended when il >= 0). `t` is not modified.
+//
+// `gf` may be null where a caller has a context but no graph -- inside a
+// shared builder, say, whose signature should not grow a parameter for an
+// instrument. The reduction nodes are then held until the next
+// qwen4exp_probe_expand().
 void qwen4exp_probe_add(ggml_context * ctx, ggml_cgraph * gf,
                         const char * label, int il, ggml_tensor * t);
+
+// Attach everything added with a null `gf` to this graph.
+void qwen4exp_probe_expand(ggml_cgraph * gf);
 
 // Read every probe registered since the last report, print one line each, and
 // clear the list. Call after the graph has been computed.

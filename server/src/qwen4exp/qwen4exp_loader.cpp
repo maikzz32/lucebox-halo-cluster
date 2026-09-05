@@ -661,7 +661,8 @@ bool load_qwen4exp_gguf(const std::string & path,
         "[qwen4exp] hparams: n_embd=%d n_layer=%d n_head=%d n_head_kv=%d head_dim=%d\n"
         "[qwen4exp]   full_attn_every=%d n_expert=%d/%d n_ff_exp=%d rope=%.0f/%d,%d,%d,%d\n"
         "[qwen4exp]   ssm: d_inner=%d d_state=%d n_group=%d dt_rank=%d conv=%d\n"
-        "[qwen4exp]   hc: n_hc=%d low_rank=%d  ple: layer=%d ngram=%d heads=%d conv=%d\n",
+        "[qwen4exp]   hc: n_hc=%d low_rank=%d  ple: layer=%d ngram=%d heads=%d conv=%d\n"
+        "[qwen4exp]   n_rot=%d rms_eps=%.2e n_ff_shexp=%d indexer: heads=%d key_len=%d top_k=%d\n",
         out.n_embd, out.n_layer, out.n_head, out.n_head_kv,
         out.n_embd_head_k,
         out.full_attention_interval, out.n_expert_used, out.n_expert, out.n_ff_exp,
@@ -670,7 +671,9 @@ bool load_qwen4exp_gguf(const std::string & path,
         out.ssm_d_inner, out.ssm_d_state, out.ssm_n_group, out.ssm_dt_rank,
         out.ssm_d_conv,
         out.n_hc, out.hc_low_rank, out.ple_layer, out.ple_ngram_size,
-        out.ple_n_heads, out.ple_conv_kernel);
+        out.ple_n_heads, out.ple_conv_kernel,
+        out.rope_dimension_count, (double) out.rms_eps, out.n_ff_shexp,
+        out.n_indexer_head, out.indexer_key_length, out.indexer_top_k);
     std::fprintf(stderr,
         "[qwen4exp] loaded %zu tensors from %s, %.1f GiB on device\n",
         bindings.size(), shards.describe().c_str(),

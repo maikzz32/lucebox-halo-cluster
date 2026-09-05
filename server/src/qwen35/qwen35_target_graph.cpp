@@ -2808,6 +2808,7 @@ static ggml_tensor * build_single_layer_hc(
 
     ggml_tensor * moe_selected = nullptr;
     ggml_tensor * ffn = build_qwen35moe_ffn(ctx, ffn_in, w, L, &moe_selected);
+    qwen4exp_probe_expand(gf);
     if (skip_blocks) ffn = ggml_scale(ctx, ffn, 0.0f);
     qwen4exp_probe_add(ctx, gf, "ffn_mix", layer_idx, ffn_in);
     qwen4exp_probe_add(ctx, gf, "ffn_out", layer_idx, ffn);

@@ -30,6 +30,11 @@ std::vector<Probe> & probes() {
     return v;
 }
 
+std::vector<ggml_tensor *> & pending() {
+    static std::vector<ggml_tensor *> v;
+    return v;
+}
+
 }  // namespace
 
 bool qwen4exp_probe_enabled() {
@@ -53,11 +58,15 @@ void qwen4exp_probe_add(ggml_context * ctx, ggml_cgraph * gf,
     }
     ggml_tensor * ss = ggml_sum(ctx, ggml_sqr(ctx, t));
     ggml_set_output(ss);
-    ggml_build_forward_expand(gf, ss);
-
     ggml_tensor * sm = ggml_sum(ctx, t);
     ggml_set_output(sm);
-    ggml_build_forward_expand(gf, sm);
+    if (gf) {
+        ggml_build_forward_expand(gf, ss);
+        ggml_build_forward_expand(gf, sm);
+    } else {
+        pending().push_back(ss);
+        pending().push_back(sm);
+    }
 
     char name[64];
     if (il >= 0) {
@@ -66,6 +75,14 @@ void qwen4exp_probe_add(ggml_context * ctx, ggml_cgraph * gf,
         std::snprintf(name, sizeof(name), "%s", label);
     }
     probes().push_back({ name, ss, sm, ggml_nelements(t) });
+}
+
+void qwen4exp_probe_expand(ggml_cgraph * gf) {
+    if (!gf) return;
+    for (ggml_tensor * t : pending()) {
+        ggml_build_forward_expand(gf, t);
+    }
+    pending().clear();
 }
 
 void qwen4exp_probe_report() {
@@ -85,6 +102,7 @@ void qwen4exp_probe_report() {
                      p.label.c_str(), rms, mean, (long long) p.n);
     }
     probes().clear();
+    pending().clear();
 }
 
 }  // namespace dflash::common
