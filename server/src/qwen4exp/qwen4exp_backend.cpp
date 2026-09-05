@@ -96,6 +96,32 @@ bool Qwen4ExpBackend::cluster_attach(const cluster::ClusterConfig * cfg,
     std::fprintf(stderr, "[qwen4exp-cluster] rank %d/%d %s\n",
                  cfg->rank, cfg->size,
                  comm ? "communicator attached" : "placement only");
+
+    // Opt-in, and it fails soft: a fabric that cannot come up leaves the RCCL
+    // path exactly as it was rather than taking the run down.
+    if (comm && cfg->size > 1 &&
+        std::getenv("DFLASH_CLUSTER_FAST_REDUCE") != nullptr && !cluster_.fast) {
+        cluster::FastReduce::Config fc;
+        fc.rank = cfg->rank;
+        fc.size = cfg->size;
+        fc.hca  = cfg->ib_hca;
+        fc.gid_index = cfg->gid_index > 0 ? cfg->gid_index : 1;
+        fc.bootstrap_host = cfg->head_host;
+        fc.bootstrap_port = cfg->head_port + 100;
+        auto fast = std::make_unique<cluster::FastReduce>();
+        std::string ferr;
+        if (fast->init(fc, &ferr)) {
+            cluster_.fast = std::move(fast);
+            std::fprintf(stderr,
+                         "[qwen4exp-cluster] fast reduce up on %s (gid %d), "
+                         "bootstrap :%d\n",
+                         fc.hca.c_str(), fc.gid_index, fc.bootstrap_port);
+        } else {
+            std::fprintf(stderr,
+                         "[qwen4exp-cluster] fast reduce unavailable, keeping RCCL: %s\n",
+                         ferr.c_str());
+        }
+    }
     return true;
 }
 

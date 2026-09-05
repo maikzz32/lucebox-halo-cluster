@@ -1,0 +1,89 @@
+// fast_reduce.h - a lean all-reduce for the decode path's tiny payloads.
+//
+// WHY THIS EXISTS. A qwen4exp decode step on two nodes computes in 29.6 ms of
+// GPU work and takes 41.0. The difference is ninety-seven all-reduces of
+// 10 KiB each -- 117 us apiece. That is not the wire: ib_write_lat puts the
+// same payload at 13.65 us, and the round trip through a pinned flag between
+// the GPU and a host thread measures 0.79 us. It is what a general-purpose
+// collective costs per call, ninety-seven times, and it is the single reason
+// adding ranks to this model buys nothing: every axis worth sharding pays for
+// its bytes with reductions at about 11.9 MB each, and every axis this model
+// has sits on that line.
+//
+// So this replaces the collective for exactly the case it is bad at: a few
+// kilobytes, latency-bound, on the critical path of every layer. Each rank
+// writes its partial straight into every peer's pre-registered buffer and adds
+// what arrives. There is no algorithm selection, no protocol negotiation and
+// no proxy handshake -- one RDMA write per peer and a flag.
+//
+// WHAT IT ASSUMES. Unified memory. On Strix Halo there is no separate VRAM, so
+// a pinned host buffer *is* GPU memory: the NIC writes into it and a kernel
+// reads it without a copy and without GPUDirect. It also assumes the ranks run
+// the same graph in lockstep, so that the n-th reduction on one rank is the
+// n-th on all of them -- which is what the sequence numbers check rather than
+// trust.
+//
+// WHAT IT IS NOT. Not a general collective: sum of f32, small sizes, no
+// in-place aliasing games, no groups. Anything outside that keeps using RCCL.
+//
+// Include convention: #include "cluster/fast_reduce.h"
+
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <string>
+
+namespace dflash::cluster {
+
+// Opaque so verbs headers stay out of every translation unit that reduces.
+struct FastReduceImpl;
+
+class FastReduce {
+public:
+    FastReduce();
+    ~FastReduce();
+
+    FastReduce(const FastReduce &) = delete;
+    FastReduce & operator=(const FastReduce &) = delete;
+
+    struct Config {
+        int         rank = 0;
+        int         size = 1;
+        std::string hca;                 // e.g. "rocep197s0f3"
+        int         ib_port = 1;
+        int         gid_index = 1;       // RoCE v2
+        std::string bootstrap_host;      // rank 0's address
+        int         bootstrap_port = 9500;
+        int         max_elems = 16384;   // 64 KiB; larger reductions fall back
+        int         slots = 256;         // in-flight ring; a step has ~97
+        uint32_t    timeout_ms = 30000;
+    };
+
+    // Brings the fabric up: registers the buffers, exchanges endpoints over a
+    // plain TCP mesh of its own, and connects one queue pair per peer. The
+    // bootstrap is separate from the cluster control channel on purpose --
+    // this has to be able to fail without taking the run with it.
+    bool init(const Config & cfg, std::string * err);
+
+    void shutdown();
+
+    bool ok() const;
+
+    // Enqueue a sum-reduction of `n` floats at `data` on `stream`. `data` must
+    // be device-visible and is updated in place. Returns false when the
+    // payload is larger than the fabric was built for, so the caller can fall
+    // back rather than corrupt the step.
+    bool submit(float * data, size_t n, void * stream);
+
+    // Reductions issued and how long the progress thread waited for the GPU,
+    // for the telemetry line.
+    uint64_t submitted() const;
+    uint64_t timed_out() const;
+
+private:
+    std::unique_ptr<FastReduceImpl> p_;
+};
+
+}  // namespace dflash::cluster

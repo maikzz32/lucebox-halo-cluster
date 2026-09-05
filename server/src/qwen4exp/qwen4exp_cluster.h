@@ -37,6 +37,9 @@
 #include "ggml-backend.h"
 
 #include <cstdint>
+#include "cluster/fast_reduce.h"
+
+#include <memory>
 #include <string>
 
 namespace dflash::common {
@@ -50,6 +53,13 @@ struct Qwen4ExpClusterRuntime {
     cluster::Ds4ClusterHooks *     hooks = nullptr;
     cluster::ClusterStepTelemetry  telemetry;
     bool trace = false;
+
+    // The lean path for the decode step's tiny reductions. A general
+    // collective costs 117 us for 10 KiB here against 13.65 us of wire, and a
+    // step waits on ninety-seven of them; this writes straight into the peers'
+    // registered buffers instead. Null unless DFLASH_CLUSTER_FAST_REDUCE=1,
+    // and the RCCL path stays underneath it for everything it declines.
+    std::unique_ptr<cluster::FastReduce> fast;
 
     // A graph node cannot return an error, so an in-graph collective records
     // its first failure here and the forward fails after the compute.

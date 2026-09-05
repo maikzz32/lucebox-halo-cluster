@@ -44,6 +44,12 @@ void allreduce_graph_callback(void * user, void * data, size_t n, void * stream)
     auto * rt = static_cast<Qwen4ExpClusterRuntime *>(user);
     if (!rt || !rt->comm || rt->comm->size() <= 1 || n == 0 || !data) return;
     if (allreduce_noop()) return;
+    // The lean fabric takes anything it was sized for; RCCL keeps the rest.
+    if (rt->fast && rt->fast->ok() && rt->fast->submit((float *) data, n, stream)) {
+        rt->telemetry.allreduce_calls += 1;
+        rt->telemetry.allreduce_bytes += (uint64_t) n * sizeof(float);
+        return;
+    }
     std::string err;
     if (!rt->comm->allreduce_sum_f32(data, n, (cluster::DeviceStream) stream, &err)) {
         // Keep the first failure: the rest of the graph still runs, and the

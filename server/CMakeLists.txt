@@ -687,6 +687,17 @@ elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
         target_sources(dflash_common PRIVATE src/cluster/cluster_comm_kernels.cu)
         set_source_files_properties(src/cluster/cluster_comm_kernels.cu PROPERTIES LANGUAGE HIP)
         target_link_libraries(dflash_common PUBLIC roc::rccl)
+
+        # The lean decode-path reduction talks to the HCA directly: a general
+        # collective costs 117 us for the 10 KiB a decode step reduces, against
+        # 13.65 us of wire. Verbs only -- no rdmacm, the endpoints are exchanged
+        # over a socket of its own.
+        find_library(DFLASH27B_IBVERBS_LIB ibverbs REQUIRED)
+        target_sources(dflash_common PRIVATE
+            src/cluster/fast_reduce.cpp
+            src/cluster/fast_reduce_kernels.cu)
+        set_source_files_properties(src/cluster/fast_reduce_kernels.cu PROPERTIES LANGUAGE HIP)
+        target_link_libraries(dflash_common PUBLIC ${DFLASH27B_IBVERBS_LIB})
     endif()
 endif()
 
@@ -966,6 +977,15 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/pflash_daemon.cpp")
         target_link_libraries(gguf_embed_tie PRIVATE CUDA::cudart)
     else()
         target_link_libraries(gguf_embed_tie PRIVATE hip::host)
+    endif()
+
+    # HIP only: the probe is about GPU/host coherence on an APU, which is not
+    # a thing the CUDA backend has an equivalent of here.
+    if(NOT DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+        set_source_files_properties(test/cluster_flag_latency.cu PROPERTIES LANGUAGE HIP)
+        add_executable(cluster_flag_latency test/cluster_flag_latency.cu)
+        target_include_directories(cluster_flag_latency PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+        target_link_libraries(cluster_flag_latency PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} hip::host)
     endif()
 
     add_executable(pflash_daemon test/pflash_daemon.cpp)
