@@ -62,4 +62,39 @@ struct Qwen4ExpClusterRuntime {
 // mismatched shard set fails at startup rather than as wrong output.
 uint64_t qwen4exp_cluster_placement_hash(const Qwen4ExpClusterRuntime & rt);
 
+// Sum `partial` across the ranks in place, as a node inside the graph.
+//
+// Between per-layer computes would need the forward split into 48 of them;
+// this rides the backend stream instead, so the collective is ordered against
+// the kernels that produce and consume it without a host synchronisation.
+// Returns `partial` unchanged on a single rank.
+ggml_tensor * qwen4exp_cluster_allreduce_node(ggml_context * ctx,
+                                              ggml_tensor *  partial,
+                                              Qwen4ExpClusterRuntime & rt);
+
+// How a tensor is split across ranks.
+//
+// Everything qwen4exp shards is a matmul weight, and a matmul splits two ways:
+// by its output rows, which every rank then owns outright, or by its input
+// columns, which makes each rank's result a partial sum that one all-reduce
+// completes. In ggml's layout a weight is [in, out], so the first is a
+// contiguous run of rows -- free -- and the second is a range inside every
+// row, which must land on a quantisation block boundary.
+enum class ShardAxis {
+    None,
+    Rows,     // ne[1]: output features. No reduction needed.
+    Cols,     // ne[0]: input features. The result is a partial sum.
+};
+
+// The [begin, end) slice of `extent` this rank owns, or the whole extent when
+// the split does not divide it evenly enough to stay on `granularity`.
+struct ShardRange {
+    int64_t begin = 0;
+    int64_t end   = 0;
+    bool    split = false;
+    int64_t count() const { return end - begin; }
+};
+ShardRange qwen4exp_shard_range(int64_t extent, int64_t granularity,
+                                int rank, int size);
+
 }  // namespace dflash::common

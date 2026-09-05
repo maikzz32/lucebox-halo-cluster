@@ -30,7 +30,10 @@ Qwen4ExpBackend::Qwen4ExpBackend(const Qwen4ExpConfig & cfg)
     : Qwen35Backend(make_qwen_runtime_config(cfg)) {}
 
 bool Qwen4ExpBackend::load_target_model(ggml_backend_t backend, TargetWeights & out) {
-    return load_qwen4exp_gguf(cfg_.target_path, backend, out);
+    // Only when this rank actually holds a slice: a single-rank run must build
+    // the same graph it always did.
+    out.cluster = cluster_.sharded() ? &cluster_ : nullptr;
+    return load_qwen4exp_gguf(cfg_.target_path, backend, out, &cluster_);
 }
 
 void Qwen4ExpBackend::print_ready_banner() const {

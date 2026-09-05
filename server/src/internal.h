@@ -262,6 +262,12 @@ struct TargetWeights {
     int kv_lora_rank            = 0;
     int q_lora_rank             = 0;
     float kda_gate_lower_bound  = 0.0f;
+    // Set when this rank holds a slice of the weights rather than all of
+    // them. The graph builder consults it to place the reductions that turn
+    // each rank's partial sums back into the whole; nothing else in the tree
+    // sets it, so every other architecture builds exactly the graph it did.
+    struct Qwen4ExpClusterRuntime * cluster = nullptr;
+
     // The gated delta net's output gate. Qwen3.5 gates the normalised output
     // with silu(z); qwen4exp gates it with sigmoid(z), and that is the only
     // numerical difference between the two architectures' GDN. It is a whole

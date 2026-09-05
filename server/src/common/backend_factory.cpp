@@ -346,9 +346,29 @@ std::unique_ptr<ModelBackend> create_backend(
         cfg.stream_fd = args.stream_fd;
 
         auto backend = std::make_unique<Qwen4ExpBackend>(cfg);
+        // A cluster rank loads only its slice of the weights, so the backend
+        // must know the cluster config BEFORE init(); the communicator is
+        // attached later, once RCCL is up. Not a cluster run: nothing here
+        // executes.
+        if (args.cluster.enabled() &&
+            !backend->cluster_attach(&args.cluster, /*comm=*/nullptr)) {
+            std::fprintf(stderr, "[backend_factory] Qwen4ExpBackend::cluster_attach refused\n");
+            return nullptr;
+        }
         if (!backend->init()) {
             std::fprintf(stderr, "[backend_factory] Qwen4ExpBackend init failed\n");
             return nullptr;
+        }
+        // Rank 0 serves HTTP through the lockstep decorator; workers get the
+        // raw backend and run_cluster_worker owns their control loop.
+        if (args.cluster.is_head()) {
+            auto head = std::make_unique<dflash::cluster::ClusterHeadBackend>(
+                std::move(backend), args.cluster, args.model_path, args.device.gpu);
+            if (!head->init()) {
+                std::fprintf(stderr, "[backend_factory] ClusterHeadBackend(qwen4exp) init failed\n");
+                return nullptr;
+            }
+            return head;
         }
         return backend;
 

@@ -30,6 +30,7 @@
 
 #include "common/gguf_shards.h"
 #include "internal.h"
+#include "qwen4exp/qwen4exp_cluster.h"
 
 #include <string>
 #include <vector>
@@ -67,6 +68,7 @@ void qwen4exp_ple_rows(const TargetWeights & w,
 // Load a qwen4exp model from a (possibly split) GGUF into `out`.
 bool load_qwen4exp_gguf(const std::string & path,
                         ggml_backend_t backend,
-                        TargetWeights & out);
+                        TargetWeights & out,
+                        const Qwen4ExpClusterRuntime * cluster);
 
 }  // namespace dflash::common

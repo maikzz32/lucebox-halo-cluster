@@ -1,10 +1,12 @@
 #include "qwen4exp/qwen4exp_internal.h"
+#include "qwen4exp/qwen4exp_cluster.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <set>
 #include <vector>
 
 namespace dflash::common {
@@ -305,6 +307,11 @@ struct Binding {
     ggml_tensor *   dst = nullptr;   // in the context TargetWeights owns
     GgufShardTensor src;             // into whichever shard holds it
     bool            to_f32 = false;  // dequantise on the host during upload
+    // Cluster sharding. `axis` says which of the source's dimensions this rank
+    // holds a slice of; begin/count are in elements along it.
+    ShardAxis       axis  = ShardAxis::None;
+    int64_t         begin = 0;
+    int64_t         count = 0;
 };
 
 // Bind one tensor by name. Optional names may be absent; required ones fail.
@@ -313,6 +320,8 @@ struct Binder {
     ggml_context *       ctx;
     std::vector<Binding> & out;
     std::string &        err;
+    const Qwen4ExpClusterRuntime * cluster = nullptr;
+    std::set<std::string> warned_unsplit;
     bool ok = true;
 
     // Bind a tensor and dequantise it to F32 on the way to the device.
@@ -331,6 +340,56 @@ struct Binder {
             for (int d = 1; d < GGML_MAX_DIMS; ++d) {
                 t->nb[d] = t->nb[d - 1] * t->ne[d - 1];
             }
+        }
+        return t;
+    }
+
+    // Bind a tensor holding only this rank's slice of it.
+    //
+    // Rows are a contiguous run and cost nothing to cut. Columns are a range
+    // inside every row, so the cut must land on a quantisation block boundary
+    // -- qwen4exp's expert width of 640 divides by two and by four and stays
+    // on the 32-element block of every type these files use, which is why the
+    // MoE splits by width rather than by expert index. That also leaves the
+    // router untouched: every rank routes to the same ten experts and computes
+    // its slice of their hidden dimension, and one all-reduce completes the
+    // sum. Splitting by expert index would have needed the ids remapped on
+    // device and would still have read a sentinel expert per unowned route.
+    ggml_tensor * take_shard(const std::string & name, ShardAxis axis,
+                             int64_t granularity, bool required) {
+        ggml_tensor * t = take(name, required);
+        if (!t || axis == ShardAxis::None || !cluster || !cluster->sharded()) {
+            return t;
+        }
+        Binding & b = out.back();
+        const int64_t extent = axis == ShardAxis::Rows ? b.src.meta->ne[1]
+                                                       : b.src.meta->ne[0];
+        const ShardRange r = qwen4exp_shard_range(extent, granularity,
+                                                  cluster->rank(), cluster->size());
+        if (!r.split) {
+            if (!warned_unsplit.count(name)) {
+                warned_unsplit.insert(name);
+                std::fprintf(stderr,
+                             "[qwen4exp-cluster] %s: %lld does not divide by %d on a "
+                             "%lld boundary, keeping it replicated\n",
+                             name.c_str(), (long long) extent, cluster->size(),
+                             (long long) granularity);
+            }
+            return t;
+        }
+        b.axis  = axis;
+        b.begin = r.begin;
+        b.count = r.count();
+        if (axis == ShardAxis::Rows) {
+            t->ne[1] = r.count();
+        } else {
+            t->ne[0] = r.count();
+        }
+        // Recompute the strides for the narrower tensor.
+        t->nb[0] = ggml_type_size(t->type);
+        t->nb[1] = ggml_row_size(t->type, t->ne[0]);
+        for (int d = 2; d < GGML_MAX_DIMS; ++d) {
+            t->nb[d] = t->nb[d - 1] * t->ne[d - 1];
         }
         return t;
     }
@@ -358,13 +417,20 @@ struct Binder {
     }
 };
 
+// The granularity every expert-width cut must land on. 32 is the block size of
+// every quantisation these checkpoints use for the expert matrices, and the
+// coarsest that still divides 640 by four. A finer cut would break a
+// quantisation block; a coarser one would refuse the four-node split.
+constexpr int64_t kFfnShardGran = 32;
+
 size_t align_up_to(size_t v, size_t a) { return a ? ((v + a - 1) / a) * a : v; }
 
 }  // namespace
 
 bool load_qwen4exp_gguf(const std::string & path,
                         ggml_backend_t backend,
-                        TargetWeights & out) {
+                        TargetWeights & out,
+                        const Qwen4ExpClusterRuntime * cluster) {
     GgufShardSet shards;
     std::string err;
     if (!shards.open(path, err)) {
@@ -393,7 +459,7 @@ bool load_qwen4exp_gguf(const std::string & path,
 
     std::vector<Binding> bindings;
     bindings.reserve(max_tensors);
-    Binder b{shards, out.ctx, bindings, err};
+    Binder b{shards, out.ctx, bindings, err, cluster};
 
     auto blk = [](int il, const char * suffix) {
         return "blk." + std::to_string(il) + "." + suffix;
@@ -441,12 +507,23 @@ bool load_qwen4exp_gguf(const std::string & path,
         // sigmoid gate qwen35moe already knows how to apply.
         L.ffn_gate_inp       = b.take(blk(il, "ffn_gate_inp.weight"),       true);
         L.ffn_gate_inp_shexp = b.take(blk(il, "ffn_gate_inp_shexp.weight"), false);
-        L.ffn_gate_exps      = b.take(blk(il, "ffn_gate_exps.weight"),      true);
-        L.ffn_up_exps        = b.take(blk(il, "ffn_up_exps.weight"),        true);
-        L.ffn_down_exps      = b.take(blk(il, "ffn_down_exps.weight"),      true);
-        L.ffn_gate_shexp     = b.take(blk(il, "ffn_gate_shexp.weight"),     false);
-        L.ffn_up_shexp       = b.take(blk(il, "ffn_up_shexp.weight"),       false);
-        L.ffn_down_shexp     = b.take(blk(il, "ffn_down_shexp.weight"),     false);
+        // The expert hidden width is what splits, on all three matrices at
+        // once: gate and up produce it, down consumes it. Every rank routes to
+        // the same experts and holds a slice of each one's width, so the
+        // routed and shared outputs are partial sums that one all-reduce per
+        // layer completes.
+        L.ffn_gate_exps      = b.take_shard(blk(il, "ffn_gate_exps.weight"),
+                                            ShardAxis::Rows, kFfnShardGran, true);
+        L.ffn_up_exps        = b.take_shard(blk(il, "ffn_up_exps.weight"),
+                                            ShardAxis::Rows, kFfnShardGran, true);
+        L.ffn_down_exps      = b.take_shard(blk(il, "ffn_down_exps.weight"),
+                                            ShardAxis::Cols, kFfnShardGran, true);
+        L.ffn_gate_shexp     = b.take_shard(blk(il, "ffn_gate_shexp.weight"),
+                                            ShardAxis::Rows, kFfnShardGran, false);
+        L.ffn_up_shexp       = b.take_shard(blk(il, "ffn_up_shexp.weight"),
+                                            ShardAxis::Rows, kFfnShardGran, false);
+        L.ffn_down_shexp     = b.take_shard(blk(il, "ffn_down_shexp.weight"),
+                                            ShardAxis::Cols, kFfnShardGran, false);
 
         if (il == out.ple_layer) {
             L.ple_key        = b.take(blk(il, "ple_key.weight"),        true);
@@ -571,6 +648,38 @@ bool load_qwen4exp_gguf(const std::string & path,
     for (const Binding & bind : bindings) {
         // find() already bounds-checked the source against its own shard.
         shards.advise_willneed(bind.src);
+        if (bind.axis != ShardAxis::None) {
+            // Copy this rank's slice out of the mapped source. Rows are one
+            // contiguous run per higher-dimension slab; columns are a range
+            // inside every row, which is why the cut has to be block-aligned.
+            const ggml_type st = bind.src.meta->type;
+            const int64_t   s0 = bind.src.meta->ne[0];
+            const int64_t   s1 = bind.src.meta->ne[1];
+            const int64_t   s2 = ggml_nelements(bind.src.meta) / (s0 * s1);
+            const size_t    src_row = ggml_row_size(st, s0);
+            const char *    sp = static_cast<const char *>(bind.src.data);
+            size_t          off = 0;
+            if (bind.axis == ShardAxis::Rows) {
+                const size_t run = (size_t) bind.count * src_row;
+                for (int64_t i2 = 0; i2 < s2; ++i2) {
+                    ggml_backend_tensor_set(
+                        bind.dst,
+                        sp + ((size_t) i2 * s1 + (size_t) bind.begin) * src_row,
+                        off, run);
+                    off += run;
+                }
+            } else {
+                const size_t skip = ggml_row_size(st, bind.begin);
+                const size_t run  = ggml_row_size(st, bind.count);
+                for (int64_t r = 0; r < s1 * s2; ++r) {
+                    ggml_backend_tensor_set(bind.dst,
+                                            sp + (size_t) r * src_row + skip,
+                                            off, run);
+                    off += run;
+                }
+            }
+            continue;
+        }
         if (!bind.to_f32) {
             ggml_backend_tensor_set(bind.dst, bind.src.data, 0, bind.src.size);
             continue;

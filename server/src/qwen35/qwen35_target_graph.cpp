@@ -32,6 +32,7 @@
 
 #include "internal.h"
 #include "qwen4exp/qwen4exp_graph.h"
+#include "qwen4exp/qwen4exp_cluster.h"
 #include "qwen4exp/qwen4exp_probe.h"
 #include "bailingmoe3_graph.h"
 #include "delta_net_chunked.h"
@@ -2823,6 +2824,13 @@ static ggml_tensor * build_single_layer_hc(
     ggml_tensor * moe_selected = nullptr;
     ggml_tensor * ffn = build_qwen35moe_ffn(ctx, ffn_in, w, L, &moe_selected);
     qwen4exp_probe_expand(gf);
+    // Each rank held a slice of the expert width, so what came back is a
+    // partial sum over that slice -- of the routed experts and of the shared
+    // one alike, since both were cut the same way. One reduction per layer
+    // makes it whole again before it is written into the carrier.
+    if (w.cluster) {
+        ffn = qwen4exp_cluster_allreduce_node(ctx, ggml_cont(ctx, ffn), *w.cluster);
+    }
     if (skip_blocks) ffn = ggml_scale(ctx, ffn, 0.0f);
     qwen4exp_probe_add(ctx, gf, "ffn_mix", layer_idx, ffn_in);
     qwen4exp_probe_add(ctx, gf, "ffn_out", layer_idx, ffn);
