@@ -982,6 +982,10 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/pflash_daemon.cpp")
     # HIP only: the probe is about GPU/host coherence on an APU, which is not
     # a thing the CUDA backend has an equivalent of here.
     if(NOT DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+        set_source_files_properties(test/device_read_bandwidth.cu PROPERTIES LANGUAGE HIP)
+        add_executable(device_read_bandwidth test/device_read_bandwidth.cu)
+        target_link_libraries(device_read_bandwidth PRIVATE hip::host)
+
         set_source_files_properties(test/cluster_flag_latency.cu PROPERTIES LANGUAGE HIP)
         add_executable(cluster_flag_latency test/cluster_flag_latency.cu)
         target_include_directories(cluster_flag_latency PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})

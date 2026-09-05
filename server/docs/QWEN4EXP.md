@@ -664,14 +664,33 @@ acceptance rate, which is +/-3 points and therefore +/-4% of throughput -- so
 anything smaller than that cannot be measured here at all without many more
 samples.
 
-**What has not been tried, and is the largest number in the file.** A decode
-step moves 2765 MB per rank in 29.6 ms: 93 GB/s, against the ~200 GB/s this
-memory can do. One node is no better, 4266 MB in 38.9 ms, 110 GB/s. Half the
-hardware's bandwidth is going somewhere, and at this point that is a bigger
-prize than anything the cluster can give back: at full bandwidth the two-node
-step would be near 15 ms of GPU work and every target in this document falls
-out of it. That is a question about the quantised matmul kernels, not about
-parallelism, and nothing in this document touches it.
+### Where the other half of the bandwidth goes
+
+A decode step moves 4266 MB in 38.9 ms on one node: 110 GB/s. `device_read_bandwidth`
+puts this GPU at **239.5 GB/s**, so the step runs at 46% of what the memory can
+do, and that is a bigger prize than anything the cluster can give back.
+
+It is not the matmuls. `rocprofv3` over a decode run, by category:
+
+| | GPU time | dispatches |
+|---|---|---|
+| weight reads (matvec, decode) | **60.5%** | 38023 |
+| batched matmul (prefill) | 17.8% | 1810 |
+| elementwise | 4.5% | 51081 |
+| delta net | 3.9% | 3528 |
+| activation quantisation | 2.4% | 27364 |
+| buffer copies | 2.3% | 22434 |
+| attention, norms, the rest | 8.6% | 69844 |
+
+The matvec kernels read 204.8 GB in 1116.8 ms: **183 GB/s, 77% of the
+ceiling**. They are fine. What the step loses is that they are only 74% of its
+GPU time -- the other quarter is **about 3500 kernel dispatches per token**,
+none of them moving weights, 214084 of them in this run.
+
+So the lever is fusion, not faster arithmetic: halving the non-matvec quarter
+would take a one-node step from 38.9 ms to about 33.8, and the two-node
+speculative pass with it. That is where the remaining factor lives, and nothing
+in this document has touched it.
 
 ## The MTP head: it works, and it speculates
 
