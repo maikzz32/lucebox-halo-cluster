@@ -1900,6 +1900,18 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
         if (!w_.embedder.embed(tokens.data() + start, n_tokens, embed_buf.data())) {
             return -1;
         }
+        // Seed the PLE predecessor window from the prompt itself rather than
+        // from whatever the previous request left in it. The window is rolling
+        // state, and nothing else resets it, so without this the first decode
+        // step of every request after the first hashes n-grams built partly
+        // from another conversation -- one wrong token, then recovery. Seeding
+        // from `start` also makes a resumed or prefix-cached prefill identical
+        // to a fresh one.
+        {
+            const int np   = std::max(0, w_.ple_ngram_size - 1);
+            const int from = std::max(0, start - np);
+            ple_hist_.assign(tokens.begin() + from, tokens.begin() + start);
+        }
         if (!fill_ple_embed(tokens.data() + start, n_tokens)) return -1;
         ggml_backend_tensor_set(sg_.inp_embed, embed_buf.data(), 0,
                                 sizeof(float) * (size_t)hidden * n_tokens);
@@ -2294,7 +2306,6 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         int32_t tok = out_tokens.back();
 
         if (!w_.embedder.embed(&tok, 1, embed_buf)) return false;
-        if (!fill_ple_embed(&tok, 1)) return false;
         ggml_backend_tensor_set(sg_.inp_embed, embed_buf, 0, sizeof(float) * hidden);
         int32_t pos4[4] = {committed, committed, committed, 0};
         ggml_backend_tensor_set(sg_.positions, pos4, 0, sizeof(int32_t) * 4);
@@ -2317,6 +2328,16 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                                /*paged_attention=*/paged)) {
             return false;
         }
+
+        // After the build, not before it. The first decode step changes the
+        // graph's token count from the prefill chunk's to one, so that build
+        // really does rebuild, and anything written into a graph-owned input
+        // beforehand is discarded. inp_embed and positions survive because
+        // they are persistent; ple_embed is not, and filling it early left the
+        // first generated token's n-gram embedding reading uninitialised
+        // memory -- one wrong token per request, then recovery. The prefill
+        // path already fills after its build; this now matches it.
+        if (!fill_ple_embed(&tok, 1)) return false;
 
         // Fill kv_write_rows with this step's cache slot for set_rows: the
         // paged append row, its pool slot in kvflash mode, or the logical

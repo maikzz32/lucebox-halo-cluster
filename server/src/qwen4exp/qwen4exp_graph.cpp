@@ -138,6 +138,14 @@ ggml_tensor * qwen4exp_ple(ggml_context * ctx,
     v3 = ggml_repeat_4d(ctx, v3, n_embd, n_hc, nt, 1);
     ggml_tensor * gated = ggml_mul(ctx, v3, gate);                   // [n_embd, n_hc, T]
 
+    qwen4exp_probe_add(ctx, gf, "  ple_ngram", -1, ngram_embd);
+    qwen4exp_probe_add(ctx, gf, "  ple_key",   -1, key);
+    qwen4exp_probe_add(ctx, gf, "  ple_value", -1, value);
+    qwen4exp_probe_add(ctx, gf, "  ple_s",     -1, s);
+    qwen4exp_probe_add(ctx, gf, "  ple_gate",  -1, gate);
+    qwen4exp_probe_add(ctx, gf, "  ple_gated", -1, gated);
+    qwen4exp_probe_add(ctx, gf, "  ple_cstat", -1, conv_state);
+
     ggml_tensor * normed = ple_grouped_norm(
         ctx, ggml_reshape_2d(ctx, gated, hc_dim, nt), w_norm_conv,
         n_embd, n_hc, nt, rms_eps);
@@ -178,9 +186,11 @@ ggml_tensor * qwen4exp_ple(ggml_context * ctx,
                                       ggml_row_size(padded->type, nt));
     ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_cont(ctx, tail), state_2d));
 
+    qwen4exp_probe_add(ctx, gf, "  ple_convraw", -1, conv_out);
     conv_out = ggml_silu(ctx, conv_out);
     conv_out = ggml_reshape_3d(ctx, ggml_cont(ctx, conv_out), n_embd, n_hc, nt);
 
+    qwen4exp_probe_add(ctx, gf, "  ple_conv", -1, conv_out);
     return ggml_add(ctx, state, ggml_add(ctx, gated, conv_out));
 }
 
