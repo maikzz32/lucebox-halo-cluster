@@ -33,6 +33,10 @@ namespace dflash::common {
 //
 //   grouped RMSNorm over a single stream, scaled by the [n_hc*n_embd] gamma
 //   gate = sigmoid(up(silu(down(xn) / n_hc)))       elementwise over n_hc*n_embd
+//
+// `cluster` non-null means this rank holds a slice of the low-rank dimension:
+// down produces part of it, up consumes that part, and the product is a
+// partial sum that one reduction completes before the sigmoid.
 //   mixed = mean over the n_hc streams of (xn * gate)
 //
 // When `inject_out` is non-null it receives the [n_hc, n_tokens] scatter
@@ -40,6 +44,7 @@ namespace dflash::common {
 // has no block to write back.
 ggml_tensor * qwen4exp_hc_mix(ggml_context * ctx,
                               ggml_cgraph *  gf,          // for the magnitude probe
+                              struct Qwen4ExpClusterRuntime * cluster,  // null = whole
                               ggml_tensor *  state,       // [n_embd, n_hc, T]
                               ggml_tensor *  w_norm,      // [n_hc*n_embd]
                               ggml_tensor *  w_down,      // [n_hc*n_embd, low_rank]

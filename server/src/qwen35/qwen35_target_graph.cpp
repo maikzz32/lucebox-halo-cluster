@@ -2682,7 +2682,7 @@ QwenGraphOutputs build_qwen35_graph(
         out = ggml_cont(ctx, ggml_view_2d(ctx, hc_state, w.n_embd, n_tokens,
                                           hc_state->nb[2], 0));
     } else if (hyper_connected) {
-        out = qwen4exp_hc_mix(ctx, gf, hc_state, w.output_hc_norm, w.output_hc_down,
+        out = qwen4exp_hc_mix(ctx, gf, w.cluster, hc_state, w.output_hc_norm, w.output_hc_down,
                               w.output_hc_up, nullptr, nullptr,
                               w.n_embd, w.n_hc, w.rms_eps);
     } else {
@@ -2779,7 +2779,7 @@ static ggml_tensor * build_single_layer_hc(
     // ── attention / delta-net sublayer ────────────────────────────────────
     ggml_tensor * inject = nullptr;
     ggml_tensor * cur = qwen4exp_hc_mix(
-        ctx, gf, *hc_state, L.hc_attn_norm, L.hc_attn_down, L.hc_attn_up,
+        ctx, gf, w.cluster, *hc_state, L.hc_attn_norm, L.hc_attn_down, L.hc_attn_up,
         L.hc_attn_inject, &inject, w.n_embd, n_hc, w.rms_eps);
     ggml_build_forward_expand(gf, cur);
     ggml_tensor * cur_mix = cur;
@@ -2827,9 +2827,11 @@ static ggml_tensor * build_single_layer_hc(
     // The delta net's output projection consumed a slice of the value heads,
     // so what came back is a partial sum. The attention layers are not split
     // and need no reduction, which is why this asks which kind of block ran.
-    // Both block kinds now hand back a partial sum -- the delta net over its
-    // value heads, attention over its query heads -- so both are reduced.
-    if (w.cluster) {
+    // Reduce only what this rank actually computed a part of. The delta net
+    // always splits when the model is sharded; attention is opt-in and may
+    // decline, and summing a block every rank computed whole would multiply it
+    // by the rank count.
+    if (w.cluster && (!is_attn || w.cluster->attn_sharded)) {
         cur = qwen4exp_cluster_allreduce_node(ctx, ggml_cont(ctx, cur), *w.cluster);
     }
     *hc_state = qwen4exp_hc_combine(ctx, *hc_state, cur, inject, w.n_embd, n_hc);
@@ -2837,7 +2839,7 @@ static ggml_tensor * build_single_layer_hc(
 
     // ── FFN sublayer ──────────────────────────────────────────────────────
     ggml_tensor * ffn_in = qwen4exp_hc_mix(
-        ctx, gf, *hc_state, L.hc_ffn_norm, L.hc_ffn_down, L.hc_ffn_up,
+        ctx, gf, w.cluster, *hc_state, L.hc_ffn_norm, L.hc_ffn_down, L.hc_ffn_up,
         L.hc_ffn_inject, &inject, w.n_embd, n_hc, w.rms_eps);
 
     ggml_tensor * moe_selected = nullptr;

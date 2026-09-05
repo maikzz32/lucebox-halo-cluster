@@ -1,4 +1,5 @@
 #include "qwen4exp/qwen4exp_graph.h"
+#include "qwen4exp/qwen4exp_cluster.h"
 #include "qwen4exp/qwen4exp_probe.h"
 
 #include <cmath>
@@ -17,6 +18,7 @@ ggml_tensor * qwen4exp_hc_init(ggml_context * ctx,
 
 ggml_tensor * qwen4exp_hc_mix(ggml_context * ctx,
                               ggml_cgraph *  gf,
+                              Qwen4ExpClusterRuntime * cluster,
                               ggml_tensor *  state,
                               ggml_tensor *  w_norm,
                               ggml_tensor *  w_down,
@@ -50,7 +52,14 @@ ggml_tensor * qwen4exp_hc_mix(ggml_context * ctx,
     // keeps the pre-activation in the range the weights were trained for.
     ggml_tensor * lo = ggml_mul_mat(ctx, w_down, xn);
     lo = ggml_silu(ctx, ggml_scale(ctx, lo, 1.0f / (float) n_hc));
-    ggml_tensor * gate = ggml_sigmoid(ctx, ggml_mul_mat(ctx, w_up, lo));
+    ggml_tensor * up = ggml_mul_mat(ctx, w_up, lo);
+    // The low-rank dimension is what splits here, so `up` summed only over
+    // this rank's part of it. Complete the sum before the sigmoid: after it,
+    // the values are no longer additive.
+    if (cluster) {
+        up = qwen4exp_cluster_allreduce_node(ctx, ggml_cont(ctx, up), *cluster);
+    }
+    ggml_tensor * gate = ggml_sigmoid(ctx, up);
 
     qwen4exp_probe_add(ctx, gf, "  xn",   -1, xn);
     qwen4exp_probe_add(ctx, gf, "  lo",   -1, lo);

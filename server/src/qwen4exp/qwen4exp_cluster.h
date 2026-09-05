@@ -62,6 +62,12 @@ struct Qwen4ExpClusterRuntime {
     int64_t vocab_slice = 0;
     int64_t vocab_total = 0;
 
+    // Whether the attention layers hold a slice of the query and key heads.
+    // The delta-net layers always do when sharded; attention is opt-in and can
+    // refuse the split, and reducing a block that every rank computed whole
+    // would multiply it by the rank count.
+    bool attn_sharded = false;
+
     int rank() const { return cfg ? cfg->rank : 0; }
     int size() const { return cfg ? cfg->size : 1; }
     bool sharded() const { return cfg && cfg->enabled() && cfg->size > 1; }

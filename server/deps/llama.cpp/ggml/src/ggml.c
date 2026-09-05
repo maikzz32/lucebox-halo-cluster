@@ -8707,7 +8707,12 @@ struct ggml_tensor * ggml_turbo_wht(
         struct ggml_context * ctx,
          struct ggml_tensor * a,
                           int direction) {
-    GGML_ASSERT(ggml_n_dims(a) >= 2);
+    // ne[0] is the transform length and everything above it is rows, which the
+    // kernel walks generically. A single row is a legitimate input -- one key
+    // head holding one token -- and ggml_n_dims() rejected it only because it
+    // does not count trailing ones, so [256, 1, 1, 1] read as one-dimensional.
+    // Assert what the transform actually needs instead.
+    GGML_ASSERT(a->ne[0] >= 2 && (a->ne[0] & (a->ne[0] - 1)) == 0);
     struct ggml_tensor * result = ggml_new_tensor(ctx, a->type, GGML_MAX_DIMS, a->ne);
     result->op = GGML_OP_TURBO_WHT;
     result->src[0] = a;

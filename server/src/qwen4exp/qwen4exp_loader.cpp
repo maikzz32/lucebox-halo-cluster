@@ -506,6 +506,13 @@ bool load_qwen4exp_gguf(const std::string & path,
 
         // Hyper-connections replace the usual pre-norms and are on every layer.
         L.hc_attn_norm   = b.take(blk(il, "hc_attn_norm.weight"),   true);
+        // Not split, though it would divide cleanly. Slicing the low rank
+        // saves 177 MB per rank of the 4266 a token reads and costs one
+        // reduction per mixer -- 97 more per token -- which measured 23.5
+        // tok/s against 29.9. At roughly 65 us each those reductions are worth
+        // about 6.3 ms and the bytes about 2.0. The lesson generalises: an
+        // axis is only worth splitting if it carries more bytes than the
+        // reduction it adds, and at this size that is a high bar.
         L.hc_attn_down   = b.take(blk(il, "hc_attn_down.weight"),   true);
         L.hc_attn_up     = b.take(blk(il, "hc_attn_up.weight"),     true);
         L.hc_attn_inject = b.take_f32(blk(il, "hc_attn_inject.weight"), true);
@@ -609,7 +616,16 @@ bool load_qwen4exp_gguf(const std::string & path,
     // the cheapest axis to split it on: the slices are disjoint, so one
     // reduction over the padded logits reproduces exactly the values a single
     // node would compute, in the same order.
-    out.output         = b.take_shard("output.weight", ShardAxis::Rows, 32, true);
+    // DFLASH_QWEN4EXP_SPLIT_VOCAB=0 keeps the head whole. It is worth 261 MB
+    // per rank at two nodes against a 993 KB reduction -- close enough to a
+    // wash that it needs to be measurable rather than assumed.
+    static const bool split_vocab = []() {
+        const char * e = std::getenv("DFLASH_QWEN4EXP_SPLIT_VOCAB");
+        return !e || std::atoi(e) == 1;
+    }();
+    out.output         = b.take_shard("output.weight",
+                                      split_vocab ? ShardAxis::Rows : ShardAxis::None,
+                                      32, true);
 
     if (!b.ok) {
         std::fprintf(stderr, "[qwen4exp] %s\n", err.c_str());
@@ -697,6 +713,7 @@ bool load_qwen4exp_gguf(const std::string & path,
                          "dt_rank=%d\n",
                          out.ssm_d_inner, out.ssm_n_group, out.ssm_dt_rank);
             if (attn_split) {
+                const_cast<Qwen4ExpClusterRuntime *>(cluster)->attn_sharded = true;
                 out.n_head    /= n;
                 out.n_head_kv /= n;
                 std::fprintf(stderr,

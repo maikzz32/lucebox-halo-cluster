@@ -503,36 +503,53 @@ DFLASH_CLUSTER_ALLREDUCE_NOOP=1.
 | forced-continuation | 8/10 | 8/10 | 8/10 |
 | target | | 32 | 50 |
 
-### What splits, and why that is not enough
+### The cluster is not bandwidth-bound, and that is the whole story
 
-| | MB per token | share | axis |
-|---|---|---|---|
-| routed experts | 1167 | 27.4% | expert hidden width |
-| attn_qkv | 649 | 15.2% | delta-net value heads |
-| output (lm_head) | 521 | 12.2% | vocabulary |
-| ssm_out | 423 | 9.9% | delta-net value heads |
-| attn_gate | 243 | 5.7% | delta-net value heads |
-| attn_q, attn_output | 342 | 8.0% | *not split, see below* |
-| ffn_gate_inp | 252 | 5.9% | replicated (F32 router) |
-| rest | 669 | 15.7% | replicated |
+Every axis was measured on its own, five samples inside one server instance
+(the spread there is 0.1 tok/s; between restarts it is much larger, so
+comparisons must stay inside one instance):
 
-Two nodes reach 93% of the target and four nodes do not improve on two. The
-reason is in the two halves of the step, measured apart with the noop probe:
+| | 2 nodes |
+|---|---|
+| MoE + delta net | 25.2 |
+| + vocabulary | 25.3 |
+| + attention heads | 25.4 |
+| one node, nothing split | 23.6 |
 
-  - **the collectives.** 85 reductions cost 6.6 ms at four nodes, 78 us each.
-    LL helps far less there than at two, where they are nearly free.
-  - **the kernels.** Four-way compute alone runs at 36.6 tok/s, which for
-    1856 MB per rank is 68 GB/s against the 100 GB/s a single node sustains.
-    Split four ways this model's matmuls are too small to saturate the memory
-    system: a delta net of 1536 inner and experts 160 wide.
+Splitting three quarters of the bytes buys 7%. That is not what a
+bandwidth-bound run looks like, and the effective rate says the same: one node
+sustains 100 GB/s of weight reads, the two-node cluster 74.
 
-That is the structural limit of per-layer tensor parallelism on a model with
-six billion active parameters. The remaining gap is not another axis to split;
-it is tokens per forward pass. Speculative decoding fixes all three at once --
-it amortises the collectives over q tokens, makes every matmul q times larger,
-and multiplies throughput by the acceptance rate. It is how DeepSeek V4 gets
-from 32 to 50 tok/s in this same tree, and Qwen3.8-Flash-Next ships an MTP
-module for exactly this purpose (unsloth publishes it as a separate GGUF).
+`GGML_CUDA_GRAPH_WHY=1` names the reason. On one node no rule refuses the
+CUDA graph. In a cluster exactly one does -- the cluster all-reduce node --
+and it costs the *whole* forward its graph, so every kernel of a 48-layer step
+is launched eagerly. The sharding does remove bytes; the launches it cannot
+remove are what the step is waiting on.
+
+`DFLASH_CLUSTER_GRAPH_CAPTURE=1` lifts that rule, and the instrumentation
+confirms the graph is then captured with the collective inside -- and it gets
+slower, 23.8 tok/s with RCCL's LL protocol and 24.4 with its default. A
+captured RCCL collective is worse than an eager one here.
+
+So the cost is not the bytes on the wire and not the launch of the collective
+alone: it is that a collective is a synchronisation point the graph cannot
+absorb, ninety-six times per token. Two things address that, and both are what
+vLLM does on the same class of hardware:
+
+  - **a capturable all-reduce.** vLLM does not use NCCL for small decode-path
+    reductions; it uses a custom one-shot kernel over pre-registered peer
+    buffers, which is an ordinary kernel and captures like any other. That
+    removes the rule and the synchronisation together.
+  - **more tokens per forward.** Speculative decoding amortises every
+    synchronisation point over q tokens and makes each matmul q times larger,
+    which is the same lever that takes deepseek4 from 32 to 50 tok/s in this
+    tree. Qwen3.8-Flash-Next ships an MTP module for it;
+    `mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf` is 2.8 GB and now on strix1.
+
+vLLM's mp-executor, by contrast, is a launcher: it replaces Ray's
+orchestration with `--nnodes/--node-rank/--headless` and leaves the
+tensor-parallel math on NCCL. It removes Ray's per-step scheduling overhead,
+which this tree never had.
 
 ### Not split: attention
 

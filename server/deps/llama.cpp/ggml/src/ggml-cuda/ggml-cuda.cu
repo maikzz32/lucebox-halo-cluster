@@ -91,6 +91,7 @@
 #include <unordered_map>
 #include <array>
 #include <cstdlib>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -3900,6 +3901,22 @@ static bool ggml_cuda_cluster_capture_allowed() {
     return allowed;
 }
 
+// GGML_CUDA_GRAPH_WHY=1 names the first rule that refused this graph, once per
+// distinct reason. A forward pass that silently loses its graph launches every
+// kernel eagerly, which on a launch-bound decode step costs far more than the
+// rule usually saves -- and there is no other way to see which rule fired.
+static void ggml_cuda_graph_refused(const char * why) {
+    static const bool on = [] {
+        const char * v = getenv("GGML_CUDA_GRAPH_WHY");
+        return v && v[0] && strcmp(v, "0") != 0;
+    }();
+    if (!on) return;
+    static std::set<std::string> seen;
+    if (seen.insert(why).second) {
+        fprintf(stderr, "[cuda-graph] refused: %s\n", why);
+    }
+}
+
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
@@ -3918,6 +3935,7 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
         if (node->src[0] && node->src[0]->buffer && ggml_backend_buft_is_cuda_split(node->src[0]->buffer->buft)) {
             use_cuda_graph = false; // Split buffers are not supported by CUDA graph capture
+            ggml_cuda_graph_refused("site 1");
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: disabling CUDA graphs due to split buffer\n", __func__);
 #endif
@@ -3936,6 +3954,7 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             ggml_get_op_params_i32(node, 0) == GGML_MOE_FUSED_CLUSTER_ALLREDUCE &&
             !ggml_cuda_cluster_capture_allowed()) {
             use_cuda_graph = false;
+            ggml_cuda_graph_refused("site 2");
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: disabling CUDA graphs due to a cluster all-reduce node\n", __func__);
 #endif
@@ -3988,6 +4007,7 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                 // TODO: figure out a way to enable for larger batch sizes, without hurting performance
                 // ref: https://github.com/ggml-org/llama.cpp/pull/18958
                 use_cuda_graph = false;
+                ggml_cuda_graph_refused("site 3");
 #ifndef NDEBUG
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
 #endif
