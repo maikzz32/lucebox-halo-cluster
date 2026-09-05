@@ -572,16 +572,21 @@ as well as a quantised one. That path is qwen35's in production, and 342 MB of
 4266 is not worth the risk, so the split is behind
 `DFLASH_QWEN4EXP_SHARD_ATTENTION=1` for whoever picks the crash up.
 
-## The MTP head: where it stands
+## The MTP head: it works, and it speculates
 
 Speculation is the only lever that addresses a synchronisation bound, so the
 module Qwen3.8-Flash-Next ships for it is loaded, its shapes are checked
-against the target, and its acceptance rate is measured. It is not usable yet.
+against the target, its acceptance rate is measured, and its drafts are now
+verified inside the target's own step.
 
-`DFLASH_QWEN4EXP_MTP=<path>` drafts the token after next at every decode step
-and scores it against what the target produces. Chance against a 248320-token
-vocabulary is 0.0004%, so the rate separates a correct wiring from a wrong one
-without ambiguity, and it costs one small forward with no rollback.
+`DFLASH_QWEN4EXP_MTP=<path>` loads the head and measures it: each decode step
+drafts the token after next, and the following step scores it against what the
+target produced. Chance against a 248320-token vocabulary is 0.0004%, so the
+rate separates a correct wiring from a wrong one without ambiguity, and the
+measurement costs one small forward and no rollback.
+`DFLASH_QWEN4EXP_SPEC=1` then puts the draft to work.
+
+### Getting from 4% to 70%
 
 | reading | acceptance |
 |---|---|
@@ -590,31 +595,89 @@ without ambiguity, and it costs one small forward with no rollback.
 | carrier collapsed before the projection, not projected per stream | 4% |
 | `hnorm` reducing over the flat width, not per stream | 7% |
 | the projection added to the carrier instead of replacing it | **0%** |
-| **`enorm` and `hnorm` read as `(1 + w)`** | **8%** |
+| `enorm` and `hnorm` read as `(1 + w)` | 8% |
+| **the carrier itself, instead of the buffer it shared** | **62%** |
+| on the GPU rather than the CPU | **69-75%** |
 
-Two of those are settled. The concatenation is embedding-first, as the
-reference has it, and the projection replaces the carrier rather than adding
-to it -- both alternatives score zero, which at this vocabulary size is not a
-degradation but a refutation.
+Two readings are settled by refutation rather than degradation: the
+concatenation is embedding-first, as the reference has it, and the projection
+replaces the carrier rather than adding to it. At this vocabulary size a
+score of zero is not a worse reading, it is a wrong one.
 
-The useful finding is `(1 + w)`. The target's hyper-connection norms average
+`(1 + w)` was the useful reading. The target's hyper-connection norms average
 about one because the converter folded the plus-one into them; `enorm` and
-`hnorm` average 0.24 and 0.67 because it did not, and reading them the other
-way doubled the rate.
+`hnorm` average 0.24 and 0.67 because it did not.
 
-**8% is not enough.** Speculation wants roughly 60% to pay for itself, and
-what is still wrong is not visible from the shapes: every reading they permit
-has now been tried. Giving the head its own KV history over the context
-changed nothing, and neither did rotating at the target's absolute position.
+But the finding that moved the number was not a reading at all. The head was
+being handed `hc_state` after `ggml_set_output`, which does not reserve the
+buffer: the output mixer built below shares it, so what reached the head was
+the mixer's sigmoid gate and not the carrier. A `ggml_cont` copy took it from
+8% to 62%, and running the head on the GPU rather than the CPU took it to
+69-75%. Everything before that was reading the wiring correctly and feeding it
+the wrong tensor.
 
-What would unblock it is a reference for this module, and there is not one to
-be had by reading: upstream llama.cpp implements qwen4exp but not its MTP,
-vLLM ships `qwen3_next_mtp` whose hidden state is a single stream where this
-architecture has four, and the model's own repository publishes no modelling
-code. Without one, the next step is not another reading -- it is the
-weights themselves, comparing what the head produces against the target's own
-next-token distribution layer by layer, which is the same instrument that
-found the two bugs in the target and would find this one.
+### The draft has to be cheap, not just right
+
+The first GPU run drafted at 75% and served 8.4 tok/s, against 25.1 without
+the head. `kv_start` was baked into the draft graph, so every token freed the
+context, rebuilt the graph and reallocated it: 55 ms per draft against 4 ms of
+arithmetic. Pinning the head's KV to a single row removed the only reason the
+graph had to change shape, and the draft fell to 4.05 ms (0.46 build, 3.59
+compute) at 69% -- the head's own history is worth about six points of
+acceptance and was, at that price, not worth having.
+
+The runtime now prints the cost beside the rate. Neither number decides on its
+own whether speculation pays.
+
+### The verify loop
+
+`DFLASH_QWEN4EXP_SPEC=1`, greedy only. The draft is appended to the target's
+own batch, so the step runs `[committed token, draft]`: row 0 is what the
+target really wanted at that position, and when the draft matches it, row 1 has
+already computed the token after that. Two tokens for one pass over the
+weights, which is where a decode step's cost sits.
+
+Three pieces had to be built, and each was invisible until it was missing:
+
+  - **the hyper-connected path never captured its recurrent states.** It
+    passed `nullptr` where `build_delta_net_block` takes a `DeltaNetCapture`,
+    so there was nothing to roll back to. It now forwards one, and asks for
+    the per-token states only when someone will read them.
+  - **the PLE keeps a convolution history outside the delta-net layers**, so
+    `rollback_to` walked straight past it. Its capture holds history and batch
+    adjacent on the token axis exactly as `conv_input` does, so the undo is the
+    same shifted copy. Skipping it does not fail, it drifts.
+  - **graph inputs are sized by `build_target_step`**, so a two-token step
+    cannot fill them before it. The one-token step got away with writing early
+    because the graph it reused already had one column.
+
+Rollback itself is the existing `Qwen35DFlashTarget::rollback_to`; the backend
+constructs that adapter for the method alone.
+
+### It is not token-identical to the unspeculated path, and that is not the rollback
+
+`DFLASH_QWEN4EXP_SPEC_FORCE_REJECT=1` rejects every draft, so every step pays
+the wide pass and then undoes half of it. That run is byte-identical to the one
+that accepts drafts, and both agree with the unspeculated path for about 120
+tokens before diverging once. An inexact rollback applied 120 times in a row
+does not do that; a two-token batch reducing in a different order than a
+one-token one does. The forced-continuation score is unchanged at 8/10.
+
+### What it costs and what it buys
+
+| | one node | two nodes |
+|---|---|---|
+| AR, no head | 25.1 tok/s | 24.5 tok/s |
+| + head, drafting only | 23.1 | -- |
+| + verify loop | **30.7** | **27.2** |
+| acceptance | 69% | 61% |
+
+The second token is not free: it brings its own ten routed experts, 1167 MB of
+the 4266 MB a token moves. Measured on one node, a two-token pass computes in
+46.8 ms without the state capture and about 50.7 ms with it, against 38.9 ms
+for one token -- so the extra experts cost ~8 ms and the capture ~4 ms. That
+is also why q=2 would not pay here: a third token costs a third expert set,
+and the arithmetic comes out level with q=1.
 
 ### A trap worth naming
 
