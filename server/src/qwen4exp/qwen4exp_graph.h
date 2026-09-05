@@ -101,7 +101,14 @@ ggml_tensor * qwen4exp_ple(ggml_context * ctx,
                            int            n_hc,
                            int            conv_kernel,
                            int            ngram_size,
-                           float          rms_eps);
+                           float          rms_eps,
+                           // Optional [hist + max_verify, n_hc*n_embd] persistent
+                           // buffer. When given, the concatenation of history and
+                           // this batch is copied into it, which is what a
+                           // speculative rejection needs: the state after token
+                           // t is rows [t+1, t+1+hist) of that same array, so the
+                           // undo is a shifted copy rather than a replay.
+                           ggml_tensor *  conv_input_capture = nullptr);
 
 // One qwen4exp block on the carrier: the mixer pair around an attention or
 // delta-net block and around the MoE. Defined beside qwen35's layer builders,
@@ -122,6 +129,12 @@ ggml_tensor * build_qwen4exp_layer(ggml_context *        ctx,
                                    int                   n_tokens,
                                    int                   fa_window,
                                    ggml_tensor *         kv_write_rows,
-                                   ggml_tensor *         parent_ids);
+                                   ggml_tensor *         parent_ids,
+                                   // Non-null on a verify pass over more than
+                                   // one token: the delta-net then writes the
+                                   // recurrent state after every token, which is
+                                   // what lets a rejected draft be undone
+                                   // without running the layer again.
+                                   DeltaNetCapture *     delta_cap = nullptr);
 
 }  // namespace dflash::common

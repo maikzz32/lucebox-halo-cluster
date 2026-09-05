@@ -2264,7 +2264,9 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
     const int hidden = w_.n_embd;
     const int vocab  = w_.n_vocab;
     std::vector<float> logits_buf(vocab);
-    std::vector<float> embed_buf_vec(hidden);
+    // Two, not one: a speculative step embeds the committed token and the
+    // draft that follows it in the same batch.
+    std::vector<float> embed_buf_vec((size_t) hidden * 2);
     float * embed_buf = embed_buf_vec.data();
 
     // First token: consume the final prefill position.  Do not derive this
@@ -2301,24 +2303,56 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         // forwards it at `committed`; only that compute may advance the cache.
     }
 
+    // qwen4exp speculation, q=1. The MTP head drafted this step's token one
+    // step ago, so the batch becomes [committed token, draft]: row 0 says what
+    // the target really wanted there, and if the draft matches it, row 1 has
+    // already computed the token after that -- two tokens for one pass over the
+    // weights, which is where the whole cost of a decode step sits.
+    //
+    // Greedy only. Accepting a sampled draft needs the rejection rule, and what
+    // the head is measured against here is the target's own argmax.
+    static const bool kSpecEnabled = [] {
+        const char * e = std::getenv("DFLASH_QWEN4EXP_SPEC");
+        return e && std::atoi(e) == 1;
+    }();
+    // Diagnostic: reject every draft, so every step pays the two-token pass and
+    // then undoes half of it. The output must then match the unspeculated path
+    // token for token -- that is the only way to tell an inexact rollback from
+    // the reduction-order difference a wider batch causes on its own, and the
+    // two look identical from the outside.
+    static const bool kSpecForceReject =
+        std::getenv("DFLASH_QWEN4EXP_SPEC_FORCE_REJECT") != nullptr;
+    // Constructed for rollback_to() alone. That method owns the one genuinely
+    // hard part of this -- restoring 36 layers of recurrent state to the middle
+    // of a batch -- and it needs nothing from the spec-decode loop it usually
+    // serves beyond the weights, cache and graph this backend already holds.
+    Qwen35DFlashTarget spec_rollback(w_, cache_, target_backend_, sg_,
+                                     cfg_.kq_stride_pad, /*fa_window=*/0);
+    spec_rollback.set_fast_rollback(true);
+    const bool spec_on = kSpecEnabled && mtp_.ready() && !cfg_.paged_attention &&
+                         !kvflash_active() && !cfg_.ddtree_mode &&
+                         !sampler_.needs_logit_processing();
+
     // AR decode loop for remaining tokens
     for (int i = initial_emitted; i < n_gen; i++) {
         int32_t tok = out_tokens.back();
 
-        if (!w_.embedder.embed(&tok, 1, embed_buf)) return false;
-        ggml_backend_tensor_set(sg_.inp_embed, embed_buf, 0, sizeof(float) * hidden);
-        int32_t pos4[4] = {committed, committed, committed, 0};
-        ggml_backend_tensor_set(sg_.positions, pos4, 0, sizeof(int32_t) * 4);
+        const bool spec_step = spec_on && mtp_.pending >= 0 && (i + 1) < n_gen;
+        const int  n_step    = spec_step ? 2 : 1;
+        int32_t step_toks[2] = { tok, spec_step ? mtp_.pending : 0 };
+        std::vector<int32_t> ple_hist_saved;
+        if (spec_step) ple_hist_saved = ple_hist_;
+
 
         // kvflash: graph carries a slot-validity mask alongside the
         // step-invariant set_rows write; the FA span clamps to the pool.
         const bool pool = kvflash_active();
         const bool paged = cfg_.paged_attention;
         if (!build_target_step(sg_, w_, cache_, target_backend_,
-                               /*kv_start=*/committed, /*n_tokens=*/1,
-                               /*with_mask=*/pool || w_.is_bailingmoe3,
+                               /*kv_start=*/committed, /*n_tokens=*/n_step,
+                               /*with_mask=*/pool || w_.is_bailingmoe3 || n_step > 1,
                                /*capture=*/false,
-                               /*capture_delta_intermediate=*/false,
+                               /*capture_delta_intermediate=*/n_step > 1,
                                /*fa_window=*/0,
                                /*logits_tail_rows=*/0,
                                cfg_.kq_stride_pad,
@@ -2329,15 +2363,22 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
             return false;
         }
 
-        // After the build, not before it. The first decode step changes the
-        // graph's token count from the prefill chunk's to one, so that build
-        // really does rebuild, and anything written into a graph-owned input
-        // beforehand is discarded. inp_embed and positions survive because
-        // they are persistent; ple_embed is not, and filling it early left the
-        // first generated token's n-gram embedding reading uninitialised
-        // memory -- one wrong token per request, then recovery. The prefill
-        // path already fills after its build; this now matches it.
-        if (!fill_ple_embed(&tok, 1)) return false;
+        // After the build, not before it. The build is what fixes this step's
+        // token count -- from the prefill chunk's to one, or to two when a
+        // draft rides along -- and every graph input is sized by it. Writing
+        // ple_embed early left the first generated token's n-gram embedding
+        // reading uninitialised memory (one wrong token per request, then
+        // recovery); writing a two-token inp_embed early ran off the end of a
+        // one-token tensor outright. The prefill path fills after its build,
+        // and so does this.
+        if (!w_.embedder.embed(step_toks, n_step, embed_buf)) return false;
+        ggml_backend_tensor_set(sg_.inp_embed, embed_buf, 0,
+                                sizeof(float) * (size_t) hidden * n_step);
+        int32_t pos_buf[8] = {0};
+        fill_qwen35_mrope_positions(pos_buf, committed, n_step);
+        ggml_backend_tensor_set(sg_.positions, pos_buf, 0,
+                                sizeof(int32_t) * 4 * n_step);
+        if (!fill_ple_embed(step_toks, n_step)) return false;
         sg_.want_hc_final = mtp_.ready();
 
         // Fill kv_write_rows with this step's cache slot for set_rows: the
@@ -2366,16 +2407,19 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         }
         if (pool) {
             kvflash_upload_mask();
-        } else if (w_.is_bailingmoe3) {
+        } else if (w_.is_bailingmoe3 || n_step > 1) {
+            // Two tokens in one step are causal with respect to each other: the
+            // draft must not see itself, or row 0 stops being the answer the
+            // unspeculated step would have given.
             upload_qwen35_causal_mask(
-                sg_.attn_mask, committed, 1, cfg_.kq_stride_pad);
+                sg_.attn_mask, committed, n_step, cfg_.kq_stride_pad);
         }
 
         auto st = ggml_backend_graph_compute(target_backend_, sg_.gf);
         qwen4exp_probe_report();
         if (st != GGML_STATUS_SUCCESS) return false;
 
-        after_target_compute(sg_, committed, 1);
+        after_target_compute(sg_, committed, n_step);
 
         // GPU argmax: read 4 bytes, skip the 970 KB logit D2H. Escape: DFLASH_GPU_ARGMAX=0.
         static const bool kGpuArgmaxAR = []() {
@@ -2383,7 +2427,12 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
             return v == nullptr || v[0] != '0';
         }();
         int32_t next_tok;
-        if (sampler_.needs_logit_processing()) {
+        int32_t verify_argmax[2] = { -1, -1 };
+        if (spec_step) {
+            ggml_backend_tensor_get(sg_.argmax_tokens, verify_argmax, 0,
+                                    sizeof(verify_argmax));
+            next_tok = verify_argmax[0];
+        } else if (sampler_.needs_logit_processing()) {
 #ifdef DFLASH27B_HAVE_GPU_SAMPLER
             // GPU sample straight from the device logits tensor, skipping the
             // full ~vocab-wide D2H copy (the same payoff DFLASH_GPU_ARGMAX gets
@@ -2443,6 +2492,47 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
 
         maybe_force_close(next_tok);
 
+        // The draft counts as accepted only if the target's own first row
+        // agrees with it and neither the floor nor the close hook rewrote that
+        // row. Both of those change the sequence, and the bonus token was
+        // computed from the row they did not change.
+        int32_t bonus_tok   = -1;
+        int     carrier_row = 0;
+        if (spec_step) {
+            qwen4exp_mtp_score(mtp_, verify_argmax[0]);
+            const bool accepted = !kSpecForceReject &&
+                                  next_tok == verify_argmax[0] &&
+                                  verify_argmax[0] == step_toks[1] &&
+                                  !IS_EOS_TOK(verify_argmax[0], w_);
+            if (accepted) {
+                bonus_tok = apply_min_tokens_floor(
+                    verify_argmax[1], (int) out_tokens.size() + 1,
+                    sizeof(float) * (size_t) vocab);
+                maybe_force_close(bonus_tok);
+                carrier_row = 1;
+            } else {
+                // The recurrent state ran over the draft as well as over the
+                // real token. Undo the draft's half of it, or every following
+                // step continues from a state that saw a token the sequence
+                // never contained -- which does not fail, it drifts.
+                cache_.cur_pos = committed + n_step;
+                if (!spec_rollback.rollback_to(committed, 1)) {
+                    std::fprintf(stderr,
+                                 "[qwen4exp-spec] rollback failed at %d\n",
+                                 committed);
+                    return false;
+                }
+                // The n-gram window is host state and rolls back the same way:
+                // as if only the first token had been filled.
+                ple_hist_ = ple_hist_saved;
+                ple_hist_.push_back(step_toks[0]);
+                const size_t np = (size_t) std::max(0, w_.ple_ngram_size - 1);
+                if (ple_hist_.size() > np) {
+                    ple_hist_.erase(ple_hist_.begin(), ple_hist_.end() - np);
+                }
+            }
+        }
+
         // The MTP head drafted this token one step ago; score it, then draft the
         // one after next from the carrier this step produced. Measurement only:
         // nothing here changes what the target does, so a wiring mistake shows
@@ -2452,16 +2542,24 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         static const bool capture_only =
             std::getenv("DFLASH_QWEN4EXP_MTP_CAPTURE_ONLY") != nullptr;
         if (mtp_.ready()) {
-            qwen4exp_mtp_score(mtp_, next_tok);
+            if (!spec_step) qwen4exp_mtp_score(mtp_, next_tok);
             if (sg_.hc_final) {
                 const size_t n = (size_t) w_.n_embd * w_.n_hc;
                 std::vector<float> carrier(n);
                 const size_t rows = (size_t) ggml_nelements(sg_.hc_final) / n;
+                // The head predicts from the carrier at a position and the token
+                // that followed it. After a rejection that pair is (row 0, the
+                // token the target actually chose); after an acceptance it is
+                // (row 1, the bonus). Taking the last row unconditionally would
+                // pair a rejected draft's carrier with a token from elsewhere.
+                const size_t row = spec_step ? (size_t) carrier_row : rows - 1;
                 ggml_backend_tensor_get(sg_.hc_final, carrier.data(),
-                                        sizeof(float) * n * (rows - 1),
+                                        sizeof(float) * n * row,
                                         sizeof(float) * n);
                 if (!capture_only) {
-                    qwen4exp_mtp_draft_step(mtp_, w_, carrier.data(), next_tok, committed);
+                    const int32_t from_tok = bonus_tok >= 0 ? bonus_tok : next_tok;
+                    qwen4exp_mtp_draft_step(mtp_, w_, carrier.data(), from_tok,
+                                            committed + (int) row);
                 }
             }
         }
@@ -2470,6 +2568,16 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         io.emit(next_tok);
         committed++;
         cache_.cur_pos = committed;
+        if (bonus_tok >= 0) {
+            // Two tokens left this pass, so the budget advances by two and the
+            // stop checks below look at the later one.
+            out_tokens.push_back(bonus_tok);
+            io.emit(bonus_tok);
+            committed++;
+            cache_.cur_pos = committed;
+            i++;
+            next_tok = bonus_tok;
+        }
         if (pool) {
             kvflash_history_.push_back(next_tok);
             if (kvflash_qk_policy_) kvflash_qk_pool_to(committed);

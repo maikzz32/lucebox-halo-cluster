@@ -557,6 +557,11 @@ struct TargetCache {
     // layer that carries it: [(conv_kernel-1)*ngram_size, n_hc*n_embd, slots].
     // Null for every architecture without PLE.
     ggml_tensor * ple_conv_state = nullptr;
+    // [hist + max_verify_tokens, n_hc*n_embd] f32, the PLE counterpart of
+    // conv_input_cache. The PLE convolution is the one piece of recurrent state
+    // outside the delta-net layers, so a rollback that only walks those leaves
+    // it holding a rejected token's contribution.
+    ggml_tensor * ple_conv_input_cache = nullptr;
 
     // Snapshot buffers for speculative decoding rollback. Sized identically
     // to ssm_state/conv_state above. Populated by snapshot_ssm_state() and

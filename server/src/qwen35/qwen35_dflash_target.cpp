@@ -1062,6 +1062,40 @@ bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
             }
         }
     }
+    // qwen4exp carries one convolution outside the delta-net layers, on the
+    // PLE. Its capture has the same shape of contents as conv_input -- history
+    // followed by this batch on the token axis -- so the restore is the same
+    // shifted copy, just once rather than per layer. Skipping it would leave
+    // the n-gram path holding a token the sequence never contained, which
+    // shows up as drift a few tokens later rather than as a failure here.
+    if (!meta_backend && cache_.ple_conv_state && cache_.ple_conv_input_cache) {
+        const int64_t hist = cache_.ple_conv_state->ne[0];
+        const int64_t rows = cache_.ple_conv_state->ne[1];
+        const size_t  elt  = ggml_element_size(cache_.ple_conv_input_cache);
+        if (commit_n + hist > cache_.ple_conv_input_cache->ne[0]) {
+            if (kFastRollbackDiag) {
+                std::fprintf(stderr,
+                             "rollback_to: ple_conv_input OOB commit_n=%d hist=%d slots=%d\n",
+                             commit_n, (int) hist,
+                             (int) cache_.ple_conv_input_cache->ne[0]);
+            }
+            return false;
+        }
+        const cudaError_t ce = cudaMemcpy2DAsync(
+            cache_.ple_conv_state->data, (size_t) hist * elt,
+            (const char *) cache_.ple_conv_input_cache->data + (size_t) commit_n * elt,
+            cache_.ple_conv_input_cache->nb[1],
+            (size_t) hist * elt, rows,
+            cudaMemcpyDeviceToDevice, stream);
+        if (ce != cudaSuccess) {
+            if (kFastRollbackDiag) {
+                std::fprintf(stderr, "rollback_to: cudaMemcpy2D ple conv: %s\n",
+                             cudaGetErrorString(ce));
+            }
+            return false;
+        }
+    }
+
     if (meta_backend) {
         if (cache_.ssm_state.empty() ||
             !synchronize_meta_tensor_devices(cache_.ssm_state.front(), backend_)) {

@@ -490,6 +490,7 @@ void free_target_cache(TargetCache & c) {
     c.ssm_intermediate.clear();
     c.conv_input_cache.clear();
     c.conv_input_cache_alt.clear();
+    c.ple_conv_input_cache = nullptr;
     c.factor_k.clear();
     c.factor_v_new.clear();
     c.factor_g_ps.clear();
@@ -717,6 +718,16 @@ bool migrate_prefill_cache(const TargetWeights & w,
             }
             dn_idx++;
         }
+    }
+
+    // qwen4exp only. hist + max_verify rows so a verify of any width can be
+    // undone to any prefix of itself.
+    if (cache.ple_conv_state && w.ple_conv_kernel > 1 && w.ple_ngram_size > 0) {
+        const int64_t hist = (int64_t) (w.ple_conv_kernel - 1) * w.ple_ngram_size;
+        cache.ple_conv_input_cache = ggml_new_tensor_2d(
+            cache.rollback_ctx, GGML_TYPE_F32,
+            hist + max_verify_tokens, (int64_t) w.n_hc * w.n_embd);
+        ggml_set_name(cache.ple_conv_input_cache, "ple_conv_input_cache");
     }
 
     cache.rollback_buf = ggml_backend_alloc_ctx_tensors(cache.rollback_ctx, backend);
@@ -2339,14 +2350,6 @@ static ggml_tensor * build_single_layer(
     return cur;
 }
 
-// fwd: build_qwen4exp_layer is defined below, beside build_qwen35_layer.
-ggml_tensor * build_qwen4exp_layer(
-    ggml_context * ctx, ggml_cgraph * gf, const TargetWeights & w,
-    TargetCache & cache, int layer_idx, ggml_tensor ** hc_state,
-    ggml_tensor * positions, ggml_tensor * attn_mask, int kv_start,
-    int n_tokens, int fa_window, ggml_tensor * kv_write_rows,
-    ggml_tensor * parent_ids);
-
 QwenGraphOutputs build_qwen35_graph(
     ggml_context *         ctx,
     ggml_cgraph *          gf,
@@ -2414,13 +2417,31 @@ QwenGraphOutputs build_qwen35_graph(
                     w.layers[il].ple_norm_key, w.layers[il].ple_norm_query,
                     w.layers[il].ple_norm_conv, w.layers[il].ple_conv1d,
                     cache.ple_conv_state, w.n_embd, w.n_hc,
-                    w.ple_conv_kernel, w.ple_ngram_size, w.rms_eps);
+                    w.ple_conv_kernel, w.ple_ngram_size, w.rms_eps,
+                    in.capture_delta_intermediate ? cache.ple_conv_input_cache
+                                                  : nullptr);
                 qwen4exp_probe_add(ctx, gf, "hc_after_ple", il, hc_state);
+            }
+            // Same binding as the plain path below: point the capture at the
+            // persistent per-layer buffers so the block copies into memory that
+            // outlives the graph, and index it by delta-net layer.
+            DeltaNetCapture * hc_cap = nullptr;
+            const bool hc_is_delta = ((il + 1) % w.full_attention_interval) != 0;
+            if (hc_is_delta) {
+                if (in.capture_delta_intermediate &&
+                    dn_idx < (int) og_early.delta_captures.size() &&
+                    dn_idx < (int) cache.ssm_intermediate.size() &&
+                    cache.ssm_intermediate[dn_idx] && cache.conv_input_cache[dn_idx]) {
+                    hc_cap = &og_early.delta_captures[dn_idx];
+                    hc_cap->ssm_intermediate_states = cache.ssm_intermediate[dn_idx];
+                    hc_cap->conv_input              = cache.conv_input_cache[dn_idx];
+                }
+                dn_idx++;
             }
             build_qwen4exp_layer(ctx, gf, w, cache, il, &hc_state,
                                  in.positions, in.attn_mask, in.kv_start,
                                  n_tokens, in.fa_window, in.kv_write_rows,
-                                 in.parent_ids);
+                                 in.parent_ids, hc_cap);
             continue;
         }
         const TargetLayer & L = w.layers[il];
@@ -2769,7 +2790,8 @@ static ggml_tensor * build_single_layer_hc(
     int                   n_tokens,
     int                   fa_window,
     ggml_tensor *         kv_write_rows,
-    ggml_tensor *         parent_ids)
+    ggml_tensor *         parent_ids,
+    DeltaNetCapture *     delta_cap)
 {
     const TargetLayer & L = w.layers[layer_idx];
     const bool is_attn = (((layer_idx + 1) % w.full_attention_interval) == 0);
@@ -2813,11 +2835,14 @@ static ggml_tensor * build_single_layer_hc(
         for (int il = 0; il < layer_idx; il++) {
             if (((il + 1) % w.full_attention_interval) != 0) dn_idx++;
         }
+        // The per-token states are skipped unless someone will read them:
+        // they are the expensive part of the block's output and only a verify
+        // pass that may have to undo a token has any use for them.
         cur = build_delta_net_block(
             ctx, gf, w, L, cur,
             cache.conv_state[dn_idx], cache.ssm_state[dn_idx],
-            n_tokens, nullptr, parent_ids,
-            /*skip_gdn_intermediate=*/true,
+            n_tokens, delta_cap, parent_ids,
+            /*skip_gdn_intermediate=*/delta_cap == nullptr,
             supports_qwen35_fused_kernels(cache.backend));
     }
     if (skip_blocks) cur = ggml_scale(ctx, cur, 0.0f);
@@ -2887,11 +2912,13 @@ ggml_tensor * build_qwen4exp_layer(
     int                   n_tokens,
     int                   fa_window,
     ggml_tensor *         kv_write_rows,
-    ggml_tensor *         parent_ids)
+    ggml_tensor *         parent_ids,
+    DeltaNetCapture *     delta_cap)
 {
     return build_single_layer_hc(ctx, gf, w, cache, layer_idx, hc_state,
                                  positions, attn_mask, kv_start, n_tokens,
-                                 fa_window, kv_write_rows, parent_ids);
+                                 fa_window, kv_write_rows, parent_ids,
+                                 delta_cap);
 }
 
 ggml_tensor * build_qwen35_layer(

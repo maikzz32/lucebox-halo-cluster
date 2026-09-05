@@ -123,7 +123,8 @@ ggml_tensor * qwen4exp_ple(ggml_context * ctx,
                            int            n_hc,
                            int            conv_kernel,
                            int            ngram_size,
-                           float          rms_eps) {
+                           float          rms_eps,
+                           ggml_tensor *  conv_input_capture) {
     const int64_t hc_dim = (int64_t) n_hc * n_embd;
     const int64_t nt     = state->ne[2];
 
@@ -188,6 +189,16 @@ ggml_tensor * qwen4exp_ple(ggml_context * ctx,
 
         ggml_tensor * term = ggml_mul(ctx, shifted, wk);
         conv_out = conv_out ? ggml_add(ctx, conv_out, term) : term;
+    }
+
+    // The same array the tail is cut from is what a rollback needs, so it is
+    // handed out whole rather than re-derived: history and batch already lie
+    // adjacent on the token axis, and the state after any prefix of the batch
+    // is just a different window into it.
+    if (conv_input_capture) {
+        ggml_tensor * dst = ggml_view_2d(ctx, conv_input_capture, hist + nt,
+                                         hc_dim, conv_input_capture->nb[1], 0);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, padded, dst));
     }
 
     // Carry the tail forward so a chunked prefill matches a single-shot one.
