@@ -142,16 +142,26 @@ void qwen4exp_mtp_draft_step(Qwen4ExpMtpRuntime & rt,
     const int64_t n_embd = t.n_embd;
     const int64_t n_hc   = t.n_hc;
 
-    // Built once. The shape never changes -- one token, one carrier -- so
-    // there is nothing to rebuild, and reusing the allocator keeps the decode
-    // loop from creating and freeing a backend buffer beside the target's.
-    if (rt.pos >= rt.max_ctx) return;      // the head has run out of its own cache
-    if (rt.ctx) {                          // kv_start is baked in; rebuild for it
+    // What makes the head expensive is not its arithmetic but its rebuild.
+    // kv_start is baked into the graph, so a write position that moves means a
+    // fresh context, a fresh graph and a fresh allocation every single token --
+    // and that is what a draft costing more than the target step it is meant to
+    // accelerate is made of. The head's own KV history was measured to be worth
+    // nothing (see the header), so pinning it to one row buys a graph that is
+    // built once. DFLASH_QWEN4EXP_MTP_GROWING_KV=1 restores the old behaviour
+    // for anyone re-testing that finding.
+    static const bool growing_kv = [] {
+        const char * e = std::getenv("DFLASH_QWEN4EXP_MTP_GROWING_KV");
+        return e && std::atoi(e) == 1;
+    }();
+    if (growing_kv && rt.pos >= rt.max_ctx) return;   // out of its own cache
+    if (rt.ctx && growing_kv) {            // kv_start is baked in; rebuild for it
         ggml_free(rt.ctx);
         rt.ctx = nullptr;
     }
-    {
+    if (!rt.ctx) {
         mark("build");
+        const int64_t t_build0 = ggml_time_us();
         struct ggml_init_params ip = { (size_t) 64 * 1024 * 1024, nullptr, true };
         rt.ctx = ggml_init(ip);
         if (!rt.ctx) return;
@@ -164,7 +174,8 @@ void qwen4exp_mtp_draft_step(Qwen4ExpMtpRuntime & rt,
         ggml_set_input(rt.in_pos);
         rt.out_draft = build_qwen4exp_mtp_draft(rt.ctx, rt.gf, rt.w, t,
                                                 rt.in_carrier, rt.in_embed, rt.in_pos,
-                                                /*attn_mask=*/nullptr, rt.pos,
+                                                /*attn_mask=*/nullptr,
+                                                growing_kv ? rt.pos : 0,
                                                 rt.cache);
         if (!rt.out_draft) { ggml_free(rt.ctx); rt.ctx = nullptr; return; }
         if (!rt.alloc) {
@@ -182,6 +193,7 @@ void qwen4exp_mtp_draft_step(Qwen4ExpMtpRuntime & rt,
             std::fprintf(stderr, "[qwen4exp-mtp] draft graph: %d nodes\n",
                          ggml_graph_n_nodes(rt.gf));
         }
+        rt.build_us += (uint64_t) (ggml_time_us() - t_build0);
     }
 
     mark("embed");
@@ -197,11 +209,13 @@ void qwen4exp_mtp_draft_step(Qwen4ExpMtpRuntime & rt,
     ggml_backend_tensor_set(rt.in_pos, pos4, 0, sizeof(pos4));
 
     mark("compute");
+    const int64_t t_compute0 = ggml_time_us();
     if (ggml_backend_graph_compute(rt.backend, rt.gf) == GGML_STATUS_SUCCESS) {
         int32_t id = -1;
         ggml_backend_tensor_get(rt.out_draft, &id, 0, sizeof(int32_t));
         rt.pending = id;
     }
+    rt.compute_us += (uint64_t) (ggml_time_us() - t_compute0);
     qwen4exp_probe_report();
     rt.pos++;
     mark("done");
@@ -215,9 +229,14 @@ void qwen4exp_mtp_score(Qwen4ExpMtpRuntime & rt, int32_t actual_token) {
     // Every 32, so the number is visible while a request is still running
     // rather than only at its end.
     if (rt.drafted % 32 == 0) {
-        std::fprintf(stderr, "[qwen4exp-mtp] acceptance %llu/%llu = %.1f%%\n",
+        std::fprintf(stderr,
+                     "[qwen4exp-mtp] acceptance %llu/%llu = %.1f%%  "
+                     "draft %.2f ms (build %.2f + compute %.2f)\n",
                      (unsigned long long) rt.matched, (unsigned long long) rt.drafted,
-                     100.0 * rt.acceptance());
+                     100.0 * rt.acceptance(),
+                     1e-3 * (double) (rt.build_us + rt.compute_us) / (double) rt.drafted,
+                     1e-3 * (double) rt.build_us / (double) rt.drafted,
+                     1e-3 * (double) rt.compute_us / (double) rt.drafted);
     }
 }
 

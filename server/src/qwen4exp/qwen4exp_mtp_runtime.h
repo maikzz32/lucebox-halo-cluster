@@ -92,6 +92,11 @@ struct Qwen4ExpMtpRuntime {
 
     uint64_t drafted = 0;
     uint64_t matched = 0;
+    // Acceptance says whether the head is right; these say whether being right
+    // is worth what it costs. A draft that takes longer than the target step it
+    // saves is not a speed-up at any acceptance rate.
+    uint64_t build_us   = 0;
+    uint64_t compute_us = 0;
 
     bool ready() const { return w.ok(); }
     double acceptance() const {
