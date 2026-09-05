@@ -33,8 +33,17 @@ ggml_tensor * qwen4exp_hc_mix(ggml_context * ctx,
     // the resulting scale is then applied across all of them by the flat
     // [n_hc*n_embd] gamma. Normalising the flattened vector instead would mix
     // the streams' magnitudes together and is a different function.
-    ggml_tensor * xn = ggml_rms_norm(ctx, state, rms_eps);
-    xn = ggml_reshape_2d(ctx, xn, hc_dim, nt);
+    ggml_tensor * xn3 = ggml_rms_norm(ctx, state, rms_eps);
+
+    // Stream c lives at c*n_embd + i in the flat [n_hc*n_embd] weights, not at
+    // i*n_hc + c. The two readings accept exactly the same tensor shapes, so
+    // nothing in the file's metadata distinguishes them, but the weights
+    // themselves do: grouped stream-major, the four blocks of every hc norm
+    // have visibly different statistics (output_hc_norm means 2.45, 3.62,
+    // 4.98, 3.96), which is what four separately trained per-stream gammas
+    // look like. Grouped by stride n_hc they come out identical to three
+    // decimals -- the signature of four distinct blocks averaged together.
+    ggml_tensor * xn = ggml_reshape_2d(ctx, xn3, hc_dim, nt);
     xn = ggml_mul(ctx, xn, w_norm);
 
     // Low-rank gate over the whole flattened state. The 1/n_hc before the silu

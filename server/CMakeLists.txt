@@ -938,6 +938,15 @@ endif()
 # PFlash phase-split harness
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/pflash_daemon.cpp")
+    add_executable(gguf_embed_tie test/gguf_embed_tie.cpp)
+    target_include_directories(gguf_embed_tie PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+    target_link_libraries(gguf_embed_tie PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+    if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+        target_link_libraries(gguf_embed_tie PRIVATE CUDA::cudart)
+    else()
+        target_link_libraries(gguf_embed_tie PRIVATE hip::host)
+    endif()
+
     add_executable(pflash_daemon test/pflash_daemon.cpp)
     target_include_directories(pflash_daemon PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
     target_link_libraries(pflash_daemon PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})

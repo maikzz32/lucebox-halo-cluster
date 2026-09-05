@@ -2652,11 +2652,27 @@ QwenGraphOutputs build_qwen35_graph(
     // 2. Final norm. For a hyper-connected model the final mixer IS the output
     //    norm -- there is no separate one, and w.out_norm is null. It takes no
     //    inject weights because there is no block left to write back into.
-    ggml_tensor * out = hyper_connected
-        ? qwen4exp_hc_mix(ctx, gf, hc_state, w.output_hc_norm, w.output_hc_down,
-                          w.output_hc_up, nullptr, nullptr,
-                          w.n_embd, w.n_hc, w.rms_eps)
-        : rms_norm_mul(ctx, inpL, w.out_norm, w.rms_eps);
+    // The final mixer is the output norm; there is no separate one. Setting
+    // DFLASH_QWEN4EXP_SKIP_MIXER=1 replaces it with the first stream taken
+    // raw, which halves the remaining search: argmax is invariant to a
+    // positive scale, so with the blocks also zeroed the logits become
+    // lm_head(embed(x)) and an echo of the input token clears the embedding
+    // and the head together, leaving only the mixer.
+    static const bool skip_mixer = []() {
+        const char * s = std::getenv("DFLASH_QWEN4EXP_SKIP_MIXER");
+        return s && std::atoi(s) == 1;
+    }();
+    ggml_tensor * out = nullptr;
+    if (hyper_connected && skip_mixer) {
+        out = ggml_cont(ctx, ggml_view_2d(ctx, hc_state, w.n_embd, n_tokens,
+                                          hc_state->nb[2], 0));
+    } else if (hyper_connected) {
+        out = qwen4exp_hc_mix(ctx, gf, hc_state, w.output_hc_norm, w.output_hc_down,
+                              w.output_hc_up, nullptr, nullptr,
+                              w.n_embd, w.n_hc, w.rms_eps);
+    } else {
+        out = rms_norm_mul(ctx, inpL, w.out_norm, w.rms_eps);
+    }
     qwen4exp_probe_add(ctx, gf, "final_mix", -1, out);
 
     // 3. LM head — optionally only for sampled rows (prefill computes just
@@ -2721,6 +2737,19 @@ static ggml_tensor * build_single_layer_hc(
     const bool is_attn = (((layer_idx + 1) % w.full_attention_interval) == 0);
     const int n_hc = w.n_hc;
 
+    // Bisection for bring-up. Every block still runs -- skipping them would
+    // drop the KV writes and leave their graph inputs unallocated -- but its
+    // output is scaled to zero, so the carrier reaches the final mixer as the
+    // untouched embedding and the logits become a pure function of
+    // embed -> mixer -> lm_head. A trained model scores the input token, or an
+    // obvious continuation of it, well above chance there; noise says the
+    // fault is in that path and not in any block.
+    static const bool skip_blocks = []() {
+        const char * s = std::getenv("DFLASH_QWEN4EXP_SKIP_BLOCKS");
+        return s && std::atoi(s) == 1;
+    }();
+
+
     // ── attention / delta-net sublayer ────────────────────────────────────
     ggml_tensor * inject = nullptr;
     ggml_tensor * cur = qwen4exp_hc_mix(
@@ -2753,6 +2782,7 @@ static ggml_tensor * build_single_layer_hc(
             /*skip_gdn_intermediate=*/true,
             supports_qwen35_fused_kernels(cache.backend));
     }
+    if (skip_blocks) cur = ggml_scale(ctx, cur, 0.0f);
     qwen4exp_probe_add(ctx, gf, "attn_mix",  layer_idx, cur_mix);
     qwen4exp_probe_add(ctx, gf, "attn_out",  layer_idx, cur);
     qwen4exp_probe_add(ctx, gf, "attn_inj",  layer_idx, inject);
@@ -2778,6 +2808,7 @@ static ggml_tensor * build_single_layer_hc(
 
     ggml_tensor * moe_selected = nullptr;
     ggml_tensor * ffn = build_qwen35moe_ffn(ctx, ffn_in, w, L, &moe_selected);
+    if (skip_blocks) ffn = ggml_scale(ctx, ffn, 0.0f);
     qwen4exp_probe_add(ctx, gf, "ffn_mix", layer_idx, ffn_in);
     qwen4exp_probe_add(ctx, gf, "ffn_out", layer_idx, ffn);
     qwen4exp_probe_add(ctx, gf, "ffn_inj", layer_idx, inject);

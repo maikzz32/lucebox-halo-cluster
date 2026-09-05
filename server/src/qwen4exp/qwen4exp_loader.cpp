@@ -599,6 +599,64 @@ bool load_qwen4exp_gguf(const std::string & path,
         }
     }
 
+    // Bring-up check: does the unembedding know the embedding?
+    //
+    // Every transformer correlates output.weight[v] with token_embd[v] for the
+    // same v, tied or not, because both encode the identity of token v. If the
+    // self-similarity is not clearly above the cross-similarity then the two
+    // tensors are not being read in the same basis, and no amount of work on
+    // the blocks between them will produce sensible logits.
+    if (std::getenv("DFLASH_QWEN4EXP_RMS")) {
+        GgufShardTensor outw;
+        std::string oe;
+        if (shards.find("output.weight", outw, oe) && outw.meta) {
+            const ggml_type_traits * otr = ggml_get_type_traits(outw.meta->type);
+            const size_t orow = ggml_row_size(outw.meta->type, out.n_embd);
+            // Placement check before the basis check. A vocabulary padded up
+            // to a round size leaves its last rows zero in both tables; if the
+            // low rows are non-zero and the top rows are zero, both tensors sit
+            // where the shard says they do and the comparison below is about
+            // the bases and not about the offsets.
+            {
+                const int32_t probe[7] = { 0, 100, 248000, 248200, 248300,
+                                           248318, 248319 };
+                std::vector<float> r((size_t) out.n_embd);
+                for (int a = 0; a < 7; ++a) {
+                    double se = 0.0, so = 0.0;
+                    if (out.embedder.embed(&probe[a], 1, r.data())) {
+                        for (int k = 0; k < out.n_embd; ++k) se += (double) r[(size_t) k] * r[(size_t) k];
+                    }
+                    otr->to_float(static_cast<const char *>(outw.data) +
+                                      (size_t) probe[a] * orow, r.data(), out.n_embd);
+                    for (int k = 0; k < out.n_embd; ++k) so += (double) r[(size_t) k] * r[(size_t) k];
+                    std::fprintf(stderr, "[q4e-tie] row %6d  embd_rms=%.6f  out_rms=%.6f\n",
+                                 probe[a], std::sqrt(se / out.n_embd),
+                                 std::sqrt(so / out.n_embd));
+                }
+            }
+            const int32_t ids[5] = { 100, 1000, 15043, 50000, 200000 };
+            std::vector<float> e((size_t) out.n_embd), o((size_t) out.n_embd);
+            for (int a = 0; a < 5; ++a) {
+                if (!out.embedder.embed(&ids[a], 1, e.data())) continue;
+                for (int b = 0; b < 5; ++b) {
+                    otr->to_float(static_cast<const char *>(outw.data) +
+                                      (size_t) ids[b] * orow,
+                                  o.data(), out.n_embd);
+                    double dot = 0.0, ne2 = 0.0, no2 = 0.0;
+                    for (int k = 0; k < out.n_embd; ++k) {
+                        dot += (double) e[(size_t) k] * o[(size_t) k];
+                        ne2 += (double) e[(size_t) k] * e[(size_t) k];
+                        no2 += (double) o[(size_t) k] * o[(size_t) k];
+                    }
+                    std::fprintf(stderr, "[q4e-tie] embd(%6d) . out(%6d) cos=%+.4f%s\n",
+                                 ids[a], ids[b],
+                                 dot / (std::sqrt(ne2) * std::sqrt(no2) + 1e-30),
+                                 a == b ? "   <- same token" : "");
+                }
+            }
+        }
+    }
+
     std::fprintf(stderr,
         "[qwen4exp] hparams: n_embd=%d n_layer=%d n_head=%d n_head_kv=%d head_dim=%d\n"
         "[qwen4exp]   full_attn_every=%d n_expert=%d/%d n_ff_exp=%d rope=%.0f/%d,%d,%d,%d\n"
