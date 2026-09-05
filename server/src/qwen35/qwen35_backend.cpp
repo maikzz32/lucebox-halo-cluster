@@ -2338,6 +2338,7 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         // memory -- one wrong token per request, then recovery. The prefill
         // path already fills after its build; this now matches it.
         if (!fill_ple_embed(&tok, 1)) return false;
+        sg_.want_hc_final = mtp_.ready();
 
         // Fill kv_write_rows with this step's cache slot for set_rows: the
         // paged append row, its pool slot in kvflash mode, or the logical
@@ -2441,6 +2442,23 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
             next_tok, (int)out_tokens.size(), /*logits_row_offset=*/0);
 
         maybe_force_close(next_tok);
+
+        // The MTP head drafted this token one step ago; score it, then draft the
+        // one after next from the carrier this step produced. Measurement only:
+        // nothing here changes what the target does, so a wiring mistake shows
+        // up as a low rate rather than as wrong output.
+        if (mtp_.ready()) {
+            qwen4exp_mtp_score(mtp_, next_tok);
+            if (sg_.hc_final) {
+                const size_t n = (size_t) w_.n_embd * w_.n_hc;
+                std::vector<float> carrier(n);
+                const size_t rows = (size_t) ggml_nelements(sg_.hc_final) / n;
+                ggml_backend_tensor_get(sg_.hc_final, carrier.data(),
+                                        sizeof(float) * n * (rows - 1),
+                                        sizeof(float) * n);
+                qwen4exp_mtp_draft_step(mtp_, w_, carrier.data(), next_tok);
+            }
+        }
 
         out_tokens.push_back(next_tok);
         io.emit(next_tok);

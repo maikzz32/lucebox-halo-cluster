@@ -540,6 +540,7 @@ add_library(dflash_common STATIC
     src/qwen4exp/qwen4exp_probe.cpp
     src/qwen4exp/qwen4exp_cluster.cpp
     src/qwen4exp/qwen4exp_mtp.cpp
+    src/qwen4exp/qwen4exp_mtp_runtime.cpp
     src/common/dynamic_backend.cpp
     src/common/domino_head.cpp
     src/common/dspark_head.cpp

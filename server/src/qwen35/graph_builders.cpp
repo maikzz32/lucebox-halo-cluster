@@ -700,9 +700,11 @@ bool build_target_step(
     gi.specla_n_boundaries        = hld_schedule.n_boundaries;
     gi.specla_max_parallel_chains = hld_schedule.max_parallel_chains;
 
+    gi.capture_hc_final = sg.want_hc_final;
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;
     sg.logits = go.logits;
+    sg.hc_final = go.hc_final;
     sg.delta_captures = std::move(go.delta_captures);
     sg.moe_selected = std::move(go.moe_selected);
     ggml_set_output(sg.logits);
@@ -817,9 +819,11 @@ bool build_target_step_tree(
     gi.specla_n_boundaries        = hld_schedule ? hld_schedule->n_boundaries : 0;
     gi.specla_max_parallel_chains = hld_schedule ? hld_schedule->max_parallel_chains : 0;
 
+    gi.capture_hc_final = sg.want_hc_final;
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;
     sg.logits = go.logits;
+    sg.hc_final = go.hc_final;
     sg.delta_captures = std::move(go.delta_captures);
     ggml_set_output(sg.logits);
 
@@ -979,9 +983,11 @@ bool build_target_step_paged_tree(
     gi.tree_scratch_base = tree_scratch_base;
     gi.tree_scratch_stride = tree_scratch_stride;
 
+    gi.capture_hc_final = sg.want_hc_final;
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;
     sg.logits = go.logits;
+    sg.hc_final = go.hc_final;
     sg.delta_captures = std::move(go.delta_captures);
     sg.tree_features = go.tree_features;
     if (!sg.tree_features || sg.delta_captures.empty()) {

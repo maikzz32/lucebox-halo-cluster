@@ -39,6 +39,8 @@
 #include <string>
 #include <cstddef>
 
+#include "qwen4exp/qwen4exp_mtp_runtime.h"
+
 namespace dflash::common {
 
 class Qwen35TensorParallelContext;
@@ -167,6 +169,10 @@ protected:
     // into decode -- out_tokens holds only generated tokens, so it cannot
     // supply them. This rolling window follows the KV cache: whatever the
     // model has consumed, in order, truncated to what the hash needs.
+    // The MTP head, when DFLASH_QWEN4EXP_MTP names one. Only qwen4exp has a
+    // carrier for it to read, and only then is it opened.
+    Qwen4ExpMtpRuntime mtp_;
+
     std::vector<int32_t> ple_hist_;
 
     // Compute the PLE row indices for `n` tokens, gather them from the mapped

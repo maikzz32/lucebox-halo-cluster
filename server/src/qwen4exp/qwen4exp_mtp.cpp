@@ -4,6 +4,7 @@
 #include "qwen4exp/qwen4exp_graph.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -245,10 +246,19 @@ ggml_tensor * build_qwen4exp_mtp_draft(ggml_context * ctx,
     mw.full_attention_interval = 1;
     mw.cluster = nullptr;              // the head is replicated on every rank
 
-    build_qwen4exp_layer(ctx, gf, mw, cache, /*layer_idx=*/0, &state,
-                         positions, attn_mask, kv_start, (int) nt,
-                         /*fa_window=*/0, /*kv_write_rows=*/nullptr,
-                         /*parent_ids=*/nullptr);
+    // DFLASH_QWEN4EXP_MTP_NO_BLOCK=1 leaves the block out, so a failure in the
+    // glue can be told apart from one inside the block. The draft is then
+    // nonsense, which is exactly what makes it a bisection and not a fallback.
+    static const bool with_block = [] {
+        const char * e = std::getenv("DFLASH_QWEN4EXP_MTP_NO_BLOCK");
+        return !(e && std::atoi(e) == 1);
+    }();
+    if (with_block) {
+        build_qwen4exp_layer(ctx, gf, mw, cache, /*layer_idx=*/0, &state,
+                             positions, attn_mask, kv_start, (int) nt,
+                             /*fa_window=*/0, /*kv_write_rows=*/nullptr,
+                             /*parent_ids=*/nullptr);
+    }
 
     ggml_tensor * mixed = qwen4exp_hc_mix(ctx, gf, /*cluster=*/nullptr, state,
                                           w.head_norm, w.head_down, w.head_up,

@@ -68,6 +68,11 @@ struct StepGraph {
     // (no target_hidden_cat input tensor). A view-built graph must never be
     // reused by the copy-mode persistent fast path.
     bool            built_view = false;
+    // qwen4exp's hyper-connection carrier after the last layer, when the MTP
+    // head asked for it: [n_embd, n_hc, n_tokens]. Null otherwise.
+    bool            want_hc_final = false;
+    ggml_tensor *   hc_final = nullptr;
+
     ggml_tensor *   hidden_input = nullptr;        // lm-head projection only
     // [n_tokens,n_head_kv] i64 physical destination rows for ggml_set_rows.
     // Used by contiguous replay, KVFlash, and paged attention; null when the

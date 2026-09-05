@@ -33,8 +33,18 @@ bool Qwen4ExpBackend::load_target_model(ggml_backend_t backend, TargetWeights & 
     // Only when this rank actually holds a slice: a single-rank run must build
     // the same graph it always did.
     out.cluster = cluster_.sharded() ? &cluster_ : nullptr;
-    return load_qwen4exp_gguf(cfg_.target_path, backend, out, &cluster_);
+    if (!load_qwen4exp_gguf(cfg_.target_path, backend, out, &cluster_)) {
+        return false;
+    }
+    // The head is opened against the weights that were just read, so its
+    // shapes are checked against this target rather than a configuration.
+    if (!qwen4exp_mtp_open(out, backend, out.n_vocab, mtp_)) {
+        return false;
+    }
+    return true;
 }
+
+
 
 void Qwen4ExpBackend::print_ready_banner() const {
     const TargetWeights & w = target_weights();
