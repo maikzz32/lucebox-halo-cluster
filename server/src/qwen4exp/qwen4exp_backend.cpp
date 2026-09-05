@@ -1,5 +1,9 @@
 #include "qwen4exp/qwen4exp_backend.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+
 #include "qwen4exp/qwen4exp_internal.h"
 
 #include <cstdio>
@@ -41,6 +45,45 @@ void Qwen4ExpBackend::print_ready_banner() const {
         w.n_hc, w.hc_low_rank, w.ple_layer,
         cfg_.device.max_ctx);
     std::fflush(stdout);
+}
+
+void Qwen4ExpBackend::cluster_set_hooks(cluster::Ds4ClusterHooks * hooks) {
+    // Stored rather than forwarded: the lockstep decisions are consumed by the
+    // generate path once rank-0-decides is wired, and qwen35 has no hook slot
+    // of its own to forward them to.
+    cluster_.hooks = hooks;
+}
+
+bool Qwen4ExpBackend::cluster_attach(const cluster::ClusterConfig * cfg,
+                                     cluster::IClusterComm * comm) {
+    if (!cfg || !cfg->enabled()) {
+        return true;                       // not a cluster run
+    }
+    const std::string err = cfg->validate();
+    if (!err.empty()) {
+        std::fprintf(stderr, "[qwen4exp-cluster] %s\n", err.c_str());
+        return false;
+    }
+    // The first call defines the placement and must happen before init(); the
+    // second only attaches the transport, so its placement-defining fields
+    // have to match what the rank already loaded.
+    if (cluster_.cfg && (cluster_.cfg_storage.size != cfg->size ||
+                         cluster_.cfg_storage.rank != cfg->rank)) {
+        std::fprintf(stderr,
+                     "[qwen4exp-cluster] refusing to change rank %d/%d to %d/%d "
+                     "after the shard was loaded\n",
+                     cluster_.cfg_storage.rank, cluster_.cfg_storage.size,
+                     cfg->rank, cfg->size);
+        return false;
+    }
+    cluster_.cfg_storage = *cfg;
+    cluster_.cfg  = &cluster_.cfg_storage;
+    cluster_.comm = comm;
+    cluster_.trace = std::getenv("DFLASH_CLUSTER_TRACE") != nullptr;
+    std::fprintf(stderr, "[qwen4exp-cluster] rank %d/%d %s\n",
+                 cfg->rank, cfg->size,
+                 comm ? "communicator attached" : "placement only");
+    return true;
 }
 
 }  // namespace dflash::common

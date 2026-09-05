@@ -17,6 +17,9 @@
 # GPU memory: the nodes normally run a vLLM Ray cluster (~100 GB GPU memory in
 # use). Stop it before launching; this script refuses to kill it for you.
 set -euo pipefail
+TARGET_ARGS=${TARGET_ARGS-"--ds4-expert-top-k 6 --ds4-prefill sparse"}
+CHUNK=${CHUNK:-2048}
+MAX_CTX=${MAX_CTX:-32768}
 
 usage() {
     cat <<'USAGE'
@@ -39,6 +42,11 @@ Environment:
   PLACEMENT      --cluster-expert-placement (default uniform)
   HEAD_WAIT      seconds to wait for the head's "cluster: listening" line (default 20)
   SPEC_Q         DFLASH_DS4_SPEC_Q (default 4); SPEC=0 disables DSpark entirely
+  TARGET_ARGS    architecture-specific flags (default the deepseek4 set,
+                 "--ds4-expert-top-k 6 --ds4-prefill sparse"; pass "" for
+                 qwen4exp, which has none of them)
+  CHUNK          --chunk (default 2048)
+  MAX_CTX        --max-ctx (default 32768)
   MMVF_F16       LUCE_MMVF_MAX_NCOLS_F16 (default 4; 0 = upstream per-arch value)
   PINNED_ROLLBACK DFLASH_DS4_PINNED_ROLLBACK (default 1; 0 = pageable staging)
   FUSED_CACHE_SLOTS DFLASH_DS4_TP_FUSED_CACHE_SLOTS (default 12 = the hard cap; upstream is 2 at q<=4)
@@ -293,8 +301,8 @@ podman_cmd() {
         --cluster-rank "$i" --cluster-size "$N" --cluster-head "${HEAD_IP}:${HEAD_PORT}"
         --cluster-ifname "$iface" --cluster-ib-hca "$hca" --cluster-gid-index "$GID_INDEX"
         --cluster-expert-placement "$PLACEMENT"
-        --target-device hip:0 --ds4-expert-top-k 6 --ds4-prefill sparse
-        --chunk 2048 --max-ctx 32768
+        --target-device hip:0 ${TARGET_ARGS}
+        --chunk "$CHUNK" --max-ctx "$MAX_CTX"
         --prefix-cache-slots "$PREFIX_SLOTS" --prefill-cache-slots 0)
     if [ "$i" = 0 ]; then cmd+=(--host 0.0.0.0 --port "$HTTP_PORT"); fi
     cmd+=("${EXTRA_ARGS[@]}")

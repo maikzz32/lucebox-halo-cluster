@@ -13,6 +13,7 @@
 #include "../common/moe_hybrid_routing_stats.h"
 #include "../common/moe_hybrid_storage.h"
 #include "../common/moe_hybrid_stream.h"
+#include "common/cluster_participant.h"
 #include "deepseek4_internal.h"
 #include "deepseek4_dspark.h"
 
@@ -49,7 +50,7 @@ int deepseek4_hybrid_prefill_step_tokens(
     int configured_chunk,
     int position,
     int remaining_tokens);
-class DeepSeek4Backend : public ModelBackend {
+class DeepSeek4Backend : public ModelBackend, public IClusterParticipant {
 public:
     explicit DeepSeek4Backend(const DeepSeek4BackendConfig & cfg);
     ~DeepSeek4Backend() override;
@@ -108,6 +109,20 @@ public:
     // borrowed and must outlive every forward. Returns false on a config
     // mismatch or a failed reload.
     bool set_cluster(const cluster::ClusterConfig * cfg, cluster::IClusterComm * comm);
+
+    // IClusterParticipant. set_cluster is the older name and stays: it is
+    // what deepseek4's own call sites use.
+    bool cluster_attach(const cluster::ClusterConfig * cfg,
+                        cluster::IClusterComm * comm) override {
+        return set_cluster(cfg, comm);
+    }
+    uint64_t cluster_placement_hash() const override;
+    void cluster_set_hooks(cluster::Ds4ClusterHooks * hooks) override {
+        set_cluster_hooks(hooks);
+    }
+    bool cluster_spec_decode_ready() const override { return spec_decode_ready(); }
+    uint64_t cluster_resident_expert_bytes() const override;
+    bool cluster_ingraph_allreduce() const override;
     const Ds4ClusterRuntime * cluster_runtime() const { return cluster_.get(); }
 
     // True when a request with a greedy sampler and no budget hook would

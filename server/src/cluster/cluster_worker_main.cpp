@@ -10,7 +10,8 @@
 #include "cluster/cluster_identity.h"
 #include "cluster/cluster_protocol.h"
 #include "common/backend_factory.h"
-#include "deepseek4/deepseek4_backend.h"
+#include "common/cluster_participant.h"
+#include "common/model_backend.h"
 
 #include <atomic>
 #include <chrono>
@@ -73,7 +74,10 @@ GenerateRequest request_from_msg(const RequestMsg & m) {
 struct WorkerState {
     ClusterConfig                              cfg;
     std::unique_ptr<common::ModelBackend>      backend_owner;
-    common::DeepSeek4Backend *                 ds4 = nullptr;
+    // The backend as the worker replays requests into it, and the same object
+    // seen as a cluster participant. Both are borrowed from backend_owner.
+    common::ModelBackend *        model = nullptr;
+    common::IClusterParticipant * part  = nullptr;
     ClusterWorkerControl                       control;
     std::unique_ptr<IClusterComm>              comm;
     std::unique_ptr<WorkerHooks>               hooks;
@@ -104,7 +108,7 @@ void send_abort(WorkerState & st, int code, uint64_t request_id, const std::stri
 void teardown(WorkerState & st) {
     st.watchdog_stop.store(true);
     if (st.watchdog.joinable()) st.watchdog.join();
-    if (st.ds4) st.ds4->set_cluster_hooks(nullptr);
+    if (st.part) st.part->cluster_set_hooks(nullptr);
     if (st.backend_owner) st.backend_owner->shutdown();
     st.control.close();
     st.comm.reset();
@@ -117,7 +121,7 @@ bool apply_backend_op(WorkerState & st, const BackendOpMsg & op) {
     auto arg = [&](size_t i, int64_t def) { return i < op.args.size() ? op.args[i] : def; };
     switch (op.kind) {
     case BackendOpKind::SnapshotSave:
-        if (!st.ds4->snapshot_save((int) arg(0, -1))) {
+        if (!st.model->snapshot_save((int) arg(0, -1))) {
             // A rank without the snapshot would silently resume different KV
             // on the next restore. Fail the run instead.
             std::fprintf(stderr,
@@ -128,28 +132,28 @@ bool apply_backend_op(WorkerState & st, const BackendOpMsg & op) {
         }
         return true;
     case BackendOpKind::SnapshotFree:
-        st.ds4->snapshot_free((int) arg(0, -1));
+        st.model->snapshot_free((int) arg(0, -1));
         return true;
     case BackendOpKind::SnapshotRestore:
         // Restore is carried by RequestMsg (snapshot_slot + kv_offset), not
         // as a standalone op; accept and ignore for forward compatibility.
         return true;
     case BackendOpKind::Park:
-        if (!st.ds4->park((common::ParkTarget) arg(0, (int64_t) common::ParkTarget::Empty))) {
+        if (!st.model->park((common::ParkTarget) arg(0, (int64_t) common::ParkTarget::Empty))) {
             std::fprintf(stderr, "[cluster] worker %d: park failed\n", st.cfg.rank);
         }
         return true;
     case BackendOpKind::Unpark:
-        if (!st.ds4->unpark((common::ParkTarget) arg(0, (int64_t) common::ParkTarget::Empty))) {
+        if (!st.model->unpark((common::ParkTarget) arg(0, (int64_t) common::ParkTarget::Empty))) {
             std::fprintf(stderr, "[cluster] worker %d: unpark failed\n", st.cfg.rank);
             return false;
         }
         return true;
     case BackendOpKind::FreeDrafter:
-        st.ds4->free_drafter();
+        st.model->free_drafter();
         return true;
     case BackendOpKind::ResetRequestState:
-        st.ds4->release_scratch();
+        st.model->release_scratch();
         return true;
     case BackendOpKind::HandleCompress:
         // DeepSeek4Backend::handle_compress is unsupported upstream; nothing to mirror.
@@ -199,7 +203,7 @@ int handle_request(WorkerState & st, const RequestMsg & msg) {
     // WP4: the head speculates only when it broadcast DecodeMode::Speculative.
     // A worker without a drafter would silently decode AR instead and then
     // wait for a Decision frame that never comes, so fail the run loudly.
-    if (msg.decode_mode == DecodeMode::Speculative && !st.ds4->spec_decode_ready()) {
+    if (msg.decode_mode == DecodeMode::Speculative && !st.part->cluster_spec_decode_ready()) {
         send_abort(st, kExitProtocol, msg.request_id,
                    "head requested speculative decode but this rank has no DSpark drafter "
                    "(pass the same --draft / DFLASH_DS4_SPEC settings to every rank)");
@@ -208,9 +212,9 @@ int handle_request(WorkerState & st, const RequestMsg & msg) {
 
     GenerateResult result;
     if (msg.restore_slot >= 0) {
-        result = st.ds4->restore_and_generate_impl(msg.restore_slot, req, io);
+        result = st.model->restore_and_generate_impl(msg.restore_slot, req, io);
     } else {
-        result = st.ds4->generate_impl(req, io);
+        result = st.model->generate_impl(req, io);
     }
     const uint64_t compute_us = now_us() - t0;
 
@@ -328,9 +332,11 @@ int run_cluster_worker(BackendArgs & args, const BackendFeatureConfig & features
         std::fprintf(stderr, "[cluster] worker %d: backend creation failed\n", st.cfg.rank);
         return kExitBackend;
     }
-    st.ds4 = dynamic_cast<common::DeepSeek4Backend *>(st.backend_owner.get());
-    if (!st.ds4) {
-        std::fprintf(stderr, "[cluster] worker %d: cluster mode needs the monolithic deepseek4 backend\n",
+    st.model = st.backend_owner.get();
+    st.part  = dynamic_cast<common::IClusterParticipant *>(st.model);
+    if (!st.part) {
+        std::fprintf(stderr, "[cluster] worker %d: this architecture does not "
+                             "implement IClusterParticipant, so it cannot shard\n",
                      st.cfg.rank);
         teardown(st);
         return kExitConfig;
@@ -338,7 +344,7 @@ int run_cluster_worker(BackendArgs & args, const BackendFeatureConfig & features
 
     // Join the cluster. Identity fields are computed by cluster_identity.h on
     // every rank; the placement hash is this rank's built placement.
-    const uint64_t placement_hash = backend_placement_hash(*st.ds4);
+    const uint64_t placement_hash = backend_placement_hash(*st.model);
     if (placement_hash == 0) {
         std::fprintf(stderr, "[cluster] worker %d: backend has no cluster placement\n", st.cfg.rank);
         teardown(st);
@@ -416,12 +422,12 @@ int run_cluster_worker(BackendArgs & args, const BackendFeatureConfig & features
     st.hooks = std::make_unique<WorkerHooks>(st.control, hcfg);
     // Second set_cluster call (WP3 contract): attach the communicator to the
     // runtime the factory created before init().
-    if (!st.ds4->set_cluster(&st.cfg, st.comm.get())) {
+    if (!st.part->cluster_attach(&st.cfg, st.comm.get())) {
         send_abort(st, kExitBackend, 0, "set_cluster(comm) refused by the backend");
         teardown(st);
         return kExitBackend;
     }
-    st.ds4->set_cluster_hooks(st.hooks.get());
+    st.part->cluster_set_hooks(st.hooks.get());
 
     if (!st.comm->barrier(&err)) {
         std::fprintf(stderr, "[cluster] worker %d: post-init barrier failed: %s\n", st.cfg.rank, err.c_str());

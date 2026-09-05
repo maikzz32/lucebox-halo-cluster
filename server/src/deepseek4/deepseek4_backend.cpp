@@ -2997,4 +2997,25 @@ void DeepSeek4Backend::shutdown() {
     if (backend_) { ggml_backend_free(backend_); backend_ = nullptr; }
 }
 
+// ─── IClusterParticipant ────────────────────────────────────────────────
+//
+// Out of line because Ds4ClusterRuntime is incomplete in the header: the
+// cluster runtime pulls in the whole placement and hybrid-storage surface,
+// and the backend header is included by the factory and the server.
+
+uint64_t DeepSeek4Backend::cluster_placement_hash() const {
+    const Ds4ClusterRuntime * rt = cluster_runtime();
+    return rt ? rt->placement.hash() : 0;
+}
+
+uint64_t DeepSeek4Backend::cluster_resident_expert_bytes() const {
+    const Ds4ClusterRuntime * rt = cluster_runtime();
+    return rt ? rt->resident_expert_bytes : 0;
+}
+
+bool DeepSeek4Backend::cluster_ingraph_allreduce() const {
+    const Ds4ClusterRuntime * rt = cluster_runtime();
+    return rt && ds4_cluster_fused_graph_available(rt);
+}
+
 }  // namespace dflash::common

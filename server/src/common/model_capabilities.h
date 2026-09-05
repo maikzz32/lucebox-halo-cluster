@@ -80,7 +80,7 @@ inline constexpr ArchCapabilities kArchCapabilities[] = {
     {"qwen3",      false, false, true,  false,  false,   kNever, kNever, kNever, kNever, kNever,kNever, kNever},
     {"gemma4",     true,  false, false, false,  false,   kMono, kNever, kNever, kNever, kBoth,kNever, kNever},
     {"deepseek4",  true,  false, false, false,  true,    kNever, kNever, kNever, kNever, kNever,kNever, kNever},
-    {"qwen4exp",   false, false, false, false,  false,   kNever, kNever, kNever, kNever, kNever,kNever, kNever},
+    {"qwen4exp",   false, false, false, false,  true,    kNever, kNever, kNever, kNever, kNever,kNever, kNever},
 };
 
 inline constexpr std::size_t kArchCount =
@@ -224,8 +224,10 @@ inline bool arch_has_expert_offload(const std::string & arch) {
     return detail::arch_has(arch, &ArchCapabilities::expert_offload);
 }
 
-// Multi-node RCCL expert-parallel execution (--cluster-size). Only the
-// DeepSeek4 backend shards its routed experts across ranks.
+// Multi-node RCCL sharded execution (--cluster-size). deepseek4 splits its
+// routed experts; qwen4exp splits experts, attention and delta-net heads, and
+// the vocabulary, because its experts are only a quarter of the bytes a decode
+// step reads.
 inline bool arch_supports_cluster_ep(const std::string & arch) {
     return detail::arch_has(arch, &ArchCapabilities::cluster_ep);
 }

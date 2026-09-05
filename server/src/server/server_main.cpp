@@ -172,8 +172,20 @@ static int run_cluster_selftest_main(const BackendArgs & bargs) {
     std::fprintf(stderr, "[cluster] rank %d/%d communicator ready (rccl %s)\n",
                  c.rank, c.size, rccl_version_string().c_str());
 
+    // The small size matters for tensor parallelism, where a decode step's
+    // reduction is one hidden vector -- 2560 floats for qwen4exp -- and the
+    // collective is pure latency. Overridable so the fabric can be measured at
+    // the size a given model would actually use.
+    auto env_n = [](const char * key, size_t dflt) {
+        const char * v = std::getenv(key);
+        if (!v) return dflt;
+        const long long n = std::atoll(v);
+        return n > 0 ? (size_t) n : dflt;
+    };
+    const size_t small_n = env_n("DFLASH_CLUSTER_SELFTEST_SMALL", 16384);
+    const size_t large_n = env_n("DFLASH_CLUSTER_SELFTEST_LARGE", 4u * 1024u * 1024u);
     const bool ok = run_cluster_selftest(*comm, bargs.device.gpu, /*iters=*/1000,
-                                         /*small_n=*/16384, /*large_n=*/4u * 1024u * 1024u, &err);
+                                         small_n, large_n, &err);
     if (!ok) {
         std::fprintf(stderr, "[cluster] self-test FAILED on rank %d: %s\n", c.rank, err.c_str());
         comm->abort();

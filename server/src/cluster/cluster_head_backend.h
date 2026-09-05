@@ -1,7 +1,7 @@
 // cluster_head_backend.h - rank-0 ModelBackend decorator for cluster runs.
 //
 // The HTTP server talks to one ModelBackend. In a cluster that backend is
-// this decorator: it owns the real DeepSeek4Backend, the control channel to
+// this decorator: it owns the real backend, the control channel to
 // the workers, the RCCL communicator and the HeadHooks. Before every
 // generate() it broadcasts a RequestMsg so the workers run the identical
 // call; every state-changing ModelBackend virtual (snapshot save/free,
@@ -23,7 +23,8 @@
 #include "cluster/cluster_protocol.h"
 #include "common/cluster_view.h"
 #include "common/model_backend.h"
-#include "deepseek4/deepseek4_backend.h"
+#include "common/cluster_participant.h"
+#include "common/model_backend.h"
 
 #include <cstdint>
 #include <atomic>
@@ -54,13 +55,13 @@ struct ClusterRequestReport {
 
 // Placement hash for HelloMsg: the inner backend's built placement
 // (Ds4ClusterRuntime::placement.hash()) or 0 when no cluster runtime exists.
-uint64_t backend_placement_hash(const common::DeepSeek4Backend & backend);
+uint64_t backend_placement_hash(const common::ModelBackend & backend);
 
 class ClusterHeadBackend final : public common::ModelBackend {
 public:
     // `device` is the local HIP ordinal the inner backend runs on
     // (BackendArgs::device.gpu); RCCL binds the communicator to it.
-    ClusterHeadBackend(std::unique_ptr<common::DeepSeek4Backend> inner,
+    ClusterHeadBackend(std::unique_ptr<common::ModelBackend> inner,
                        const ClusterConfig & cfg,
                        std::string model_path,
                        int device);
@@ -161,7 +162,13 @@ private:
     void fail_cluster(const std::string & reason, int code, uint64_t request_id);
     bool spec_available() const;
 
-    std::unique_ptr<common::DeepSeek4Backend> inner_;
+    // The inner backend seen as a cluster participant. Null would mean the
+    // factory handed us an architecture the gates should have rejected.
+    common::IClusterParticipant * cluster_participant() const {
+        return dynamic_cast<common::IClusterParticipant *>(inner_.get());
+    }
+
+    std::unique_ptr<common::ModelBackend> inner_;
     ClusterConfig                     cfg_;
     std::string                       model_path_;
     int                               device_ = 0;

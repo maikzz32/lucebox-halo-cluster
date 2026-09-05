@@ -59,9 +59,9 @@ uint32_t bootstrap_deadline_ms(const ClusterConfig & cfg) {
 
 // ─── Identity ───────────────────────────────────────────────────────────
 
-uint64_t backend_placement_hash(const common::DeepSeek4Backend & backend) {
-    const common::Ds4ClusterRuntime * rt = backend.cluster_runtime();
-    return rt ? rt->placement.hash() : 0;
+uint64_t backend_placement_hash(const common::ModelBackend & backend) {
+    const auto * p = dynamic_cast<const common::IClusterParticipant *>(&backend);
+    return p ? p->cluster_placement_hash() : 0;
 }
 
 // ─── Request mapping ────────────────────────────────────────────────────
@@ -113,7 +113,7 @@ RequestMsg ClusterHeadBackend::build_request_msg(uint64_t request_id, const Gene
 
 // ─── Lifecycle ──────────────────────────────────────────────────────────
 
-ClusterHeadBackend::ClusterHeadBackend(std::unique_ptr<common::DeepSeek4Backend> inner,
+ClusterHeadBackend::ClusterHeadBackend(std::unique_ptr<common::ModelBackend> inner,
                                        const ClusterConfig & cfg,
                                        std::string model_path,
                                        int device)
@@ -246,11 +246,12 @@ bool ClusterHeadBackend::init() {
     // Second set_cluster call (WP3 contract): attaches the communicator to the
     // runtime the factory created before init(); placement-defining fields
     // must be unchanged, which they are (same ClusterConfig).
-    if (!inner_->set_cluster(&cfg_, comm_.get())) {
-        fail_cluster("set_cluster(comm) refused by the backend", kAbortCodeCollective, 0);
+    common::IClusterParticipant * part = cluster_participant();
+    if (!part || !part->cluster_attach(&cfg_, comm_.get())) {
+        fail_cluster("cluster_attach(comm) refused by the backend", kAbortCodeCollective, 0);
         return false;
     }
-    inner_->set_cluster_hooks(hooks_.get());
+    part->cluster_set_hooks(hooks_.get());
 
     if (!comm_->barrier(&err)) {
         std::fprintf(stderr, "[cluster] head: post-init barrier failed: %s\n", err.c_str());
@@ -373,7 +374,8 @@ bool ClusterHeadBackend::spec_available() const {
     // speculatively. A worker that happens to lack a drafter must not quietly
     // fall back to AR while the head speculates, so it rejects the request
     // instead (cluster_worker_main.cpp).
-    return inner_ && inner_->spec_decode_ready();
+    const common::IClusterParticipant * part = cluster_participant();
+    return part && part->cluster_spec_decode_ready();
 }
 
 GenerateResult ClusterHeadBackend::generate_impl(const GenerateRequest & req, const DaemonIO & io) {
@@ -572,10 +574,9 @@ bool ClusterHeadBackend::cluster_props(common::ClusterPropsView & out) const {
     out.gpudirect       = false;
     if (inner_) {
         out.placement_hash = backend_placement_hash(*inner_);
-        if (const common::Ds4ClusterRuntime * rt = inner_->cluster_runtime()) {
-            out.resident_expert_bytes = rt->resident_expert_bytes;
-            out.ingraph_allreduce =
-                common::ds4_cluster_fused_graph_available(rt);
+        if (const common::IClusterParticipant * part = cluster_participant()) {
+            out.resident_expert_bytes = part->cluster_resident_expert_bytes();
+            out.ingraph_allreduce     = part->cluster_ingraph_allreduce();
         }
     }
     return true;
@@ -698,7 +699,9 @@ void ClusterHeadBackend::shutdown() {
         control_.broadcast(make_frame(bye), nullptr);
     }
     if (inner_) {
-        inner_->set_cluster_hooks(nullptr);
+        if (common::IClusterParticipant * part = cluster_participant()) {
+            part->cluster_set_hooks(nullptr);
+        }
         inner_->shutdown();
     }
     control_.close();

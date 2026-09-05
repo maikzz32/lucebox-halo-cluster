@@ -353,7 +353,7 @@ std::string check_feature_compatibility(
             return "cluster mode: " + structural;
         }
         if (!arch_supports_cluster_ep(arch)) {
-            return "--cluster-size requires a deepseek4 target (architecture '" +
+            return "--cluster-size requires a sharding architecture (architecture '" +
                    arch + "' has no cluster expert-parallel path)";
         }
         if (compiled_backend != PlacementBackend::Hip ||
