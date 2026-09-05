@@ -214,7 +214,13 @@ struct FastReduceImpl {
     uint32_t * progress_host = nullptr;
     uint32_t * progress_dev = nullptr;
 
-    std::vector<int> pending_n;             // payload length per slot, host side
+    // Payload length per reduction, on its own much larger ring. It cannot
+    // share the slot ring: it is written when the host *enqueues* a reduction
+    // and the host enqueues a whole step ahead of the GPU, so with one ring the
+    // entry the progress thread still needs is overwritten a hundred
+    // reductions before it reads it.
+    static constexpr int kPendingRing = 8192;
+    std::vector<int> pending_n;
     std::atomic<uint64_t> seq{0};
     std::atomic<bool> stop{false};
     std::thread progress;
@@ -433,7 +439,7 @@ bool FastReduce::init(const Config & cfg, std::string * err) {
         return bail("hipMalloc for the peer scratch failed");
     }
 
-    s.pending_n.assign((size_t) cfg.slots, 0);
+    s.pending_n.assign((size_t) FastReduceImpl::kPendingRing, 0);
 
     // ── progress ──────────────────────────────────────────────────────────
     s.up = true;
@@ -467,7 +473,7 @@ bool FastReduce::init(const Config & cfg, std::string * err) {
                     std::this_thread::yield();
                 }
             }
-            const int n = s.pending_n[(size_t) slot];
+            const int n = s.pending_n[(size_t) (next % (uint64_t) FastReduceImpl::kPendingRing)];
             for (int r = 0; r < s.cfg.size; ++r) {
                 if (r == s.cfg.rank) continue;
                 const Endpoint & pe = s.peers[(size_t) r];
@@ -573,9 +579,9 @@ bool FastReduce::submit(float * data, size_t n, void * stream) {
     const uint64_t seq = s.seq.fetch_add(1, std::memory_order_relaxed) + 1;
     const int slot = (int) (seq % (uint64_t) s.cfg.slots);
     // The progress thread reads this once it sees the flag, and the flag is
-    // raised by a kernel launched below -- so writing it here is ordered
-    // ahead of any possible read.
-    s.pending_n[(size_t) slot] = (int) n;
+    // raised further down the stream -- so writing it here is ordered ahead of
+    // any possible read.
+    s.pending_n[(size_t) (seq % (uint64_t) FastReduceImpl::kPendingRing)] = (int) n;
 
     const int n_peers = s.cfg.size - 1;
     auto stm = (hipStream_t) stream;
@@ -609,6 +615,21 @@ bool FastReduce::submit(float * data, size_t n, void * stream) {
     // comparison.
     static const bool kernel_flags =
         std::getenv("DFLASH_CLUSTER_FAST_REDUCE_KERNEL_FLAGS") != nullptr;
+
+    // Do not write into a slot the progress thread has not finished with. The
+    // kernel form waited on this; the stream form has to as well, or the GPU --
+    // which runs a whole step's reductions ahead of the host -- laps the ring
+    // and overwrites a payload that has not been sent. That is what made the
+    // third request of a run stop rather than the first.
+    // The previous user of this slot was seq - slots, and it leaves exactly that
+    // value behind. Asking for anything higher is a wait nothing can satisfy.
+    if (!dry && !kernel_flags && seq > (uint64_t) s.cfg.slots) {
+        const uint32_t need = (uint32_t) (seq - (uint64_t) s.cfg.slots);
+        if (hipStreamWaitValue32(stm, s.flag_dev + s.done_off(slot), need,
+                                 hipStreamWaitValueGte, 0xffffffffu) != hipSuccess) {
+            return false;
+        }
+    }
 
     // Publish: the copy engine moves the partial into the pinned staging
     // buffer, then the flag is written. Both are on the stream, so the flag

@@ -56,8 +56,14 @@ public:
         int         gid_index = 1;       // RoCE v2
         std::string bootstrap_host;      // rank 0's address
         int         bootstrap_port = 9500;
-        int         max_elems = 262144;  // 1 MiB: a prefill chunk's reduction too
-        int         slots = 128;         // in-flight ring; a step has ~97
+        // Decode sizes only -- 10240 floats is the largest a step reduces --
+        // and a ring deep enough that the guard against lapping it almost never
+        // fires. It has to be deep: the guard is a stream wait, and a stream
+        // wait that fires stops the GPU running ahead, which is where this
+        // path's speed comes from. Prefill's much larger reductions fall back
+        // to RCCL, where they cost nothing that matters.
+        int         max_elems = 16384;   // 64 KiB
+        int         slots = 4096;        // a step has ~97
         uint32_t    timeout_ms = 30000;
     };
 
