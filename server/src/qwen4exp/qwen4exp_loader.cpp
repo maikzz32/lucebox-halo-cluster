@@ -1,5 +1,6 @@
 #include "qwen4exp/qwen4exp_internal.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -299,6 +300,7 @@ namespace {
 struct Binding {
     ggml_tensor *   dst = nullptr;   // in the context TargetWeights owns
     GgufShardTensor src;             // into whichever shard holds it
+    bool            to_f32 = false;  // dequantise on the host during upload
 };
 
 // Bind one tensor by name. Optional names may be absent; required ones fail.
@@ -308,6 +310,26 @@ struct Binder {
     std::vector<Binding> & out;
     std::string &        err;
     bool ok = true;
+
+    // Bind a tensor and dequantise it to F32 on the way to the device.
+    //
+    // For a weight with very few rows this costs almost nothing in memory and
+    // avoids the quantised matmul entirely. hc_*_inject is [n_hc*n_embd, n_hc]
+    // -- four rows -- which is narrower than the row tiles the ROCmFP4 kernels
+    // are built around, and narrow enough that quantising it saves under 8 MiB
+    // across the whole model.
+    ggml_tensor * take_f32(const std::string & name, bool required) {
+        ggml_tensor * t = take(name, required);
+        if (t && ggml_is_quantized(t->type)) {
+            out.back().to_f32 = true;
+            t->type = GGML_TYPE_F32;
+            t->nb[0] = ggml_type_size(GGML_TYPE_F32);
+            for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+                t->nb[d] = t->nb[d - 1] * t->ne[d - 1];
+            }
+        }
+        return t;
+    }
 
     ggml_tensor * take(const std::string & name, bool required) {
         if (!ok) return nullptr;
@@ -382,11 +404,11 @@ bool load_qwen4exp_gguf(const std::string & path,
         L.hc_attn_norm   = b.take(blk(il, "hc_attn_norm.weight"),   true);
         L.hc_attn_down   = b.take(blk(il, "hc_attn_down.weight"),   true);
         L.hc_attn_up     = b.take(blk(il, "hc_attn_up.weight"),     true);
-        L.hc_attn_inject = b.take(blk(il, "hc_attn_inject.weight"), true);
+        L.hc_attn_inject = b.take_f32(blk(il, "hc_attn_inject.weight"), true);
         L.hc_ffn_norm    = b.take(blk(il, "hc_ffn_norm.weight"),    true);
         L.hc_ffn_down    = b.take(blk(il, "hc_ffn_down.weight"),    true);
         L.hc_ffn_up      = b.take(blk(il, "hc_ffn_up.weight"),      true);
-        L.hc_ffn_inject  = b.take(blk(il, "hc_ffn_inject.weight"),  true);
+        L.hc_ffn_inject  = b.take_f32(blk(il, "hc_ffn_inject.weight"),  true);
 
         if (full_attn) {
             L.wq     = b.take(blk(il, "attn_q.weight"),      true);
@@ -541,12 +563,56 @@ bool load_qwen4exp_gguf(const std::string & path,
             return false;
         }
     }
+    std::vector<float> scratch;
     for (const Binding & bind : bindings) {
         // find() already bounds-checked the source against its own shard.
         shards.advise_willneed(bind.src);
-        ggml_backend_tensor_set(bind.dst, bind.src.data, 0, bind.src.size);
+        if (!bind.to_f32) {
+            ggml_backend_tensor_set(bind.dst, bind.src.data, 0, bind.src.size);
+            continue;
+        }
+        const ggml_type      st = bind.src.meta->type;
+        const ggml_type_traits * tr = ggml_get_type_traits(st);
+        const int64_t nc   = bind.dst->ne[0];
+        const int64_t rows = ggml_nelements(bind.dst) / nc;
+        const size_t  srow = ggml_row_size(st, nc);
+        scratch.resize((size_t) nc * (size_t) rows);
+        const char * sp = static_cast<const char *>(bind.src.data);
+        for (int64_t r = 0; r < rows; ++r) {
+            tr->to_float(sp + (size_t) r * srow, scratch.data() + (size_t) r * nc, nc);
+        }
+        ggml_backend_tensor_set(bind.dst, scratch.data(), 0,
+                                scratch.size() * sizeof(float));
+        if (std::getenv("DFLASH_QWEN4EXP_RMS")) {
+            const int64_t nc2   = bind.dst->ne[0];
+            const int64_t rows2 = (int64_t) scratch.size() / nc2;
+            for (int64_t r = 0; r < rows2 && r < 4; ++r) {
+                double sum = 0.0, sq = 0.0;
+                const float * rp = scratch.data() + (size_t) r * nc2;
+                for (int64_t i = 0; i < nc2; ++i) { sum += rp[i]; sq += (double) rp[i] * rp[i]; }
+                std::fprintf(stderr,
+                    "[q4e-w] %-28s row%lld mean=%+.5f rms=%.5f  first=%+.4f %+.4f %+.4f\n",
+                    ggml_get_name(bind.dst), (long long) r,
+                    sum / (double) nc2, std::sqrt(sq / (double) nc2),
+                    rp[0], rp[1], rp[2]);
+            }
+        }
     }
 
+    std::fprintf(stderr,
+        "[qwen4exp] hparams: n_embd=%d n_layer=%d n_head=%d n_head_kv=%d head_dim=%d\n"
+        "[qwen4exp]   full_attn_every=%d n_expert=%d/%d n_ff_exp=%d rope=%.0f/%d,%d,%d,%d\n"
+        "[qwen4exp]   ssm: d_inner=%d d_state=%d n_group=%d dt_rank=%d conv=%d\n"
+        "[qwen4exp]   hc: n_hc=%d low_rank=%d  ple: layer=%d ngram=%d heads=%d conv=%d\n",
+        out.n_embd, out.n_layer, out.n_head, out.n_head_kv,
+        out.n_embd_head_k,
+        out.full_attention_interval, out.n_expert_used, out.n_expert, out.n_ff_exp,
+        (double) out.rope_theta, out.rope_sections[0], out.rope_sections[1],
+        out.rope_sections[2], out.rope_sections[3],
+        out.ssm_d_inner, out.ssm_d_state, out.ssm_n_group, out.ssm_dt_rank,
+        out.ssm_d_conv,
+        out.n_hc, out.hc_low_rank, out.ple_layer, out.ple_ngram_size,
+        out.ple_n_heads, out.ple_conv_kernel);
     std::fprintf(stderr,
         "[qwen4exp] loaded %zu tensors from %s, %.1f GiB on device\n",
         bindings.size(), shards.describe().c_str(),

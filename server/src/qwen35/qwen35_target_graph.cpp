@@ -32,6 +32,7 @@
 
 #include "internal.h"
 #include "qwen4exp/qwen4exp_graph.h"
+#include "qwen4exp/qwen4exp_probe.h"
 #include "bailingmoe3_graph.h"
 #include "delta_net_chunked.h"
 #include "delta_net_specla.h"
@@ -2382,6 +2383,7 @@ QwenGraphOutputs build_qwen35_graph(
     if (hyper_connected) {
         hc_state = qwen4exp_hc_init(ctx, graph_tensor_f32(ctx, inpL),
                                     w.n_embd, w.n_hc);
+        qwen4exp_probe_add(ctx, gf, "hc_init", -1, hc_state);
     }
 
     for (int il = 0; il < w.n_layer; il++) {
@@ -2398,6 +2400,7 @@ QwenGraphOutputs build_qwen35_graph(
                     w.layers[il].ple_norm_conv, w.layers[il].ple_conv1d,
                     cache.ple_conv_state, w.n_embd, w.n_hc,
                     w.ple_conv_kernel, w.ple_ngram_size, w.rms_eps);
+                qwen4exp_probe_add(ctx, gf, "hc_after_ple", il, hc_state);
             }
             build_qwen4exp_layer(ctx, gf, w, cache, il, &hc_state,
                                  in.positions, in.attn_mask, in.kv_start,
@@ -2650,10 +2653,11 @@ QwenGraphOutputs build_qwen35_graph(
     //    norm -- there is no separate one, and w.out_norm is null. It takes no
     //    inject weights because there is no block left to write back into.
     ggml_tensor * out = hyper_connected
-        ? qwen4exp_hc_mix(ctx, hc_state, w.output_hc_norm, w.output_hc_down,
+        ? qwen4exp_hc_mix(ctx, gf, hc_state, w.output_hc_norm, w.output_hc_down,
                           w.output_hc_up, nullptr, nullptr,
                           w.n_embd, w.n_hc, w.rms_eps)
         : rms_norm_mul(ctx, inpL, w.out_norm, w.rms_eps);
+    qwen4exp_probe_add(ctx, gf, "final_mix", -1, out);
 
     // 3. LM head — optionally only for sampled rows (prefill computes just
     //    the last row; fused steps the decode rows plus committing prompts'
@@ -2720,9 +2724,10 @@ static ggml_tensor * build_single_layer_hc(
     // ── attention / delta-net sublayer ────────────────────────────────────
     ggml_tensor * inject = nullptr;
     ggml_tensor * cur = qwen4exp_hc_mix(
-        ctx, *hc_state, L.hc_attn_norm, L.hc_attn_down, L.hc_attn_up,
+        ctx, gf, *hc_state, L.hc_attn_norm, L.hc_attn_down, L.hc_attn_up,
         L.hc_attn_inject, &inject, w.n_embd, n_hc, w.rms_eps);
     ggml_build_forward_expand(gf, cur);
+    ggml_tensor * cur_mix = cur;
 
     if (is_attn) {
         int fa_idx = 0;
@@ -2748,16 +2753,36 @@ static ggml_tensor * build_single_layer_hc(
             /*skip_gdn_intermediate=*/true,
             supports_qwen35_fused_kernels(cache.backend));
     }
+    qwen4exp_probe_add(ctx, gf, "attn_mix",  layer_idx, cur_mix);
+    qwen4exp_probe_add(ctx, gf, "attn_out",  layer_idx, cur);
+    qwen4exp_probe_add(ctx, gf, "attn_inj",  layer_idx, inject);
+    if (layer_idx == 0 && inject) {
+        // One line per hyper-connection stream. The weight rows differ in norm
+        // by a factor of four, so if the four streams come out equal the
+        // product is not the one the weights describe.
+        for (int c = 0; c < n_hc; ++c) {
+            char lbl[24];
+            std::snprintf(lbl, sizeof(lbl), "  inj_row%d", c);
+            qwen4exp_probe_add(ctx, gf, lbl, -1,
+                ggml_view_2d(ctx, inject, 1, inject->ne[1], inject->nb[1],
+                             (size_t) c * inject->nb[0]));
+        }
+    }
     *hc_state = qwen4exp_hc_combine(ctx, *hc_state, cur, inject, w.n_embd, n_hc);
+    qwen4exp_probe_add(ctx, gf, "hc_after_attn", layer_idx, *hc_state);
 
     // ── FFN sublayer ──────────────────────────────────────────────────────
     ggml_tensor * ffn_in = qwen4exp_hc_mix(
-        ctx, *hc_state, L.hc_ffn_norm, L.hc_ffn_down, L.hc_ffn_up,
+        ctx, gf, *hc_state, L.hc_ffn_norm, L.hc_ffn_down, L.hc_ffn_up,
         L.hc_ffn_inject, &inject, w.n_embd, n_hc, w.rms_eps);
 
     ggml_tensor * moe_selected = nullptr;
     ggml_tensor * ffn = build_qwen35moe_ffn(ctx, ffn_in, w, L, &moe_selected);
+    qwen4exp_probe_add(ctx, gf, "ffn_mix", layer_idx, ffn_in);
+    qwen4exp_probe_add(ctx, gf, "ffn_out", layer_idx, ffn);
+    qwen4exp_probe_add(ctx, gf, "ffn_inj", layer_idx, inject);
     *hc_state = qwen4exp_hc_combine(ctx, *hc_state, ffn, inject, w.n_embd, n_hc);
+    qwen4exp_probe_add(ctx, gf, "hc_after_ffn", layer_idx, *hc_state);
 
     return ffn_in;
 }

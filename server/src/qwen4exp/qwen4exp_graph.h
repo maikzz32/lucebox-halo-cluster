@@ -39,6 +39,7 @@ namespace dflash::common {
 // weights for the matching hc_combine; pass nullptr for the final mixer, which
 // has no block to write back.
 ggml_tensor * qwen4exp_hc_mix(ggml_context * ctx,
+                              ggml_cgraph *  gf,          // for the magnitude probe
                               ggml_tensor *  state,       // [n_embd, n_hc, T]
                               ggml_tensor *  w_norm,      // [n_hc*n_embd]
                               ggml_tensor *  w_down,      // [n_hc*n_embd, low_rank]

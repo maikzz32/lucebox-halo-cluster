@@ -1,6 +1,8 @@
 #include "qwen4exp/qwen4exp_graph.h"
+#include "qwen4exp/qwen4exp_probe.h"
 
 #include <cmath>
+#include <cstdlib>
 
 namespace dflash::common {
 
@@ -14,6 +16,7 @@ ggml_tensor * qwen4exp_hc_init(ggml_context * ctx,
 }
 
 ggml_tensor * qwen4exp_hc_mix(ggml_context * ctx,
+                              ggml_cgraph *  gf,
                               ggml_tensor *  state,
                               ggml_tensor *  w_norm,
                               ggml_tensor *  w_down,
@@ -39,6 +42,10 @@ ggml_tensor * qwen4exp_hc_mix(ggml_context * ctx,
     ggml_tensor * lo = ggml_mul_mat(ctx, w_down, xn);
     lo = ggml_silu(ctx, ggml_scale(ctx, lo, 1.0f / (float) n_hc));
     ggml_tensor * gate = ggml_sigmoid(ctx, ggml_mul_mat(ctx, w_up, lo));
+
+    qwen4exp_probe_add(ctx, gf, "  xn",   -1, xn);
+    qwen4exp_probe_add(ctx, gf, "  lo",   -1, lo);
+    qwen4exp_probe_add(ctx, gf, "  gate", -1, gate);
 
     ggml_tensor * gated = ggml_mul(ctx, xn, gate);
     gated = ggml_reshape_3d(ctx, gated, n_embd, n_hc, nt);
@@ -174,8 +181,45 @@ ggml_tensor * qwen4exp_hc_combine(ggml_context * ctx,
 
     // 2*sigmoid centres the scatter weights on 1, so an injection of zero is a
     // plain residual add rather than a halving of the block's contribution.
-    ggml_tensor * w = ggml_sigmoid(ctx, ggml_scale(ctx, inject, 1.0f / (float) n_hc));
-    w = ggml_scale(ctx, w, 2.0f);
+    //
+    // DFLASH_QWEN4EXP_HC_VARIANT selects a different reading of the same
+    // tensors. It exists because the measured injections are far outside the
+    // range this formula assumes -- around -19 where random alignment predicts
+    // -0.5 -- which saturates every gate to zero and stops the blocks writing
+    // back at all. Variant 1 is the control that matters: with the gate pinned
+    // to 1 the four streams stay identical and the model degenerates to an
+    // ordinary residual network, so coherent text there would say the fault is
+    // in this formula and nowhere else.
+    static const int variant = []() {
+        const char * s = std::getenv("DFLASH_QWEN4EXP_HC_VARIANT");
+        return s ? std::atoi(s) : 0;
+    }();
+
+    ggml_tensor * w = nullptr;
+    switch (variant) {
+        case 1:  // control: plain residual add into every stream
+            w = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, inject, 0.0f)), 2.0f);
+            break;
+        case 2: {
+            // Centre the injection across the streams before the sigmoid. The
+            // measured offset is nearly the same for all four, so if it is an
+            // artefact rather than a signal, removing it restores a gate that
+            // spans zero to two. (1 + tanh(x) is not a separate variant: it
+            // equals 2*sigmoid(2x), which only saturates harder.)
+            ggml_tensor * mu = ggml_repeat(ctx, ggml_mean(ctx, inject), inject);
+            ggml_tensor * centred = ggml_sub(ctx, inject, mu);
+            w = ggml_scale(
+                ctx, ggml_sigmoid(ctx, ggml_scale(ctx, centred, 1.0f / (float) n_hc)), 2.0f);
+            break;
+        }
+        case 3:  // no 1/n_hc: the scale is the only free constant in the formula
+            w = ggml_scale(ctx, ggml_sigmoid(ctx, inject), 2.0f);
+            break;
+        default:
+            w = ggml_scale(
+                ctx, ggml_sigmoid(ctx, ggml_scale(ctx, inject, 1.0f / (float) n_hc)), 2.0f);
+            break;
+    }
     w = ggml_reshape_3d(ctx, w, 1, n_hc, nt);
 
     ggml_tensor * b = ggml_reshape_3d(ctx, block_out, n_embd, 1, nt);
