@@ -1626,6 +1626,14 @@ static ggml_tensor * build_delta_net_block(
         alpha_2d = apply_scale2(ctx, ggml_mul_mat(ctx, L.ssm_alpha, cur), L.ssm_alpha_s);
     }
 
+    // Bring-up probes for qwen4exp: the four whole-batch projections, against
+    // the same points in upstream's trace (linear_attn_qkv_mixed, z, beta,
+    // alpha). Inert unless DFLASH_QWEN4EXP_RMS=1.
+    qwen4exp_probe_add(ctx, gf, "  dn_qkv",   -1, qkv_2d);
+    qwen4exp_probe_add(ctx, gf, "  dn_z",     -1, z);
+    qwen4exp_probe_add(ctx, gf, "  dn_beta",  -1, beta_2d);
+    qwen4exp_probe_add(ctx, gf, "  dn_alpha", -1, alpha_2d);
+
     // Fused kernels (single-sequence chain path only): the conv step and the
     // gate prep are folded into the ssm_conv_step / gated_delta_net kernels
     // instead of 6-8 tiny graph ops per layer. DFLASH_QWEN35_NO_FUSED_KERNELS=1
@@ -2168,14 +2176,20 @@ static ggml_tensor * build_delta_net_block(
     }
 
 after_delta_net:
-    // ── Gated output norm: rms_norm(output) * silu(z_4d)
+    // ── Gated output norm: rms_norm(output) * gate(z_4d)
+    //
+    // Qwen3.5 gates with silu(z); qwen4exp gates with sigmoid(z). That single
+    // op is the whole numerical difference between the two architectures'
+    // gated delta net, and it applies to three quarters of qwen4exp's layers.
     ggml_tensor * z_4d = ggml_reshape_4d(ctx,
         contig(seg_cols(z, seg.off, seg_tokens)),
         head_v_dim, num_v_heads, n_seq_tokens, seg_seqs);
     ggml_tensor * output_n = ggml_rms_norm(ctx, rms_norm_input_f32(ctx, output), w.rms_eps);
     output_n = ggml_mul(ctx, output_n, L.ssm_norm);
-    ggml_tensor * z_silu  = ggml_silu(ctx, z_4d);
-    output_n = ggml_mul(ctx, output_n, z_silu);
+    ggml_tensor * z_gate = w.gdn_sigmoid_output_gate
+        ? ggml_sigmoid(ctx, z_4d)
+        : ggml_silu(ctx, z_4d);
+    output_n = ggml_mul(ctx, output_n, z_gate);
 
     // Reshape to [d_inner, seg_tokens]
     flat[si] = ggml_reshape_2d(ctx, output_n,

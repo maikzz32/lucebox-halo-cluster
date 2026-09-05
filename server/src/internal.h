@@ -262,6 +262,13 @@ struct TargetWeights {
     int kv_lora_rank            = 0;
     int q_lora_rank             = 0;
     float kda_gate_lower_bound  = 0.0f;
+    // The gated delta net's output gate. Qwen3.5 gates the normalised output
+    // with silu(z); qwen4exp gates it with sigmoid(z), and that is the only
+    // numerical difference between the two architectures' GDN. It is a whole
+    // architecture apart on 36 of 48 layers, and nothing about the tensor
+    // shapes reveals which one a checkpoint wants.
+    bool gdn_sigmoid_output_gate = false;
+
     // qwen4exp hyper-connections and PLE. n_hc == 1 means the architecture
     // does not use them, which is every other model in this tree.
     int n_hc                    = 1;

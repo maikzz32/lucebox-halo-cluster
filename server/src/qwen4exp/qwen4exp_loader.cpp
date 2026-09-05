@@ -149,6 +149,9 @@ bool read_qwen4exp_hparams(const GgufShardSet & shards,
     need("ssm.group_count",                   out.ssm_n_group);
     need("ssm.time_step_rank",                out.ssm_dt_rank);
     need("ssm.inner_size",                    out.ssm_d_inner);
+    // qwen4exp's gated delta net differs from Qwen3.5's in exactly one place.
+    out.gdn_sigmoid_output_gate = true;
+
     need("hyper_connection.count",            out.n_hc);
     need("hyper_connection.low_rank",         out.hc_low_rank);
     need("attention.indexer.head_count",      out.n_indexer_head);
