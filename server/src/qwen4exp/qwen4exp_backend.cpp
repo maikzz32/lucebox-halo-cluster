@@ -108,6 +108,12 @@ bool Qwen4ExpBackend::cluster_attach(const cluster::ClusterConfig * cfg,
         fc.gid_index = cfg->gid_index > 0 ? cfg->gid_index : 1;
         fc.bootstrap_host = cfg->head_host;
         fc.bootstrap_port = cfg->head_port + 100;
+        if (const char * e = std::getenv("DFLASH_CLUSTER_FAST_REDUCE_ELEMS")) {
+            fc.max_elems = std::max(1024, std::atoi(e));
+        }
+        if (const char * e = std::getenv("DFLASH_CLUSTER_FAST_REDUCE_SLOTS")) {
+            fc.slots = std::max(8, std::atoi(e));
+        }
         auto fast = std::make_unique<cluster::FastReduce>();
         std::string ferr;
         if (fast->init(fc, &ferr)) {

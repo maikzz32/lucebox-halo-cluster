@@ -56,8 +56,8 @@ public:
         int         gid_index = 1;       // RoCE v2
         std::string bootstrap_host;      // rank 0's address
         int         bootstrap_port = 9500;
-        int         max_elems = 16384;   // 64 KiB; larger reductions fall back
-        int         slots = 256;         // in-flight ring; a step has ~97
+        int         max_elems = 262144;  // 1 MiB: a prefill chunk's reduction too
+        int         slots = 128;         // in-flight ring; a step has ~97
         uint32_t    timeout_ms = 30000;
     };
 
