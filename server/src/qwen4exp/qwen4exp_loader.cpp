@@ -278,7 +278,7 @@ bool read_qwen4exp_hparams(const GgufShardSet & shards,
     // has attn_qkv, and the interval says which is which. Disagreement here
     // means the graph would build the wrong block for the wrong layer.
     if (c.ok && out.full_attention_interval > 0) {
-        for (int il = 0; il < out.n_layer; ++il) {
+    for (int il = 0; il < out.n_layer; ++il) {
             const bool want_full = ((il + 1) % out.full_attention_interval) == 0;
             const std::string q   = "blk." + std::to_string(il) + ".attn_q.weight";
             const std::string qkv = "blk." + std::to_string(il) + ".attn_qkv.weight";
@@ -310,8 +310,9 @@ struct Binding {
     // Cluster sharding. `axis` says which of the source's dimensions this rank
     // holds a slice of; begin/count are in elements along it.
     ShardAxis       axis  = ShardAxis::None;
-    int64_t         begin = 0;
+    int64_t         begin = 0;   // within one segment
     int64_t         count = 0;
+    int             segs  = 1;   // equal blocks the axis is made of
 };
 
 // Bind one tensor by name. Optional names may be absent; required ones fail.
@@ -356,14 +357,18 @@ struct Binder {
     // sum. Splitting by expert index would have needed the ids remapped on
     // device and would still have read a sentinel expert per unowned route.
     ggml_tensor * take_shard(const std::string & name, ShardAxis axis,
-                             int64_t granularity, bool required) {
+                             int64_t granularity, bool required, int segments = 1) {
         ggml_tensor * t = take(name, required);
         if (!t || axis == ShardAxis::None || !cluster || !cluster->sharded()) {
             return t;
         }
         Binding & b = out.back();
-        const int64_t extent = axis == ShardAxis::Rows ? b.src.meta->ne[1]
-                                                       : b.src.meta->ne[0];
+        const int64_t whole = axis == ShardAxis::Rows ? b.src.meta->ne[1]
+                                                      : b.src.meta->ne[0];
+        if (segments < 1 || whole % segments != 0) {
+            return t;
+        }
+        const int64_t extent = whole / segments;
         const ShardRange r = qwen4exp_shard_range(extent, granularity,
                                                   cluster->rank(), cluster->size());
         if (!r.split) {
@@ -380,10 +385,11 @@ struct Binder {
         b.axis  = axis;
         b.begin = r.begin;
         b.count = r.count();
+        b.segs  = segments;
         if (axis == ShardAxis::Rows) {
-            t->ne[1] = r.count();
+            t->ne[1] = r.count() * segments;
         } else {
-            t->ne[0] = r.count();
+            t->ne[0] = r.count() * segments;
         }
         // Recompute the strides for the narrower tensor.
         t->nb[0] = ggml_type_size(t->type);
@@ -466,6 +472,34 @@ bool load_qwen4exp_gguf(const std::string & path,
     };
 
     out.layers.resize((size_t) out.n_layer);
+    // Attention splits only when the query and key head counts both divide by
+    // the rank count; see the note at the binding below for why they cannot
+    // split apart. The delta net and the MoE have no such coupling.
+    const int cluster_n = (cluster && cluster->sharded()) ? cluster->size() : 1;
+    // Off by default. The split itself is sound -- query and key heads move
+    // together, and the arithmetic is the same as the delta net's -- but with
+    // one key head per rank the shared attention path trips
+    // GGML_ASSERT(ggml_n_dims(a) >= 2) inside ggml_turbo_wht, the rotation
+    // that guards a quantised V cache, and that path is qwen35's in
+    // production. It is worth 372 MB of the 4266 a token reads, which is not
+    // worth risking that on. DFLASH_QWEN4EXP_SHARD_ATTENTION=1 turns it on for
+    // whoever picks the crash up.
+    static const bool attn_opt_in = []() {
+        const char * e = std::getenv("DFLASH_QWEN4EXP_SHARD_ATTENTION");
+        return e && std::atoi(e) == 1;
+    }();
+    const bool attn_split = attn_opt_in && cluster_n > 1 &&
+                            out.n_head % cluster_n == 0 &&
+                            out.n_head_kv % cluster_n == 0;
+    const ShardAxis attn_axis_rows = attn_split ? ShardAxis::Rows : ShardAxis::None;
+    const ShardAxis attn_axis_cols = attn_split ? ShardAxis::Cols : ShardAxis::None;
+    if (cluster_n > 1 && !attn_split && attn_opt_in) {
+        std::fprintf(stderr,
+                     "[qwen4exp-cluster] attention stays whole: %d query and %d kv "
+                     "heads do not both divide by %d\n",
+                     out.n_head, out.n_head_kv, cluster_n);
+    }
+
     for (int il = 0; il < out.n_layer && b.ok; ++il) {
         TargetLayer & L = out.layers[(size_t) il];
         const bool full_attn = ((il + 1) % out.full_attention_interval) == 0;
@@ -481,10 +515,27 @@ bool load_qwen4exp_gguf(const std::string & path,
         L.hc_ffn_inject  = b.take_f32(blk(il, "hc_ffn_inject.weight"),  true);
 
         if (full_attn) {
-            L.wq     = b.take(blk(il, "attn_q.weight"),      true);
-            L.wk     = b.take(blk(il, "attn_k.weight"),      true);
-            L.wv     = b.take(blk(il, "attn_v.weight"),      true);
-            L.wo     = b.take(blk(il, "attn_output.weight"), true);
+            // Query AND key/value heads split together, or neither does.
+            // Grouped-query attention maps query head h to key head
+            // h / (n_head / n_head_kv), and that index is computed from this
+            // rank's local numbering: give rank 1 query heads 12..23 while
+            // leaving both key heads in place and it reads key head 0 for all
+            // of them. With 24 query heads over 2 key heads the two split
+            // together at two ranks and neither splits at four, which is why
+            // the axis is decided once, above, from both counts.
+            //
+            // attn_q packs query and gate together per head, so a head is
+            // 2*head_dim contiguous rows and the cut is a plain row split. The
+            // output projection consumes those heads, so it is cut the other
+            // way and its result is a partial sum.
+            L.wq     = b.take_shard(blk(il, "attn_q.weight"), attn_axis_rows,
+                                    2 * out.n_embd_head_k, true);
+            L.wk     = b.take_shard(blk(il, "attn_k.weight"), attn_axis_rows,
+                                    out.n_embd_head_k, true);
+            L.wv     = b.take_shard(blk(il, "attn_v.weight"), attn_axis_rows,
+                                    out.n_embd_head_k, true);
+            L.wo     = b.take_shard(blk(il, "attn_output.weight"), attn_axis_cols,
+                                    out.n_embd_head_k, true);
             L.q_norm = b.take(blk(il, "attn_q_norm.weight"), true);
             L.k_norm = b.take(blk(il, "attn_k_norm.weight"), true);
             L.indexer_q_proj = b.take(blk(il, "indexer.q_proj.weight"), true);
@@ -492,15 +543,31 @@ bool load_qwen4exp_gguf(const std::string & path,
             L.indexer_q_norm = b.take(blk(il, "indexer.q_norm.weight"), true);
             L.indexer_k_norm = b.take(blk(il, "indexer.k_norm.weight"), true);
         } else {
-            L.wqkv        = b.take(blk(il, "attn_qkv.weight"),   true);
-            L.wqkv_gate   = b.take(blk(il, "attn_gate.weight"),  true);
-            L.ssm_conv1d  = b.take(blk(il, "ssm_conv1d.weight"), true);
-            L.ssm_alpha   = b.take(blk(il, "ssm_alpha.weight"),  true);
-            L.ssm_beta    = b.take(blk(il, "ssm_beta.weight"),   true);
-            L.ssm_a       = b.take(blk(il, "ssm_a"),             true);
-            L.ssm_dt_bias = b.take(blk(il, "ssm_dt.bias"),       true);
+            // The delta net splits by head. attn_qkv is query, key and
+            // several key-widths of value laid end to end, so each rank takes
+            // the same fraction of every part rather than a prefix of the
+            // whole; the same segmentation applies to the gate, the conv, the
+            // per-head scalars and the output projection. ssm_norm is indexed
+            // by head_v_dim, which does not change, so it stays whole.
+            const int qkv_segs = qwen4exp_qkv_segments(out);
+            const int val_segs = qwen4exp_value_segments(out);
+            L.wqkv        = b.take_shard(blk(il, "attn_qkv.weight"), ShardAxis::Rows,
+                                         out.ssm_d_state, true, qkv_segs);
+            L.wqkv_gate   = b.take_shard(blk(il, "attn_gate.weight"), ShardAxis::Rows,
+                                         out.ssm_d_state, true, val_segs);
+            L.ssm_conv1d  = b.take_shard(blk(il, "ssm_conv1d.weight"), ShardAxis::Rows,
+                                         out.ssm_d_state, true, qkv_segs);
+            L.ssm_alpha   = b.take_shard(blk(il, "ssm_alpha.weight"), ShardAxis::Rows,
+                                         1, true, val_segs);
+            L.ssm_beta    = b.take_shard(blk(il, "ssm_beta.weight"), ShardAxis::Rows,
+                                         1, true, val_segs);
+            L.ssm_a       = b.take_shard(blk(il, "ssm_a"), ShardAxis::Cols,
+                                         1, true, val_segs);
+            L.ssm_dt_bias = b.take_shard(blk(il, "ssm_dt.bias"), ShardAxis::Cols,
+                                         1, true, val_segs);
             L.ssm_norm    = b.take(blk(il, "ssm_norm.weight"),   true);
-            L.ssm_out     = b.take(blk(il, "ssm_out.weight"),    true);
+            L.ssm_out     = b.take_shard(blk(il, "ssm_out.weight"), ShardAxis::Cols,
+                                         out.ssm_d_state, true, val_segs);
         }
 
         // MoE: 512 routed experts top-10, plus a shared expert whose scalar
@@ -538,7 +605,11 @@ bool load_qwen4exp_gguf(const std::string & path,
     out.output_hc_norm = b.take("output_hc_norm.weight", true);
     out.output_hc_down = b.take("output_hc_down.weight", true);
     out.output_hc_up   = b.take("output_hc_up.weight",   true);
-    out.output         = b.take("output.weight",         true);
+    // The head is 12% of the bytes a decode step reads, and the vocabulary is
+    // the cheapest axis to split it on: the slices are disjoint, so one
+    // reduction over the padded logits reproduces exactly the values a single
+    // node would compute, in the same order.
+    out.output         = b.take_shard("output.weight", ShardAxis::Rows, 32, true);
 
     if (!b.ok) {
         std::fprintf(stderr, "[qwen4exp] %s\n", err.c_str());
@@ -608,6 +679,52 @@ bool load_qwen4exp_gguf(const std::string & path,
         }
     }
 
+    // The delta net's dimensions become this rank's, now that the segment
+    // counts above have been taken from the whole. Everything downstream
+    // derives from these -- the conv and recurrent state shapes, the head
+    // counts the fused kernels loop over -- so halving them here is the whole
+    // of what the graph needs to know about the split. d_state is per head and
+    // does not move, which keeps head_v_dim = d_inner / dt_rank unchanged.
+    if (cluster && cluster->sharded()) {
+        const int n = cluster->size();
+        if (out.ssm_d_inner % n == 0 && out.ssm_n_group % n == 0 &&
+            out.ssm_dt_rank % n == 0) {
+            out.ssm_d_inner /= n;
+            out.ssm_n_group /= n;
+            out.ssm_dt_rank /= n;
+            std::fprintf(stderr,
+                         "[qwen4exp-cluster] delta net per rank: d_inner=%d n_group=%d "
+                         "dt_rank=%d\n",
+                         out.ssm_d_inner, out.ssm_n_group, out.ssm_dt_rank);
+            if (attn_split) {
+                out.n_head    /= n;
+                out.n_head_kv /= n;
+                std::fprintf(stderr,
+                             "[qwen4exp-cluster] attention per rank: %d query heads "
+                             "over %d kv heads\n", out.n_head, out.n_head_kv);
+            }
+        } else {
+            std::fprintf(stderr,
+                         "[qwen4exp-cluster] delta net stays whole: %d/%d/%d does not "
+                         "divide by %d\n",
+                         out.ssm_d_inner, out.ssm_n_group, out.ssm_dt_rank, n);
+        }
+    }
+
+    if (cluster && cluster->sharded() && out.output) {
+        auto * rt = const_cast<Qwen4ExpClusterRuntime *>(cluster);
+        rt->vocab_total = out.n_vocab;
+        if (out.output->ne[1] != out.n_vocab) {
+            rt->vocab_slice = out.output->ne[1];
+            rt->vocab_begin = rt->vocab_slice * cluster->rank();
+            std::fprintf(stderr,
+                         "[qwen4exp-cluster] vocabulary %lld..%lld of %lld\n",
+                         (long long) rt->vocab_begin,
+                         (long long) (rt->vocab_begin + rt->vocab_slice),
+                         (long long) rt->vocab_total);
+        }
+    }
+
     // ── one buffer, one pass ──────────────────────────────────────────────
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
     const size_t alignment = ggml_backend_buft_get_alignment(buft);
@@ -660,22 +777,28 @@ bool load_qwen4exp_gguf(const std::string & path,
             const char *    sp = static_cast<const char *>(bind.src.data);
             size_t          off = 0;
             if (bind.axis == ShardAxis::Rows) {
-                const size_t run = (size_t) bind.count * src_row;
+                const int64_t seg_rows = s1 / bind.segs;
+                const size_t  run = (size_t) bind.count * src_row;
                 for (int64_t i2 = 0; i2 < s2; ++i2) {
-                    ggml_backend_tensor_set(
-                        bind.dst,
-                        sp + ((size_t) i2 * s1 + (size_t) bind.begin) * src_row,
-                        off, run);
-                    off += run;
+                    for (int g = 0; g < bind.segs; ++g) {
+                        const size_t first =
+                            (size_t) i2 * s1 + (size_t) g * seg_rows + (size_t) bind.begin;
+                        ggml_backend_tensor_set(bind.dst, sp + first * src_row, off, run);
+                        off += run;
+                    }
                 }
             } else {
-                const size_t skip = ggml_row_size(st, bind.begin);
-                const size_t run  = ggml_row_size(st, bind.count);
+                const int64_t seg_cols = s0 / bind.segs;
+                const size_t  run = ggml_row_size(st, bind.count);
                 for (int64_t r = 0; r < s1 * s2; ++r) {
-                    ggml_backend_tensor_set(bind.dst,
-                                            sp + (size_t) r * src_row + skip,
-                                            off, run);
-                    off += run;
+                    for (int g = 0; g < bind.segs; ++g) {
+                        const size_t skip =
+                            ggml_row_size(st, (int64_t) g * seg_cols + bind.begin);
+                        ggml_backend_tensor_set(bind.dst,
+                                                sp + (size_t) r * src_row + skip,
+                                                off, run);
+                        off += run;
+                    }
                 }
             }
             continue;

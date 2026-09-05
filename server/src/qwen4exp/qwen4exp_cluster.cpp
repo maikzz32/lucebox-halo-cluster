@@ -98,4 +98,16 @@ ShardRange qwen4exp_shard_range(int64_t extent, int64_t granularity,
     return r;
 }
 
+int qwen4exp_value_segments(const TargetWeights & w) {
+    const int key_dim = w.ssm_n_group * w.ssm_d_state;
+    if (key_dim <= 0 || w.ssm_d_inner % key_dim != 0) {
+        return 1;
+    }
+    return w.ssm_d_inner / key_dim;
+}
+
+int qwen4exp_qkv_segments(const TargetWeights & w) {
+    return 2 + qwen4exp_value_segments(w);
+}
+
 }  // namespace dflash::common

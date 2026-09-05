@@ -478,3 +478,72 @@ genuinely near -15.
 **The lesson worth keeping: build the oracle first.** Every instrument built
 before it produced a confident wrong answer, and each was caught only by
 running it against a model known to work.
+
+## Running it on a cluster
+
+Three axes are split, and the graph reduces twice per layer plus once at the
+head. `--cluster-size` on qwen4exp needs no architecture flags:
+
+```
+MODELS_DIR=/home/maik/gguf/qwen4exp TARGET_ARGS="" SPEC=0 \
+  EXTRA_ENV="NCCL_PROTO=LL" \
+  scripts/cluster/launch_cluster.sh "strix1 strix2" <model>-00001-of-00003.gguf <same>
+```
+
+`NCCL_PROTO=LL` is not optional. RCCL's default protocol costs 122 us for the
+10 KiB reduction a decode step needs, against 41.8 us measured back-to-back by
+the self-test -- in a graph the launches cannot pipeline. LL puts it back:
+23.9 tok/s to 28.1 on two nodes, level with the same run reduced with
+DFLASH_CLUSTER_ALLREDUCE_NOOP=1.
+
+| | 1 node | 2 nodes | 4 nodes |
+|---|---|---|---|
+| decode | 23.6 tok/s | **29.9** | 29.5 |
+| weights per rank | 62.3 GiB | 31.5 | 16.2 |
+| forced-continuation | 8/10 | 8/10 | 8/10 |
+| target | | 32 | 50 |
+
+### What splits, and why that is not enough
+
+| | MB per token | share | axis |
+|---|---|---|---|
+| routed experts | 1167 | 27.4% | expert hidden width |
+| attn_qkv | 649 | 15.2% | delta-net value heads |
+| output (lm_head) | 521 | 12.2% | vocabulary |
+| ssm_out | 423 | 9.9% | delta-net value heads |
+| attn_gate | 243 | 5.7% | delta-net value heads |
+| attn_q, attn_output | 342 | 8.0% | *not split, see below* |
+| ffn_gate_inp | 252 | 5.9% | replicated (F32 router) |
+| rest | 669 | 15.7% | replicated |
+
+Two nodes reach 93% of the target and four nodes do not improve on two. The
+reason is in the two halves of the step, measured apart with the noop probe:
+
+  - **the collectives.** 85 reductions cost 6.6 ms at four nodes, 78 us each.
+    LL helps far less there than at two, where they are nearly free.
+  - **the kernels.** Four-way compute alone runs at 36.6 tok/s, which for
+    1856 MB per rank is 68 GB/s against the 100 GB/s a single node sustains.
+    Split four ways this model's matmuls are too small to saturate the memory
+    system: a delta net of 1536 inner and experts 160 wide.
+
+That is the structural limit of per-layer tensor parallelism on a model with
+six billion active parameters. The remaining gap is not another axis to split;
+it is tokens per forward pass. Speculative decoding fixes all three at once --
+it amortises the collectives over q tokens, makes every matmul q times larger,
+and multiplies throughput by the acceptance rate. It is how DeepSeek V4 gets
+from 32 to 50 tok/s in this same tree, and Qwen3.8-Flash-Next ships an MTP
+module for exactly this purpose (unsloth publishes it as a separate GGUF).
+
+### Not split: attention
+
+Query and key heads must move together -- grouped-query attention maps query
+head h to key head h / (n_head / n_head_kv) from this rank's local numbering,
+so splitting the query heads alone sends every rank to key head 0. They do
+split cleanly at two ranks (12 query heads over 1 key head) and cannot at four.
+
+Even done correctly it crashes: with one key head per rank the shared
+attention path trips `GGML_ASSERT(ggml_n_dims(a) >= 2)` inside
+`ggml_turbo_wht`, the rotation guarding a quantised V cache, with an f16 cache
+as well as a quantised one. That path is qwen35's in production, and 342 MB of
+4266 is not worth the risk, so the split is behind
+`DFLASH_QWEN4EXP_SHARD_ATTENTION=1` for whoever picks the crash up.

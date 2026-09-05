@@ -2706,6 +2706,17 @@ QwenGraphOutputs build_qwen35_graph(
                                    out->nb[1]);
         }
         logits = ggml_mul_mat(ctx, w.output, out);
+        // A rank that owns a slice of the vocabulary produces only its own
+        // columns. Zero everywhere else and sum across ranks: each column is
+        // contributed by exactly one rank, so the result is bit-exact and
+        // everything downstream -- sampling, the argmax -- sees the same
+        // values in the same order a single node would.
+        if (w.cluster && w.cluster->vocab_slice > 0) {
+            const int64_t lo = w.cluster->vocab_begin;
+            const int64_t hi = w.cluster->vocab_total - lo - w.cluster->vocab_slice;
+            logits = ggml_pad_ext(ctx, logits, (int) lo, (int) hi, 0, 0, 0, 0, 0, 0);
+            logits = qwen4exp_cluster_allreduce_node(ctx, logits, *w.cluster);
+        }
         ggml_set_name(logits, "logits");
         ggml_build_forward_expand(gf, logits);
     } else {
@@ -2812,6 +2823,14 @@ static ggml_tensor * build_single_layer_hc(
                 ggml_view_2d(ctx, inject, 1, inject->ne[1], inject->nb[1],
                              (size_t) c * inject->nb[0]));
         }
+    }
+    // The delta net's output projection consumed a slice of the value heads,
+    // so what came back is a partial sum. The attention layers are not split
+    // and need no reduction, which is why this asks which kind of block ran.
+    // Both block kinds now hand back a partial sum -- the delta net over its
+    // value heads, attention over its query heads -- so both are reduced.
+    if (w.cluster) {
+        cur = qwen4exp_cluster_allreduce_node(ctx, ggml_cont(ctx, cur), *w.cluster);
     }
     *hc_state = qwen4exp_hc_combine(ctx, *hc_state, cur, inject, w.n_embd, n_hc);
     qwen4exp_probe_add(ctx, gf, "hc_after_attn", layer_idx, *hc_state);

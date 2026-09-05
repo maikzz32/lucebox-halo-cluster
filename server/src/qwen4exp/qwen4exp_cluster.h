@@ -31,6 +31,8 @@
 #include "cluster/cluster_decision_hooks.h"
 #include "cluster/cluster_telemetry.h"
 
+#include "internal.h"
+
 #include "ggml.h"
 #include "ggml-backend.h"
 
@@ -52,6 +54,13 @@ struct Qwen4ExpClusterRuntime {
     // A graph node cannot return an error, so an in-graph collective records
     // its first failure here and the forward fails after the compute.
     std::string node_error;
+
+    // This rank's slice of the vocabulary, when output.weight is split.
+    // vocab_slice == 0 means the head is replicated and the graph builds the
+    // logits exactly as a single node would.
+    int64_t vocab_begin = 0;
+    int64_t vocab_slice = 0;
+    int64_t vocab_total = 0;
 
     int rank() const { return cfg ? cfg->rank : 0; }
     int size() const { return cfg ? cfg->size : 1; }
@@ -96,5 +105,17 @@ struct ShardRange {
 };
 ShardRange qwen4exp_shard_range(int64_t extent, int64_t granularity,
                                 int rank, int size);
+
+// How many equal blocks a delta-net weight is made of.
+//
+// attn_qkv is not one projection but three laid end to end -- query, key and
+// value -- and the value part is several key-widths wide. Splitting it by
+// rank means taking the same fraction of EACH part, not a prefix of the whole,
+// or a rank ends up with all of the query and none of the value. The block
+// count is 2 + d_inner/(n_group*d_state) for qkv, one less for the gate, and
+// d_inner/(n_group*d_state) for the output projection and the per-head
+// scalars.
+int qwen4exp_qkv_segments(const TargetWeights & w);
+int qwen4exp_value_segments(const TargetWeights & w);
 
 }  // namespace dflash::common
