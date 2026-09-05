@@ -2677,6 +2677,12 @@ QwenGraphOutputs build_qwen35_graph(
         const char * s = std::getenv("DFLASH_QWEN4EXP_SKIP_MIXER");
         return s && std::atoi(s) == 1;
     }();
+    if (hyper_connected && in.capture_hc_final) {
+        ggml_set_output(hc_state);
+        ggml_build_forward_expand(gf, hc_state);
+        og_early.hc_final = hc_state;
+    }
+
     ggml_tensor * out = nullptr;
     if (hyper_connected && skip_mixer) {
         out = ggml_cont(ctx, ggml_view_2d(ctx, hc_state, w.n_embd, n_tokens,

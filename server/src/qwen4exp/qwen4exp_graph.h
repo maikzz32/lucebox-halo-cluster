@@ -24,6 +24,8 @@
 
 #pragma once
 
+#include "internal.h"
+
 #include "ggml.h"
 
 namespace dflash::common {
@@ -100,5 +102,26 @@ ggml_tensor * qwen4exp_ple(ggml_context * ctx,
                            int            conv_kernel,
                            int            ngram_size,
                            float          rms_eps);
+
+// One qwen4exp block on the carrier: the mixer pair around an attention or
+// delta-net block and around the MoE. Defined beside qwen35's layer builders,
+// because the blocks between the mixers are exactly qwen35's.
+//
+// `hc_state` is [n_embd, n_hc, n_tokens] and is updated in place. The MTP head
+// builds its single block through this too, presenting itself as a one-layer
+// model so the weights come from its own module rather than the target's.
+ggml_tensor * build_qwen4exp_layer(ggml_context *        ctx,
+                                   ggml_cgraph *         gf,
+                                   const TargetWeights & w,
+                                   TargetCache &         cache,
+                                   int                   layer_idx,
+                                   ggml_tensor **        hc_state,
+                                   ggml_tensor *         positions,
+                                   ggml_tensor *         attn_mask,
+                                   int                   kv_start,
+                                   int                   n_tokens,
+                                   int                   fa_window,
+                                   ggml_tensor *         kv_write_rows,
+                                   ggml_tensor *         parent_ids);
 
 }  // namespace dflash::common

@@ -1,6 +1,7 @@
 #include "qwen4exp/qwen4exp_mtp.h"
 
 #include "common/gguf_shards.h"
+#include "qwen4exp/qwen4exp_graph.h"
 
 #include <cstdio>
 #include <cstring>
@@ -196,6 +197,68 @@ bool load_qwen4exp_mtp(const std::string & path,
                  out.layer_index, binds.size(),
                  (double) total / (1024.0 * 1024.0 * 1024.0));
     return true;
+}
+
+ggml_tensor * build_qwen4exp_mtp_draft(ggml_context * ctx,
+                                       ggml_cgraph *  gf,
+                                       const Qwen4ExpMtpWeights & w,
+                                       const TargetWeights & t,
+                                       ggml_tensor * carrier,
+                                       ggml_tensor * embed_next,
+                                       ggml_tensor * positions,
+                                       ggml_tensor * attn_mask,
+                                       int           kv_start,
+                                       TargetCache & cache) {
+    const int64_t nt     = carrier->ne[2];
+    const int64_t hc_dim = (int64_t) t.n_hc * t.n_embd;
+
+    // The token that was just sampled, normalised on its own.
+    ggml_tensor * e = ggml_mul(ctx, ggml_rms_norm(ctx, embed_next, t.rms_eps), w.enorm);
+
+    // The carrier, normalised the way every qwen4exp norm treats it: the
+    // reduction runs over one stream and the flat gamma scales all of them.
+    ggml_tensor * h = ggml_rms_norm(ctx, carrier, t.rms_eps);
+    h = ggml_mul(ctx, ggml_reshape_2d(ctx, h, hc_dim, nt), w.hnorm);
+    h = ggml_reshape_3d(ctx, h, t.n_embd, t.n_hc, nt);
+
+    // eh_proj is [2*n_embd, n_embd], so it cannot see the whole carrier at
+    // once. It sees one stream at a time with the embedding alongside, and its
+    // output is that stream of the carrier the layer runs on. Broadcasting the
+    // embedding across the streams and concatenating on the feature axis does
+    // all four in one matmul.
+    ggml_tensor * e3 = ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, e, t.n_embd, 1, nt),
+                                      t.n_embd, t.n_hc, nt, 1);
+    ggml_tensor * eh = ggml_concat(ctx, e3, h, 0);          // [2*n_embd, n_hc, T]
+    ggml_tensor * state = ggml_mul_mat(ctx, w.eh_proj, eh); // [n_embd, n_hc, T]
+    state = ggml_cont(ctx, state);
+
+    // One ordinary qwen4exp block, then this head's own output mixer -- which
+    // stands in the same place output_hc_* does for the target.
+    //
+    // The block builder reads its weights out of TargetWeights::layers, so the
+    // head is presented as a one-layer model: the target's hyperparameters,
+    // this module's single block, and a full-attention interval of one so that
+    // block is treated as an attention layer, which is what it is.
+    TargetWeights mw = t;
+    mw.layers.assign(1, w.layer);
+    mw.n_layer = 1;
+    mw.full_attention_interval = 1;
+    mw.cluster = nullptr;              // the head is replicated on every rank
+
+    build_qwen4exp_layer(ctx, gf, mw, cache, /*layer_idx=*/0, &state,
+                         positions, attn_mask, kv_start, (int) nt,
+                         /*fa_window=*/0, /*kv_write_rows=*/nullptr,
+                         /*parent_ids=*/nullptr);
+
+    ggml_tensor * mixed = qwen4exp_hc_mix(ctx, gf, /*cluster=*/nullptr, state,
+                                          w.head_norm, w.head_down, w.head_up,
+                                          /*w_inject=*/nullptr, /*inject_out=*/nullptr,
+                                          t.n_embd, t.n_hc, t.rms_eps);
+    ggml_tensor * logits = ggml_mul_mat(ctx, w.output, mixed);
+    ggml_tensor * draft  = ggml_argmax(ctx, logits);
+    ggml_set_output(draft);
+    ggml_build_forward_expand(gf, draft);
+    return draft;
 }
 
 }  // namespace dflash::common

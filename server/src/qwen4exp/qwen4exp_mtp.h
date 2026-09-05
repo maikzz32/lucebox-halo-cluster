@@ -90,6 +90,9 @@ ggml_tensor * build_qwen4exp_mtp_draft(ggml_context * ctx,
                                        const TargetWeights & target,
                                        ggml_tensor * carrier,     // [n_embd, n_hc, T]
                                        ggml_tensor * embed_next,  // [n_embd, T]
+                                       ggml_tensor * positions,   // m-RoPE, 4 per token
+                                       ggml_tensor * attn_mask,   // causal, or null at T=1
+                                       int           kv_start,
                                        TargetCache & cache);
 
 }  // namespace dflash::common

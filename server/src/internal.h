@@ -897,6 +897,10 @@ struct QwenGraphInputs {
     // qwen4exp PLE: [hidden, n_tokens] f32, the n-gram table rows gathered on
     // the host. Null for every other architecture, and null here means the PLE
     // layer degrades to a plain pass-through rather than reading nothing.
+    // Ask for QwenGraphOutputs::hc_final. Costs one graph output and nothing
+    // else; the carrier already exists.
+    bool capture_hc_final = false;
+
     ggml_tensor * ple_embed = nullptr;
     ggml_tensor * positions;      // [4 * n_tokens] i32 (M-RoPE needs 4 per token)
     ggml_tensor * attn_mask;      // optional [kv_len, n_tokens_padded] f32 (causal); nullptr for n_tokens==1
@@ -1011,6 +1015,13 @@ struct QwenGraphOutputs {
     std::vector<DeltaNetCapture> delta_captures;
     // BF16 [n_capture_layers*n_embd, n_tokens], packed-tree only.
     ggml_tensor * tree_features = nullptr;
+    // qwen4exp's hyper-connection carrier after the last layer, before the
+    // output mixer: [n_embd, n_hc, n_tokens]. This is what the MTP head reads
+    // -- its hnorm is n_hc*n_embd wide, so it wants the four streams and not
+    // the vector the mixer collapses them into. Null unless
+    // QwenGraphInputs::capture_hc_final asked for it.
+    ggml_tensor * hc_final = nullptr;
+
     // One entry per target layer. Populated only when capture_moe_router is
     // true; qwen35 dense layers and non-MoE models leave entries null.
     std::vector<ggml_tensor *> moe_selected;
