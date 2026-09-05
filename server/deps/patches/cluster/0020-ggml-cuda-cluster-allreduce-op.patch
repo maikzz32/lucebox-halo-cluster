@@ -66,10 +66,10 @@ index 756193d..fbff94c 100644
              struct ggml_context * ctx,
              struct ggml_tensor  * experts,
 diff --git a/server/deps/llama.cpp/ggml/src/ggml-cuda/moe-fused.cu b/server/deps/llama.cpp/ggml/src/ggml-cuda/moe-fused.cu
-index 0541c58..b9f94fa 100644
+index 0541c58..12918f9 100644
 --- a/server/deps/llama.cpp/ggml/src/ggml-cuda/moe-fused.cu
 +++ b/server/deps/llama.cpp/ggml/src/ggml-cuda/moe-fused.cu
-@@ -648,6 +648,27 @@ static void ggml_cuda_op_ds4_moe_owner_split(
+@@ -648,6 +648,32 @@ static void ggml_cuda_op_ds4_moe_owner_split(
          down_scale);
  }
  
@@ -85,11 +85,16 @@ index 0541c58..b9f94fa 100644
 +    const int t = blockIdx.y;
 +    if (t >= nt) return;
 +
++    // Multiply then add, not fmaf. The fused multiply-add rounds once where the
++    // unfused graph rounds twice, which is more accurate and therefore a
++    // different function: it flips near-ties, and a flipped token four words in
++    // rewrites the rest of the answer. Matching the reference exactly is what
++    // makes this a fusion rather than a change of model.
 +    const size_t base = (size_t) t * (size_t) n_hc * (size_t) n_embd + (size_t) i;
 +    float acc = 0.0f;
 +    for (int c = 0; c < n_hc; ++c) {
 +        const size_t o = base + (size_t) c * (size_t) n_embd;
-+        acc = fmaf(a[o], b[o], acc);
++        acc += a[o] * b[o];
 +    }
 +    dst[(size_t) t * (size_t) n_embd + (size_t) i] = acc * scale;
 +}
@@ -97,7 +102,7 @@ index 0541c58..b9f94fa 100644
  void ggml_cuda_op_moe_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      const int mode = ggml_get_op_params_i32(dst, 0);
      if (mode == GGML_MOE_FUSED_BALANCED_OWNER_IDS) {
-@@ -710,6 +731,57 @@ void ggml_cuda_op_moe_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+@@ -710,6 +736,57 @@ void ggml_cuda_op_moe_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
              (int) (dst->nb[1] / sizeof(int32_t)));
          return;
      }

@@ -660,11 +660,16 @@ __global__ void hc_collapse_f32(const float * __restrict__ a,
     const int t = blockIdx.y;
     if (t >= nt) return;
 
+    // Multiply then add, not fmaf. The fused multiply-add rounds once where the
+    // unfused graph rounds twice, which is more accurate and therefore a
+    // different function: it flips near-ties, and a flipped token four words in
+    // rewrites the rest of the answer. Matching the reference exactly is what
+    // makes this a fusion rather than a change of model.
     const size_t base = (size_t) t * (size_t) n_hc * (size_t) n_embd + (size_t) i;
     float acc = 0.0f;
     for (int c = 0; c < n_hc; ++c) {
         const size_t o = base + (size_t) c * (size_t) n_embd;
-        acc = fmaf(a[o], b[o], acc);
+        acc += a[o] * b[o];
     }
     dst[(size_t) t * (size_t) n_embd + (size_t) i] = acc * scale;
 }
