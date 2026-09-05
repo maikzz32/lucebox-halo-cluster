@@ -65,4 +65,34 @@ ggml_tensor * qwen4exp_hc_init(ggml_context * ctx,
                                int            n_embd,
                                int            n_hc);
 
+// PLE, on the single layer named by ple.layers.
+//
+// A retrieval over the hyper-connection state: the n-gram embedding is
+// projected to a key and a value, the key is scored against the state per
+// stream, and a signed-square-root sigmoid of that score gates the value into
+// every stream. A causal convolution dilated by the n-gram size runs alongside
+// and carries state across tokens.
+//
+// `ngram_embd` is [n_embd, T], gathered on the host -- see qwen4exp_ple_rows.
+// `conv_state` is [(conv_kernel-1)*ngram_size, n_hc*n_embd, 1] and is updated:
+// the new tail is written back so a chunked prefill matches a single-shot one.
+//
+// Returns the updated [n_embd, n_hc, T] state.
+ggml_tensor * qwen4exp_ple(ggml_context * ctx,
+                           ggml_cgraph *  gf,
+                           ggml_tensor *  state,        // [n_embd, n_hc, T]
+                           ggml_tensor *  ngram_embd,   // [n_embd, T]
+                           ggml_tensor *  w_key,        // [n_embd, n_hc*n_embd]
+                           ggml_tensor *  w_value,      // [n_embd, n_embd]
+                           ggml_tensor *  w_norm_key,   // [n_hc*n_embd]
+                           ggml_tensor *  w_norm_query, // [n_hc*n_embd]
+                           ggml_tensor *  w_norm_conv,  // [n_hc*n_embd]
+                           ggml_tensor *  w_conv1d,     // [conv_kernel, n_hc*n_embd]
+                           ggml_tensor *  conv_state,
+                           int            n_embd,
+                           int            n_hc,
+                           int            conv_kernel,
+                           int            ngram_size,
+                           float          rms_eps);
+
 }  // namespace dflash::common

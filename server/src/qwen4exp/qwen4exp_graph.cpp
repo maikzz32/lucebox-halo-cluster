@@ -1,5 +1,7 @@
 #include "qwen4exp/qwen4exp_graph.h"
 
+#include <cmath>
+
 namespace dflash::common {
 
 ggml_tensor * qwen4exp_hc_init(ggml_context * ctx,
@@ -59,6 +61,107 @@ ggml_tensor * qwen4exp_hc_mix(ggml_context * ctx,
         *inject_out = w_inject ? ggml_mul_mat(ctx, w_inject, xn) : nullptr;
     }
     return mixed;
+}
+
+namespace {
+
+// The norm PLE uses everywhere: reduce over one stream, scale the flattened
+// n_hc*n_embd layout by the gamma. Same grouping as hc_mix, different weight.
+ggml_tensor * ple_grouped_norm(ggml_context * ctx, ggml_tensor * x,
+                               ggml_tensor * w, int n_embd, int n_hc,
+                               int64_t nt, float eps) {
+    ggml_tensor * t = ggml_reshape_3d(ctx, x, n_embd, n_hc, nt);
+    t = ggml_rms_norm(ctx, t, eps);
+    t = ggml_reshape_2d(ctx, t, (int64_t) n_hc * n_embd, nt);
+    t = ggml_mul(ctx, t, w);
+    return ggml_reshape_3d(ctx, t, n_embd, n_hc, nt);
+}
+
+}  // namespace
+
+ggml_tensor * qwen4exp_ple(ggml_context * ctx,
+                           ggml_cgraph *  gf,
+                           ggml_tensor *  state,
+                           ggml_tensor *  ngram_embd,
+                           ggml_tensor *  w_key,
+                           ggml_tensor *  w_value,
+                           ggml_tensor *  w_norm_key,
+                           ggml_tensor *  w_norm_query,
+                           ggml_tensor *  w_norm_conv,
+                           ggml_tensor *  w_conv1d,
+                           ggml_tensor *  conv_state,
+                           int            n_embd,
+                           int            n_hc,
+                           int            conv_kernel,
+                           int            ngram_size,
+                           float          rms_eps) {
+    const int64_t hc_dim = (int64_t) n_hc * n_embd;
+    const int64_t nt     = state->ne[2];
+
+    ggml_tensor * key   = ggml_mul_mat(ctx, w_key,   ngram_embd);   // [hc_dim, T]
+    ggml_tensor * value = ggml_mul_mat(ctx, w_value, ngram_embd);   // [n_embd, T]
+
+    key = ple_grouped_norm(ctx, key, w_norm_key, n_embd, n_hc, nt, rms_eps);
+    ggml_tensor * query =
+        ple_grouped_norm(ctx, state, w_norm_query, n_embd, n_hc, nt, rms_eps);
+
+    // Per-stream dot product, then a signed square root before the sigmoid.
+    // The clamp keeps sqrt away from a zero derivative; the sign is restored
+    // afterwards so the gate stays centred rather than folded.
+    ggml_tensor * s = ggml_sum_rows(ctx, ggml_mul(ctx, key, query));  // [1, n_hc, T]
+    s = ggml_scale(ctx, s, 1.0f / sqrtf((float) n_embd));
+    ggml_tensor * mag =
+        ggml_sqrt(ctx, ggml_clamp(ctx, ggml_abs(ctx, s), 1e-6f, INFINITY));
+    ggml_tensor * gate = ggml_sigmoid(ctx, ggml_mul(ctx, ggml_sgn(ctx, s), mag));
+
+    ggml_tensor * v3 = ggml_reshape_3d(ctx, value, n_embd, 1, nt);
+    v3 = ggml_repeat_4d(ctx, v3, n_embd, n_hc, nt, 1);
+    ggml_tensor * gated = ggml_mul(ctx, v3, gate);                   // [n_embd, n_hc, T]
+
+    ggml_tensor * normed = ple_grouped_norm(
+        ctx, ggml_reshape_2d(ctx, gated, hc_dim, nt), w_norm_conv,
+        n_embd, n_hc, nt, rms_eps);
+    normed = ggml_reshape_2d(ctx, normed, hc_dim, nt);
+
+    // Depthwise causal convolution, dilated by the n-gram size, built as a sum
+    // of shifted copies. ggml_conv_1d_dw is not used here: the reference notes
+    // it as unreliable, and the shifted-sum form makes the tap arithmetic
+    //   out[c, t] = sum_k w[k, c] * x[c, t - (K-1-k)*dilation]
+    // visible at the call site.
+    const int64_t hist = (int64_t) (conv_kernel - 1) * ngram_size;
+
+    // History first, then this batch, on the token axis: [hist + T, hc_dim].
+    ggml_tensor * state_2d = ggml_reshape_2d(ctx, conv_state, hist, hc_dim);
+    ggml_tensor * batch_2d = ggml_cont(ctx, ggml_transpose(ctx, normed));  // [T, hc_dim]
+    ggml_tensor * padded   = ggml_concat(ctx, state_2d, batch_2d, 0);
+
+    ggml_tensor * conv_out = nullptr;
+    for (int k = 0; k < conv_kernel; ++k) {
+        const int64_t start = hist - (int64_t) (conv_kernel - 1 - k) * ngram_size;
+        ggml_tensor * shifted = ggml_cont(ctx, ggml_transpose(ctx,
+            ggml_view_2d(ctx, padded, nt, hc_dim, padded->nb[1],
+                         ggml_row_size(padded->type, start))));   // [hc_dim, T]
+
+        // Column k of the [kernel, hc_dim] kernel is one weight per channel.
+        ggml_tensor * wk = ggml_cont(ctx,
+            ggml_view_2d(ctx, w_conv1d, 1, hc_dim, w_conv1d->nb[1],
+                         (size_t) k * w_conv1d->nb[0]));
+        wk = ggml_reshape_1d(ctx, wk, hc_dim);
+        if (wk->type != GGML_TYPE_F32) wk = ggml_cast(ctx, wk, GGML_TYPE_F32);
+
+        ggml_tensor * term = ggml_mul(ctx, shifted, wk);
+        conv_out = conv_out ? ggml_add(ctx, conv_out, term) : term;
+    }
+
+    // Carry the tail forward so a chunked prefill matches a single-shot one.
+    ggml_tensor * tail = ggml_view_2d(ctx, padded, hist, hc_dim, padded->nb[1],
+                                      ggml_row_size(padded->type, nt));
+    ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_cont(ctx, tail), state_2d));
+
+    conv_out = ggml_silu(ctx, conv_out);
+    conv_out = ggml_reshape_3d(ctx, ggml_cont(ctx, conv_out), n_embd, n_hc, nt);
+
+    return ggml_add(ctx, state, ggml_add(ctx, gated, conv_out));
 }
 
 ggml_tensor * qwen4exp_hc_combine(ggml_context * ctx,
