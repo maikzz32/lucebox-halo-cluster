@@ -4620,6 +4620,25 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// GGML_CUDA_GRAPH_WHY=1 also counts how often a step re-captures instead of
+// replaying. A graph that is rebuilt every step is worse than none: the
+// capture costs what the eager launches would have, plus the instantiate.
+static void ggml_cuda_graph_step_counted(bool captured) {
+    static const bool on = [] {
+        const char * v = getenv("GGML_CUDA_GRAPH_WHY");
+        return v && v[0] && strcmp(v, "0") != 0;
+    }();
+    if (!on) return;
+    static int64_t steps = 0, captures = 0;
+    steps++;
+    captures += captured ? 1 : 0;
+    if (steps % 64 == 0) {
+        fprintf(stderr, "[cuda-graph] %lld steps, %lld captures (%.0f%% replayed)\n",
+                (long long) steps, (long long) captures,
+                100.0 * (double) (steps - captures) / (double) steps);
+    }
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -4653,6 +4672,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     while (!graph_evaluated_or_captured) {
         // Only perform the graph execution if CUDA graphs are not enabled, or we are capturing the graph.
         // With the use of CUDA graphs, the execution will be performed by the graph launch.
+        ggml_cuda_graph_step_counted(!use_cuda_graph || cuda_graph_update_required);
         if (!use_cuda_graph || cuda_graph_update_required) {
             [[maybe_unused]] int prev_i = 0;
 

@@ -528,8 +528,15 @@ remove are what the step is waiting on.
 
 `DFLASH_CLUSTER_GRAPH_CAPTURE=1` lifts that rule, and the instrumentation
 confirms the graph is then captured with the collective inside -- and it gets
-slower, 23.8 tok/s with RCCL's LL protocol and 24.4 with its default. A
-captured RCCL collective is worse than an eager one here.
+slower, 23.8 tok/s with RCCL's LL protocol and 24.4 with its default. The same
+flag also counts captures against replays: 3 captures in 128 steps, so it is
+not rebuilding the graph every step. A captured RCCL collective is simply
+worse than an eager one on this fabric.
+
+The clearest evidence that the bytes are not the constraint is that the number
+of collectives does not matter either: 84 of them give 25.2 tok/s, 85 give
+25.3 and 97 give 25.4. What costs is losing the graph, and one collective
+loses it as thoroughly as ninety-seven.
 
 So the cost is not the bytes on the wire and not the launch of the collective
 alone: it is that a collective is a synchronisation point the graph cannot
