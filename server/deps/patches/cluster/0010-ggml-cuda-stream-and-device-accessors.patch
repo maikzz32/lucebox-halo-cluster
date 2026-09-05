@@ -20,21 +20,99 @@ index ec5643f..aabd170 100644
  // thread. Pass zero to restore LUCE_MMVQ_MAX_NCOLS. This is intentionally
  // thread-local so one graph builder can select a safe topology without
 diff --git a/server/deps/llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu b/server/deps/llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu
-index a1c178f..8bfc8fd 100644
+index a1c178f..2e6baca 100644
 --- a/server/deps/llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/server/deps/llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -3911,6 +3911,19 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+@@ -91,6 +91,7 @@
+ #include <unordered_map>
+ #include <array>
+ #include <cstdlib>
++#include <set>
+ #include <string>
+ #include <vector>
+ 
+@@ -3888,6 +3889,56 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
+ }
+ 
+ #ifdef USE_CUDA_GRAPH
++
++// DFLASH_CLUSTER_GRAPH_CAPTURE=1: allow HIP graph capture of a graph that
++// contains a cluster collective. Off by default until a run proves the
++// captured replay is bit-identical to the eager one on this RCCL build.
++static bool ggml_cuda_cluster_capture_allowed() {
++    static const bool allowed = [] {
++        const char * v = getenv("DFLASH_CLUSTER_GRAPH_CAPTURE");
++        return v && v[0] && strcmp(v, "0") != 0;
++    }();
++    return allowed;
++}
++
++// GGML_CUDA_GRAPH_WHY=1 names the first rule that refused this graph, once per
++// distinct reason. A forward pass that silently loses its graph launches every
++// kernel eagerly, which on a launch-bound decode step costs far more than the
++// rule usually saves -- and there is no other way to see which rule fired.
++static void ggml_cuda_graph_refused(const char * why) {
++    static const bool on = [] {
++        const char * v = getenv("GGML_CUDA_GRAPH_WHY");
++        return v && v[0] && strcmp(v, "0") != 0;
++    }();
++    if (!on) return;
++    static std::set<std::string> seen;
++    if (seen.insert(why).second) {
++        fprintf(stderr, "[cuda-graph] refused: %s\n", why);
++    }
++}
++
++// DFLASH_CLUSTER_SEGMENTED_GRAPH=1: capture the forward in segments cut at
++// every cluster collective, instead of refusing to capture it at all.
++//
++// The measurement this exists for, two nodes, qwen4exp, one decode step:
++// eager with a real collective 40.2 ms; captured whole with an empty
++// collective 32.4 ms; captured whole with a real one ~42 ms. So the graph is
++// worth 7.8 ms and an RCCL collective inside it costs about 10 -- but eagerly
++// that same collective is nearly free. Segmenting takes both: the kernels
++// replay, the collective does not.
++static bool ggml_cuda_graph_segmented() {
++    static const bool on = [] {
++        const char * v = getenv("DFLASH_CLUSTER_SEGMENTED_GRAPH");
++        return v && v[0] && strcmp(v, "0") != 0;
++    }();
++    return on;
++}
++
++static bool ggml_cuda_is_capture_break(const ggml_tensor * node) {
++    return node->op == GGML_OP_MOE_FUSED &&
++           ggml_get_op_params_i32(node, 0) == GGML_MOE_FUSED_CLUSTER_ALLREDUCE;
++}
++
+ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+ 
+     bool use_cuda_graph = true;
+@@ -3906,11 +3957,32 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+ 
+         if (node->src[0] && node->src[0]->buffer && ggml_backend_buft_is_cuda_split(node->src[0]->buffer->buft)) {
+             use_cuda_graph = false; // Split buffers are not supported by CUDA graph capture
++            ggml_cuda_graph_refused("site 1");
+ #ifndef NDEBUG
+             GGML_LOG_DEBUG("%s: disabling CUDA graphs due to split buffer\n", __func__);
  #endif
          }
  
 +        // A cluster all-reduce node calls into a collective library on this
 +        // stream. Whether such a collective may be captured into a graph and
-+        // replayed is runtime- and library-specific, and it is unverified on
-+        // gfx1151/RCCL, so a graph containing one is executed eagerly. This
-+        // costs nothing for non-cluster builds: no such node exists there.
++        // replayed is runtime- and library-specific. Blocking capture is the
++        // safe default, but it costs the WHOLE forward its graph: one such
++        // node per MoE layer makes a 43-layer decode step launch every kernel
++        // eagerly, and that step is launch-bound. DFLASH_CLUSTER_GRAPH_CAPTURE=1
++        // allows capture so the two can be compared; the environment read is
++        // cached and costs nothing for non-cluster builds, where no such node
++        // exists in the first place.
 +        if (node->op == GGML_OP_MOE_FUSED &&
-+            ggml_get_op_params_i32(node, 0) == GGML_MOE_FUSED_CLUSTER_ALLREDUCE) {
++            ggml_get_op_params_i32(node, 0) == GGML_MOE_FUSED_CLUSTER_ALLREDUCE &&
++            !ggml_cuda_cluster_capture_allowed() &&
++            !ggml_cuda_graph_segmented()) {
 +            use_cuda_graph = false;
++            ggml_cuda_graph_refused("site 2");
 +#ifndef NDEBUG
 +            GGML_LOG_DEBUG("%s: disabling CUDA graphs due to a cluster all-reduce node\n", __func__);
 +#endif
@@ -43,7 +121,130 @@ index a1c178f..8bfc8fd 100644
          // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
          if (node->op == GGML_OP_MUL_MAT_ID) {
              const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-@@ -5759,6 +5772,22 @@ void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * tot
+@@ -3958,6 +4030,7 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+                 // TODO: figure out a way to enable for larger batch sizes, without hurting performance
+                 // ref: https://github.com/ggml-org/llama.cpp/pull/18958
+                 use_cuda_graph = false;
++                ggml_cuda_graph_refused("site 3");
+ #ifndef NDEBUG
+                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
+ #endif
+@@ -4570,12 +4643,44 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+     return false;
+ }
+ 
++// GGML_CUDA_GRAPH_WHY=1 also counts how often a step re-captures instead of
++// replaying. A graph that is rebuilt every step is worse than none: the
++// capture costs what the eager launches would have, plus the instantiate.
++static void ggml_cuda_graph_step_counted(bool captured) {
++    static const bool on = [] {
++        const char * v = getenv("GGML_CUDA_GRAPH_WHY");
++        return v && v[0] && strcmp(v, "0") != 0;
++    }();
++    if (!on) return;
++    static int64_t steps = 0, captures = 0;
++    steps++;
++    captures += captured ? 1 : 0;
++    if (steps % 64 == 0) {
++        fprintf(stderr, "[cuda-graph] %lld steps, %lld captures (%.0f%% replayed)\n",
++                (long long) steps, (long long) captures,
++                100.0 * (double) (steps - captures) / (double) steps);
++    }
++}
++
+ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+     bool graph_evaluated_or_captured = false;
+ 
+     // flag used to determine whether it is an integrated_gpu
+     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
+ 
++#ifdef USE_CUDA_GRAPH
++    ggml_cuda_graph * seg_graph = cuda_ctx->cuda_graph(graph_key);
++    // Segmenting only while capturing, and never alongside multi-stream
++    // regions: ending a capture that has forked streams open is not something
++    // this path can put back together.
++    const bool segmenting = use_cuda_graph && cuda_graph_update_required &&
++                            ggml_cuda_graph_segmented() &&
++                            cuda_ctx->stream_context().concurrent_events.empty();
++    if (segmenting) {
++        seg_graph->free_segments();
++    }
++#endif  // USE_CUDA_GRAPH
++
+     ggml_cuda_stream_context & stream_ctx = cuda_ctx->stream_context();
+     bool                         is_concurrent_event_active = false;
+     ggml_cuda_concurrent_event * concurrent_event           = nullptr;
+@@ -4603,6 +4708,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+     while (!graph_evaluated_or_captured) {
+         // Only perform the graph execution if CUDA graphs are not enabled, or we are capturing the graph.
+         // With the use of CUDA graphs, the execution will be performed by the graph launch.
++        ggml_cuda_graph_step_counted(!use_cuda_graph || cuda_graph_update_required);
+         if (!use_cuda_graph || cuda_graph_update_required) {
+             [[maybe_unused]] int prev_i = 0;
+ 
+@@ -5110,6 +5216,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 GGML_UNUSED(integrated);
+ #endif  // NDEBUG
+ 
++#ifdef USE_CUDA_GRAPH
++                if (segmenting && ggml_cuda_is_capture_break(node)) {
++                    // Close the segment before the collective and leave the
++                    // collective out of it. Nothing has run yet -- a capture
++                    // records, it does not execute -- so the collective is
++                    // launched later, in its place, between the segment
++                    // launches below.
++                    cudaGraph_t seg = nullptr;
++                    CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &seg));
++                    seg_graph->seg_graphs.push_back(seg);
++                    CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(),
++                                                      cudaStreamCaptureModeRelaxed));
++                    continue;
++                }
++#endif  // USE_CUDA_GRAPH
++
+                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                 if (!ok) {
+                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+@@ -5150,6 +5272,38 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+         if (cuda_graph_update_required) { // Update graph executable
+             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+         }
++        if (!graph->seg_graphs.empty()) {
++            // The earlier segments are re-instantiated rather than updated.
++            // A recapture happens a handful of times in a few hundred steps,
++            // so what this costs is not on the path that matters, and an
++            // update that silently failed here would be a wrong forward.
++            if (graph->seg_instances.size() != graph->seg_graphs.size()) {
++                for (cudaGraphExec_t e : graph->seg_instances) {
++                    if (e) CUDA_CHECK(cudaGraphExecDestroy(e));
++                }
++                graph->seg_instances.assign(graph->seg_graphs.size(), nullptr);
++                for (size_t s = 0; s < graph->seg_graphs.size(); ++s) {
++                    CUDA_CHECK(cudaGraphInstantiate(&graph->seg_instances[s],
++                                                    graph->seg_graphs[s], NULL, NULL, 0));
++                }
++            }
++            // The break nodes are read from the graph being run, not
++            // remembered: the ggml graph is rebuilt every step, so any pointer
++            // kept from the capture would be to a tensor that no longer exists.
++            std::vector<ggml_tensor *> breaks;
++            breaks.reserve(graph->seg_instances.size());
++            for (int i = 0; i < cgraph->n_nodes; i++) {
++                if (ggml_cuda_is_capture_break(cgraph->nodes[i])) {
++                    breaks.push_back(cgraph->nodes[i]);
++                }
++            }
++            GGML_ASSERT(breaks.size() == graph->seg_instances.size());
++            for (size_t s = 0; s < graph->seg_instances.size(); ++s) {
++                CUDA_CHECK(cudaGraphLaunch(graph->seg_instances[s], cuda_ctx->stream()));
++                const bool ok = ggml_cuda_compute_forward(*cuda_ctx, breaks[s]);
++                GGML_ASSERT(ok);
++            }
++        }
+         // Launch graph
+         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+ #else
+@@ -5759,6 +5913,22 @@ void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * tot
      CUDA_CHECK(cudaMemGetInfo(free, total));
  }
  
